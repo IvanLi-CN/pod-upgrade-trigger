@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+log="$(dirname "$0")/log.txt"
+mkdir -p "$(dirname "$log")"
+
+printf 'systemd-run %s\n' "$*" >> "$log"
+
+unit=""
+for arg in "$@"; do
+  if [[ "$arg" == --unit=* ]]; then
+    unit="${arg#--unit=}"
+  fi
+done
+
+if [[ -n "${MOCK_SYSTEMD_RUN_DELAY_MS:-}" ]]; then
+  if [[ "${MOCK_SYSTEMD_RUN_DELAY_MS}" =~ ^[0-9]+$ ]]; then
+    delay_ms=${MOCK_SYSTEMD_RUN_DELAY_MS}
+    if (( delay_ms > 0 )); then
+      seconds=$((delay_ms / 1000))
+      fraction=$((delay_ms % 1000))
+      sleep_time=$(printf '%d.%03d' "$seconds" "$fraction")
+      sleep "$sleep_time"
+    fi
+  fi
+fi
+
+if [[ -n "${MOCK_SYSTEMD_RUN_FAIL:-}" && -n "$unit" ]]; then
+  IFS=',' read -ra FAILS <<< "${MOCK_SYSTEMD_RUN_FAIL}"
+  for entry in "${FAILS[@]}"; do
+    trimmed="${entry//[[:space:]]/}"
+    if [[ -n "$trimmed" && "$trimmed" == "$unit" ]]; then
+      echo "simulated systemd-run fail for $unit" >&2
+      exit 45
+    fi
+  done
+fi
+
+command_index=-1
+position=0
+for arg in "$@"; do
+  if [[ "$arg" != --* ]]; then
+    command_index=$position
+    break
+  fi
+  position=$((position + 1))
+done
+
+if (( command_index == -1 )); then
+  exit 0
+fi
+
+cmd=("$@")
+exe="${cmd[$command_index]}"
+child_args=()
+if (( command_index + 1 < ${#cmd[@]} )); then
+  child_args=("${cmd[@]:command_index+1}")
+fi
+
+if [[ -n "$exe" ]]; then
+  ("$exe" "${child_args[@]}" >>"$log" 2>&1) || true
+fi
+
+exit 0

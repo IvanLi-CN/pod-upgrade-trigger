@@ -7,13 +7,16 @@ echo "systemctl $*" >> "$log"
 
 if [[ "$*" =~ --user\ (start|restart)\ (.+) ]]; then
   unit="${BASH_REMATCH[2]}"
-  IFS=',' read -ra FAILS <<< "${MOCK_SYSTEMCTL_FAIL:-}"
-  for u in "${FAILS[@]}"; do
-    if [[ "$u" == "$unit" ]]; then
-      echo "simulated systemctl fail for $unit" >&2
-      exit 44
-    fi
-  done
+  fail_raw="${MOCK_SYSTEMCTL_FAIL:-}"
+  if [[ -n "$fail_raw" ]]; then
+    IFS=',' read -ra FAILS <<< "$fail_raw"
+    for u in "${FAILS[@]}"; do
+      if [[ "$u" == "$unit" ]]; then
+        echo "simulated systemctl fail for $unit" >&2
+        exit 44
+      fi
+    done
+  fi
 fi
 
 exit 0

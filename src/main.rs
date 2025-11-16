@@ -1116,9 +1116,17 @@ fn trigger_single_unit(unit: &str, dry_run: bool) -> UnitActionResult {
     }
 }
 
+fn scheduler_sleep_duration(interval_secs: u64) -> Duration {
+    let min_interval = env::var("WEBHOOK_SCHEDULER_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    Duration::from_secs(interval_secs.max(min_interval))
+}
+
 fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result<(), String> {
     let unit = manual_auto_update_unit();
-    let sleep = Duration::from_secs(interval_secs.max(60));
+    let sleep = scheduler_sleep_duration(interval_secs);
     let mut iterations: u64 = 0;
 
     loop {
@@ -2583,7 +2591,7 @@ fn persist_event_record(
     };
     let pool = pool.clone();
 
-    runtime.spawn(async move {
+    let fut = async move {
         if let Err(err) = sqlx::query(
             "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -2600,7 +2608,26 @@ fn persist_event_record(
         {
             log_message(&format!("warn db-insert-failed err={err}"));
         }
-    });
+    };
+
+    if audit_sync_mode() {
+        runtime.block_on(fut);
+    } else {
+        runtime.spawn(fut);
+    }
+}
+
+fn audit_sync_mode() -> bool {
+    static SYNC_MODE: OnceLock<bool> = OnceLock::new();
+    *SYNC_MODE.get_or_init(|| {
+        env::var("WEBHOOK_AUDIT_SYNC")
+            .ok()
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes")
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn record_system_event(action: &str, status: u16, meta: Value) {
