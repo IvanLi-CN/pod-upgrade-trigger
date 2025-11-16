@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+log="$(dirname "$0")/log.txt"
+mkdir -p "$(dirname "$log")"
+
+echo "podman $*" >> "$log"
+
+if [[ "$*" =~ ^pull ]] && [[ "${MOCK_PODMAN_FAIL:-0}" == "1" ]]; then
+  echo "simulated podman pull failure" >&2
+  exit 42
+fi
+
+if [[ "$*" =~ ^image\ prune ]] && [[ "${MOCK_PODMAN_PRUNE_FAIL:-0}" == "1" ]]; then
+  echo "simulated podman prune failure" >&2
+  exit 43
+fi
+
+exit 0
