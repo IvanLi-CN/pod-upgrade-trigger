@@ -1,0 +1,1 @@
+No bespoke style guide documented. Follow standard Rust 2024 edition conventions with idiomatic async/Tokio code, SQLx query macros, and serde/serde_json types. Keep comments concise and prefer structured logging/telemetry patterns already in the codebase when editing.

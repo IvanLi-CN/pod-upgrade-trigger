@@ -1,0 +1,8 @@
+- `cargo test` – run the full Rust test suite before releases.
+- `cargo build --release` – produce the optimized webhook binary for deployment.
+- `webhook-auto-update server` – start the socket-activated webhook daemon (systemd uses this).
+- `webhook-auto-update scheduler --interval <secs> [--max-iterations N]` – drive periodic podman-auto-update runs.
+- `webhook-auto-update trigger-units <service>... --caller <who> --reason <why> [--dry-run]` – immediately redeploy specific systemd units.
+- `webhook-auto-update trigger-all [--dry-run]` – inspect or fire all managed units.
+- `webhook-auto-update prune-state --max-age-hours 48` – clean stale rate-limit rows and image locks in the SQLite DB.
+- `PATH="$PWD/tests/mock-bin:$PATH" webhook-auto-update <cmd>` – prefix PATH with mock binaries while testing locally.
