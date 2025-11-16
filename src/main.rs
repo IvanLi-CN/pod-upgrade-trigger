@@ -2,9 +2,13 @@ use hex::decode;
 use hmac::{Hmac, Mac};
 use libc::{self, LOCK_EX, LOCK_NB, LOCK_UN};
 use regex::Regex;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use std::collections::HashMap;
+use sqlx::migrate::Migrator;
+use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
@@ -12,8 +16,10 @@ use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::runtime::Runtime;
 use url::Url;
 
 const LOG_TAG: &str = "webhook-auto-update";
@@ -34,6 +40,17 @@ const DEFAULT_MANUAL_UNIT: &str = "podman-auto-update.service";
 const DEFAULT_REGISTRY_HOST: &str = "ghcr.io";
 const PULL_RETRY_ATTEMPTS: u8 = 3;
 const PULL_RETRY_DELAY_SECS: u64 = 5;
+const DEFAULT_SCHEDULER_INTERVAL_SECS: u64 = 900;
+const MANUAL_UNITS_ENV: &str = "WEBHOOK_MANUAL_UNITS";
+const MANUAL_TOKEN_ENV: &str = "WEBHOOK_MANUAL_TOKEN";
+const DEFAULT_STATE_RETENTION_SECS: u64 = 86_400; // 24 hours
+const WEBHOOK_DB_ENV: &str = "WEBHOOK_DB_URL";
+const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+static DB_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static DB_POOL: OnceLock<Option<SqlitePool>> = OnceLock::new();
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -44,6 +61,9 @@ struct RequestContext {
     headers: HashMap<String, String>,
     body: Vec<u8>,
     raw_request: String,
+    request_id: String,
+    started_at: Instant,
+    received_at: SystemTime,
 }
 
 fn manual_auto_update_unit() -> String {
@@ -117,38 +137,269 @@ fn extract_container_image(body: &[u8]) -> Result<String, String> {
 
 fn main() {
     let mut args = env::args();
-    let _exe = args.next();
+    let exe = args.next().unwrap_or_else(|| "webhook-auto-update".into());
+    let Some(raw_cmd) = args.next() else {
+        print_usage(&exe);
+        std::process::exit(1);
+    };
 
-    if let Some(mode) = args.next() {
-        if mode == "--run-task" {
-            let unit = args.next().unwrap_or_default();
-            let image = args.next().unwrap_or_default();
-            let event = args.next().unwrap_or_default();
-            let delivery = args.next().unwrap_or_default();
-            let path = args.next().unwrap_or_default();
+    let command = normalize_command(&raw_cmd);
+    let remaining: Vec<String> = args.collect();
 
-            if unit.is_empty() || image.is_empty() {
-                log_message("500 background-task invalid-args");
-                std::process::exit(1);
-            }
-
-            if let Err(err) = run_background_task(&unit, &image, &event, &delivery, &path) {
-                log_message(&format!(
-                    "500 background-task-failed unit={unit} image={image} err={err}"
-                ));
-                std::process::exit(1);
-            }
-            return;
+    match command.as_str() {
+        "server" => run_server(),
+        "run-task" => run_background_cli(&remaining),
+        "scheduler" => run_scheduler_cli(&remaining),
+        "trigger-units" => run_trigger_cli(&remaining, false),
+        "trigger-all" => run_trigger_cli(&remaining, true),
+        "prune-state" => run_prune_cli(&remaining),
+        "help" => {
+            print_usage(&exe);
+            std::process::exit(0);
         }
-    }
-
-    if let Err(err) = handle_connection() {
-        log_message(&format!("500 internal-error {err}"));
-        let _ = write_response(500, "InternalServerError", "internal error");
+        _ => {
+            eprintln!("unknown command: {raw_cmd}");
+            print_usage(&exe);
+            std::process::exit(2);
+        }
     }
 }
 
+fn normalize_command(raw: &str) -> String {
+    raw.trim_start_matches('-').to_lowercase()
+}
+
+fn run_background_cli(args: &[String]) -> ! {
+    let unit = args.get(0).cloned().unwrap_or_default();
+    let image = args.get(1).cloned().unwrap_or_default();
+    let event = args.get(2).cloned().unwrap_or_default();
+    let delivery = args.get(3).cloned().unwrap_or_default();
+    let path = args.get(4).cloned().unwrap_or_default();
+
+    if unit.is_empty() || image.is_empty() {
+        log_message("500 background-task invalid-args");
+        eprintln!("--run-task requires unit and image");
+        std::process::exit(1);
+    }
+
+    if let Err(err) = run_background_task(&unit, &image, &event, &delivery, &path) {
+        log_message(&format!(
+            "500 background-task-failed unit={unit} image={image} err={err}"
+        ));
+        eprintln!("background task failed: {err}");
+        std::process::exit(1);
+    }
+
+    std::process::exit(0);
+}
+
+fn run_server() -> ! {
+    if let Err(err) = handle_connection() {
+        log_message(&format!("500 internal-error {err}"));
+        let _ = write_response(500, "InternalServerError", "internal error");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+fn run_scheduler_cli(args: &[String]) -> ! {
+    let mut interval = env::var("AUTO_UPDATE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCHEDULER_INTERVAL_SECS);
+    let mut max_iterations = env::var("WEBHOOK_SCHEDULER_MAX_TICKS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--interval" | "--interval-secs" => {
+                idx += 1;
+                interval = expect_u64(args.get(idx), "interval");
+            }
+            "--max-iterations" => {
+                idx += 1;
+                max_iterations = Some(expect_u64(args.get(idx), "max-iterations"));
+            }
+            other => {
+                eprintln!("unknown scheduler option: {other}");
+                std::process::exit(2);
+            }
+        }
+        idx += 1;
+    }
+
+    match run_scheduler_loop(interval, max_iterations) {
+        Ok(()) => std::process::exit(0),
+        Err(err) => {
+            eprintln!("scheduler failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_trigger_cli(args: &[String], force_all: bool) -> ! {
+    let mut opts = ManualCliOptions::default();
+    opts.all = force_all;
+
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--all" => opts.all = true,
+            "--dry-run" => opts.dry_run = true,
+            "--caller" => {
+                idx += 1;
+                opts.caller = args.get(idx).cloned();
+            }
+            "--reason" => {
+                idx += 1;
+                opts.reason = args.get(idx).cloned();
+            }
+            "--units" => {
+                idx += 1;
+                if let Some(raw) = args.get(idx) {
+                    opts.units.extend(
+                        raw.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    );
+                }
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown trigger option: {other}");
+                std::process::exit(2);
+            }
+            value => opts.units.push(value.to_string()),
+        }
+        idx += 1;
+    }
+
+    let units = if opts.all || opts.units.is_empty() {
+        manual_unit_list()
+    } else {
+        let mut resolved = Vec::new();
+        for entry in &opts.units {
+            match resolve_unit_identifier(entry) {
+                Some(unit) => resolved.push(unit),
+                None => eprintln!("unknown unit identifier: {entry}"),
+            }
+        }
+        resolved
+    };
+
+    if units.is_empty() {
+        eprintln!("No units resolved for trigger");
+        std::process::exit(2);
+    }
+
+    let results = trigger_units(&units, opts.dry_run);
+    for result in &results {
+        println!("{} -> {}", result.unit, result.status);
+        if let Some(msg) = &result.message {
+            println!("    {msg}");
+        }
+    }
+
+    let ok = all_units_ok(&results);
+    log_message(&format!(
+        "manual-cli units={} dry_run={} caller={} reason={} status={}",
+        results.len(),
+        opts.dry_run,
+        opts.caller.as_deref().unwrap_or("-"),
+        opts.reason.as_deref().unwrap_or("-"),
+        if ok { "ok" } else { "error" }
+    ));
+    record_system_event(
+        "cli-trigger",
+        if ok { 202 } else { 500 },
+        json!({
+            "dry_run": opts.dry_run,
+            "caller": opts.caller,
+            "reason": opts.reason,
+            "units": units,
+            "results": results,
+        }),
+    );
+
+    if ok {
+        std::process::exit(0);
+    } else {
+        std::process::exit(1);
+    }
+}
+
+fn run_prune_cli(args: &[String]) -> ! {
+    let mut retention_secs = DEFAULT_STATE_RETENTION_SECS;
+    let mut dry_run = false;
+
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--max-age-hours" => {
+                idx += 1;
+                let hours = expect_u64(args.get(idx), "max-age-hours");
+                retention_secs = hours.saturating_mul(3600);
+            }
+            "--dry-run" => dry_run = true,
+            other => {
+                eprintln!("unknown prune option: {other}");
+                std::process::exit(2);
+            }
+        }
+        idx += 1;
+    }
+
+    match prune_state_dir(Duration::from_secs(retention_secs.max(1)), dry_run) {
+        Ok(report) => {
+            println!(
+                "Trimmed entries={} removed_dbs={} removed_locks={} dry_run={}",
+                report.trimmed_entries, report.removed_files, report.removed_locks, dry_run
+            );
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("state prune failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_u64_arg(value: Option<&String>, label: &str) -> Result<u64, String> {
+    value
+        .ok_or_else(|| format!("missing {label}"))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid {label}"))
+}
+
+fn expect_u64(value: Option<&String>, label: &str) -> u64 {
+    match parse_u64_arg(value, label) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_usage(exe: &str) {
+    eprintln!("Usage: {exe} <command> [options]\n");
+    eprintln!("Commands:");
+    eprintln!("  server                       Run the socket-activated HTTP server");
+    eprintln!("  scheduler [options]          Run the periodic auto-update trigger");
+    eprintln!("  trigger-units <units...>     Restart specific units immediately");
+    eprintln!("  trigger-all [options]        Restart all configured units");
+    eprintln!("  prune-state [options]        Clean ratelimit databases and locks");
+    eprintln!("  run-task <...internal...>    Internal helper invoked via systemd-run");
+    eprintln!("  help                         Show this message");
+}
+
 fn handle_connection() -> Result<(), String> {
+    let received_at = SystemTime::now();
+    let started_at = Instant::now();
+    let request_id = next_request_id();
+
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut request_line = String::new();
@@ -159,16 +410,40 @@ fn handle_connection() -> Result<(), String> {
 
     let (method, raw_target) = parse_request_line(&request_line);
     if method.is_empty() || raw_target.is_empty() {
-        log_message(&format!("400 bad-request {}", redact_token(&request_line)));
-        send_response(400, "BadRequest", "bad request")?;
+        let redacted = redact_token(&request_line);
+        log_message(&format!("400 bad-request {redacted}"));
+        respond_basic_error(
+            &request_id,
+            &method,
+            &raw_target,
+            &request_line,
+            400,
+            "BadRequest",
+            "bad request",
+            "request-line",
+            started_at,
+            received_at,
+        )?;
         return Ok(());
     }
 
     let (path, query) = match parse_target(&raw_target) {
         Ok(parts) => parts,
         Err(e) => {
-            log_message(&format!("400 bad-request {}", redact_token(&request_line)));
-            send_response(400, "BadRequest", &e)?;
+            let redacted = redact_token(&request_line);
+            log_message(&format!("400 bad-request {redacted}"));
+            respond_basic_error(
+                &request_id,
+                &method,
+                &raw_target,
+                &request_line,
+                400,
+                "BadRequest",
+                &e,
+                "target",
+                started_at,
+                received_at,
+            )?;
             return Ok(());
         }
     };
@@ -206,13 +481,18 @@ fn handle_connection() -> Result<(), String> {
         headers,
         body,
         raw_request: request_line,
+        request_id,
+        started_at,
+        received_at,
     };
 
     if ctx.method == "GET" && ctx.path == "/health" {
         log_message("health ok");
-        send_response(200, "OK", "ok")?;
+        respond_text(&ctx, 200, "OK", "ok", "health-check", None)?;
     } else if ctx.method == "GET" && ctx.path == "/sse/hello" {
         handle_hello_sse(&ctx)?;
+    } else if ctx.path.starts_with("/api/manual/") {
+        handle_manual_api(&ctx)?;
     } else if is_github_route(&ctx.path) {
         handle_github_request(&ctx)?;
     } else if ctx.path == "/auto-update" {
@@ -221,7 +501,7 @@ fn handle_connection() -> Result<(), String> {
         // served static asset
     } else {
         log_message(&format!("404 {}", redact_token(&ctx.raw_request)));
-        send_response(404, "NotFound", "not found")?;
+        respond_text(&ctx, 404, "NotFound", "not found", "not-found", None)?;
     }
 
     Ok(())
@@ -229,7 +509,14 @@ fn handle_connection() -> Result<(), String> {
 
 fn handle_hello_sse(ctx: &RequestContext) -> Result<(), String> {
     if ctx.method != "GET" {
-        send_response(405, "MethodNotAllowed", "method not allowed")?;
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "sse-hello",
+            None,
+        )?;
         return Ok(());
     }
 
@@ -244,7 +531,7 @@ fn handle_hello_sse(ctx: &RequestContext) -> Result<(), String> {
     });
 
     log_message("200 sse hello handshake");
-    send_sse_event("hello", &payload.to_string())
+    respond_sse(ctx, "hello", &payload.to_string(), "sse-hello", None)
 }
 
 fn is_github_route(path: &str) -> bool {
@@ -360,7 +647,14 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
     if ctx.method != "GET" && ctx.method != "POST" {
         let redacted = redact_token(&ctx.raw_request);
         log_message(&format!("405 method-not-allowed {}", redacted));
-        send_response(405, "MethodNotAllowed", "method not allowed")?;
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "manual-auto-update",
+            Some(json!({ "reason": "method" })),
+        )?;
         return Ok(());
     }
 
@@ -375,11 +669,18 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
     let expected = env::var("WEBHOOK_TOKEN").unwrap_or_default();
     if expected.is_empty() || token.is_empty() || token != expected {
         log_message(&format!("401 {}", redacted_line));
-        send_response(401, "Unauthorized", "unauthorized")?;
+        respond_text(
+            ctx,
+            401,
+            "Unauthorized",
+            "unauthorized",
+            "manual-auto-update",
+            Some(json!({ "reason": "token" })),
+        )?;
         return Ok(());
     }
 
-    if !enforce_rate_limit(&redacted_line)? {
+    if !enforce_rate_limit(ctx, &redacted_line)? {
         return Ok(());
     }
 
@@ -387,7 +688,14 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
     let result = start_auto_update_unit(&unit)?;
     if result.success() {
         log_message(&format!("202 triggered unit={unit} {}", redacted_line));
-        send_response(202, "Accepted", "auto-update triggered")?;
+        respond_text(
+            ctx,
+            202,
+            "Accepted",
+            "auto-update triggered",
+            "manual-auto-update",
+            Some(json!({ "unit": unit })),
+        )?;
     } else {
         let mut message = format!(
             "500 failed unit={unit} {} exit={}",
@@ -399,10 +707,604 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
             message.push_str(&result.stderr);
         }
         log_message(&message);
-        send_response(500, "InternalServerError", "failed to trigger")?;
+        respond_text(
+            ctx,
+            500,
+            "InternalServerError",
+            "failed to trigger",
+            "manual-auto-update",
+            Some(json!({
+                "unit": unit,
+                "stderr": result.stderr,
+            })),
+        )?;
     }
 
     Ok(())
+}
+
+fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "POST" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "manual-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if ctx.path == "/api/manual/trigger" {
+        return handle_manual_trigger(ctx);
+    }
+
+    if let Some(rest) = ctx.path.strip_prefix("/api/manual/services/") {
+        return handle_manual_service(ctx, rest);
+    }
+
+    respond_text(
+        ctx,
+        404,
+        "NotFound",
+        "manual route not found",
+        "manual-api",
+        Some(json!({ "reason": "unknown-route" })),
+    )
+}
+
+fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
+    let request: ManualTriggerRequest = match parse_json_body(ctx) {
+        Ok(body) => body,
+        Err(err) => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "invalid request",
+                "manual-trigger",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let expected = manual_api_token();
+    if expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected {
+        respond_text(
+            ctx,
+            401,
+            "Unauthorized",
+            "unauthorized",
+            "manual-trigger",
+            Some(json!({ "reason": "token" })),
+        )?;
+        return Ok(());
+    }
+
+    let mut units: Vec<String> = if request.all || request.units.is_empty() {
+        manual_unit_list()
+    } else {
+        let mut resolved = Vec::new();
+        for item in &request.units {
+            if let Some(unit) = resolve_unit_identifier(item) {
+                resolved.push(unit);
+            }
+        }
+        resolved
+    };
+
+    if units.is_empty() {
+        respond_text(
+            ctx,
+            400,
+            "BadRequest",
+            "no units available",
+            "manual-trigger",
+            Some(json!({ "reason": "units" })),
+        )?;
+        return Ok(());
+    }
+
+    let dry_run = request.dry_run;
+    let results = trigger_units(&units, dry_run);
+    let (status, reason) = if all_units_ok(&results) {
+        (202, "Accepted")
+    } else {
+        (207, "Multi-Status")
+    };
+
+    units.sort();
+    units.dedup();
+
+    let response = ManualTriggerResponse {
+        triggered: results.clone(),
+        dry_run,
+        caller: request.caller.clone(),
+        reason: request.reason.clone(),
+    };
+
+    let payload = serde_json::to_value(&response).map_err(|e| e.to_string())?;
+    respond_json(
+        ctx,
+        status,
+        reason,
+        &payload,
+        "manual-trigger",
+        Some(json!({
+            "units": units,
+            "dry_run": dry_run,
+        })),
+    )
+}
+
+fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String> {
+    let trimmed = slug.trim_matches('/');
+    if trimmed.is_empty() {
+        respond_text(
+            ctx,
+            400,
+            "BadRequest",
+            "missing service",
+            "manual-service",
+            Some(json!({ "reason": "slug" })),
+        )?;
+        return Ok(());
+    }
+
+    let synthetic = format!("{trimmed}");
+    let Some(unit) = resolve_unit_identifier(&synthetic) else {
+        respond_text(
+            ctx,
+            404,
+            "NotFound",
+            "service not found",
+            "manual-service",
+            Some(json!({ "slug": trimmed })),
+        )?;
+        return Ok(());
+    };
+
+    let request: ServiceTriggerRequest = match parse_json_body(ctx) {
+        Ok(body) => body,
+        Err(err) => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "invalid request",
+                "manual-service",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let expected = manual_api_token();
+    if expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected {
+        respond_text(
+            ctx,
+            401,
+            "Unauthorized",
+            "unauthorized",
+            "manual-service",
+            Some(json!({ "reason": "token", "unit": unit })),
+        )?;
+        return Ok(());
+    }
+
+    let dry_run = request.dry_run;
+    if !dry_run {
+        if let Some(image) = request.image.as_deref() {
+            if let Err(err) = pull_container_image(image) {
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "image pull failed",
+                    "manual-service",
+                    Some(json!({ "unit": unit, "error": err })),
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    let result = trigger_single_unit(&unit, dry_run);
+    let status = if result.status == "triggered" || result.status == "dry-run" {
+        202
+    } else {
+        500
+    };
+    let reason = if status == 202 {
+        "Accepted"
+    } else {
+        "InternalServerError"
+    };
+
+    let response = json!({
+        "unit": unit,
+        "status": result.status,
+        "message": result.message,
+        "dry_run": dry_run,
+        "caller": request.caller,
+        "reason": request.reason,
+        "image": request.image,
+    });
+
+    respond_json(
+        ctx,
+        status,
+        reason,
+        &response,
+        "manual-service",
+        Some(json!({
+            "unit": unit,
+            "dry_run": dry_run,
+        })),
+    )
+}
+
+fn parse_json_body<T: DeserializeOwned>(ctx: &RequestContext) -> Result<T, String> {
+    if ctx.body.is_empty() {
+        return Err("missing body".into());
+    }
+    serde_json::from_slice(&ctx.body).map_err(|e| format!("invalid json: {e}"))
+}
+
+#[derive(Debug, Deserialize)]
+struct ManualTriggerRequest {
+    token: Option<String>,
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    units: Vec<String>,
+    #[serde(default)]
+    dry_run: bool,
+    caller: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceTriggerRequest {
+    token: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    caller: Option<String>,
+    reason: Option<String>,
+    image: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct UnitActionResult {
+    unit: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManualTriggerResponse {
+    triggered: Vec<UnitActionResult>,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Default)]
+struct ManualCliOptions {
+    units: Vec<String>,
+    dry_run: bool,
+    all: bool,
+    caller: Option<String>,
+    reason: Option<String>,
+}
+
+fn manual_api_token() -> String {
+    env::var(MANUAL_TOKEN_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| env::var("WEBHOOK_TOKEN").unwrap_or_default())
+}
+
+fn manual_unit_list() -> Vec<String> {
+    let mut units = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let manual = manual_auto_update_unit();
+    seen.insert(manual.clone());
+    units.push(manual);
+
+    if let Ok(raw) = env::var(MANUAL_UNITS_ENV) {
+        for entry in raw.split(|ch| ch == ',' || ch == '\n') {
+            if let Some(unit) = resolve_unit_identifier(entry) {
+                if seen.insert(unit.clone()) {
+                    units.push(unit);
+                }
+            }
+        }
+    }
+
+    units
+}
+
+fn resolve_unit_identifier(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.ends_with(".service") {
+        return Some(trimmed.to_string());
+    }
+
+    let slug = if trimmed.starts_with(GITHUB_ROUTE_PREFIX) {
+        trimmed.to_string()
+    } else {
+        format!("{GITHUB_ROUTE_PREFIX}/{trimmed}")
+    };
+
+    let synthetic = format!("/{slug}");
+    lookup_unit_from_path(&synthetic)
+}
+
+fn trigger_units(units: &[String], dry_run: bool) -> Vec<UnitActionResult> {
+    let mut results = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for unit in units {
+        if !seen.insert(unit.clone()) {
+            continue;
+        }
+        results.push(trigger_single_unit(unit, dry_run));
+    }
+    results
+}
+
+fn all_units_ok(results: &[UnitActionResult]) -> bool {
+    results
+        .iter()
+        .all(|r| r.status == "triggered" || r.status == "dry-run")
+}
+
+fn trigger_single_unit(unit: &str, dry_run: bool) -> UnitActionResult {
+    if dry_run {
+        log_message(&format!("debug manual-trigger dry-run unit={unit}"));
+        return UnitActionResult {
+            unit: unit.to_string(),
+            status: "dry-run".into(),
+            message: Some("skipped by dry run".into()),
+        };
+    }
+
+    let manual = manual_auto_update_unit();
+    let outcome = if unit == manual {
+        start_auto_update_unit(unit)
+    } else {
+        restart_unit(unit)
+    };
+
+    match outcome {
+        Ok(result) if result.success() => {
+            log_message(&format!("202 manual-trigger unit={unit}"));
+            UnitActionResult {
+                unit: unit.to_string(),
+                status: "triggered".into(),
+                message: None,
+            }
+        }
+        Ok(result) => {
+            let mut detail = format!("exit={}", exit_code_string(&result.status));
+            if !result.stderr.is_empty() {
+                detail.push_str(" stderr=");
+                detail.push_str(&result.stderr);
+            }
+            log_message(&format!("500 manual-trigger-failed unit={unit} {detail}"));
+            UnitActionResult {
+                unit: unit.to_string(),
+                status: "failed".into(),
+                message: Some(detail),
+            }
+        }
+        Err(err) => {
+            log_message(&format!("500 manual-trigger-error unit={unit} err={err}"));
+            UnitActionResult {
+                unit: unit.to_string(),
+                status: "error".into(),
+                message: Some(err),
+            }
+        }
+    }
+}
+
+fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result<(), String> {
+    let unit = manual_auto_update_unit();
+    let sleep = Duration::from_secs(interval_secs.max(60));
+    let mut iterations: u64 = 0;
+
+    loop {
+        iterations = iterations.saturating_add(1);
+        log_message(&format!(
+            "scheduler tick iteration={iterations} unit={unit}"
+        ));
+
+        match start_auto_update_unit(&unit) {
+            Ok(result) if result.success() => {
+                log_message(&format!(
+                    "scheduler triggered unit={unit} iteration={iterations}"
+                ));
+                record_system_event(
+                    "scheduler",
+                    202,
+                    json!({
+                        "unit": unit.clone(),
+                        "iteration": iterations,
+                        "status": "triggered",
+                    }),
+                );
+            }
+            Ok(result) => {
+                log_message(&format!(
+                    "scheduler failed unit={unit} iteration={iterations} exit={} stderr={}",
+                    exit_code_string(&result.status),
+                    result.stderr
+                ));
+                record_system_event(
+                    "scheduler",
+                    500,
+                    json!({
+                        "unit": unit.clone(),
+                        "iteration": iterations,
+                        "status": "failed",
+                        "stderr": result.stderr,
+                        "exit": exit_code_string(&result.status),
+                    }),
+                );
+            }
+            Err(err) => {
+                log_message(&format!(
+                    "scheduler error unit={unit} iteration={iterations} err={err}"
+                ));
+                record_system_event(
+                    "scheduler",
+                    500,
+                    json!({
+                        "unit": unit.clone(),
+                        "iteration": iterations,
+                        "status": "error",
+                        "error": err,
+                    }),
+                );
+            }
+        }
+
+        if let Some(limit) = max_iterations {
+            if iterations >= limit {
+                break;
+            }
+        }
+
+        thread::sleep(sleep);
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct StatePruneReport {
+    trimmed_entries: usize,
+    removed_files: usize,
+    removed_locks: usize,
+}
+
+fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneReport, String> {
+    let dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    let state_path = Path::new(&dir);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs();
+    let cutoff_secs = now_secs.saturating_sub(retention.as_secs().max(1));
+    let cutoff_time = SystemTime::now()
+        .checked_sub(retention)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+
+    let mut report = StatePruneReport::default();
+
+    let rate_db = state_path.join("ratelimit.db");
+    let (trimmed, removed) = prune_timestamp_db(&rate_db, cutoff_secs, dry_run)?;
+    report.trimmed_entries += trimmed;
+    if removed {
+        report.removed_files += 1;
+    }
+
+    let limit_dir = state_path.join(GITHUB_IMAGE_LIMIT_SUBDIR);
+    if limit_dir.is_dir() {
+        for entry in fs::read_dir(&limit_dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("db") {
+                continue;
+            }
+            let (trimmed, removed) = prune_timestamp_db(&path, cutoff_secs, dry_run)?;
+            report.trimmed_entries += trimmed;
+            if removed {
+                report.removed_files += 1;
+            }
+        }
+    }
+
+    let lock_dir = state_path.join(GITHUB_IMAGE_LOCK_SUBDIR);
+    report.removed_locks += prune_lock_dir(&lock_dir, cutoff_time, dry_run)?;
+
+    Ok(report)
+}
+
+fn prune_timestamp_db(
+    path: &Path,
+    cutoff_secs: u64,
+    dry_run: bool,
+) -> Result<(usize, bool), String> {
+    if !path.exists() {
+        return Ok((0, false));
+    }
+
+    let mut entries: Vec<u64> = fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse::<u64>().ok())
+        .collect();
+
+    let original_len = entries.len();
+    entries.retain(|&ts| ts >= cutoff_secs);
+    let removed = original_len.saturating_sub(entries.len());
+
+    if dry_run {
+        return Ok((removed, false));
+    }
+
+    if entries.is_empty() {
+        let _ = fs::remove_file(path);
+        return Ok((removed, true));
+    }
+
+    let mut file = File::create(path).map_err(|e| e.to_string())?;
+    for ts in entries {
+        writeln!(file, "{ts}").map_err(|e| e.to_string())?;
+    }
+
+    Ok((removed, false))
+}
+
+fn prune_lock_dir(dir: &Path, cutoff: SystemTime, dry_run: bool) -> Result<usize, String> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if let Ok(modified) = metadata.modified() {
+            if modified < cutoff {
+                removed += 1;
+                if !dry_run {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
@@ -432,19 +1334,42 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
                 .map(|meta| meta.len())
                 .unwrap_or(0)
                 .min(usize::MAX as u64);
-            send_head_response(200, "OK", content_type, len as usize)?;
+            respond_head(
+                ctx,
+                200,
+                "OK",
+                content_type,
+                len as usize,
+                "frontend",
+                Some(json!({ "asset": relative.to_string_lossy() })),
+            )?;
             return Ok(true);
         }
 
         let body = fs::read(&asset_path)
             .map_err(|e| format!("failed to read asset {}: {e}", asset_path.display()))?;
-        send_binary_response(200, "OK", content_type, &body)?;
+        respond_binary(
+            ctx,
+            200,
+            "OK",
+            content_type,
+            &body,
+            "frontend",
+            Some(json!({ "asset": relative.to_string_lossy() })),
+        )?;
         return Ok(true);
     }
 
     if relative == PathBuf::from("index.html") {
         log_message("500 web-ui missing index.html");
-        send_response(500, "InternalServerError", "web ui not built")?;
+        respond_text(
+            ctx,
+            500,
+            "InternalServerError",
+            "web ui not built",
+            "frontend",
+            Some(json!({ "asset": relative.to_string_lossy() })),
+        )?;
         return Ok(true);
     }
 
@@ -453,7 +1378,14 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
         ctx.path,
         relative.display()
     ));
-    send_response(404, "NotFound", "asset not found")?;
+    respond_text(
+        ctx,
+        404,
+        "NotFound",
+        "asset not found",
+        "frontend",
+        Some(json!({ "asset": relative.to_string_lossy() })),
+    )?;
     Ok(true)
 }
 
@@ -514,14 +1446,28 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             "405 github-method-not-allowed {}",
             ctx.raw_request
         ));
-        send_response(405, "MethodNotAllowed", "method not allowed")?;
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "github-webhook",
+            Some(json!({ "reason": "method" })),
+        )?;
         return Ok(());
     }
 
     let secret = env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default();
     if secret.is_empty() {
         log_message("500 github-misconfigured missing secret");
-        send_response(500, "InternalServerError", "server misconfigured")?;
+        respond_text(
+            ctx,
+            500,
+            "InternalServerError",
+            "server misconfigured",
+            "github-webhook",
+            Some(json!({ "reason": "missing-secret" })),
+        )?;
         return Ok(());
     }
 
@@ -529,7 +1475,14 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         Some(value) => value,
         None => {
             log_message("401 github missing signature");
-            send_response(401, "Unauthorized", "unauthorized")?;
+            respond_text(
+                ctx,
+                401,
+                "Unauthorized",
+                "unauthorized",
+                "github-webhook",
+                Some(json!({ "reason": "missing-signature" })),
+            )?;
             return Ok(());
         }
     };
@@ -537,7 +1490,14 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
     let valid_signature = verify_github_signature(signature, &secret, &ctx.body)?;
     if !valid_signature {
         log_message("401 github invalid signature");
-        send_response(401, "Unauthorized", "unauthorized")?;
+        respond_text(
+            ctx,
+            401,
+            "Unauthorized",
+            "unauthorized",
+            "github-webhook",
+            Some(json!({ "reason": "signature" })),
+        )?;
         return Ok(());
     }
 
@@ -549,7 +1509,14 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
 
     if !github_event_allowed(&event) {
         log_message(&format!("202 github event-ignored event={event}"));
-        send_response(202, "Accepted", "event ignored")?;
+        respond_text(
+            ctx,
+            202,
+            "Accepted",
+            "event ignored",
+            "github-webhook",
+            Some(json!({ "reason": "event", "event": event })),
+        )?;
         return Ok(());
     }
 
@@ -558,7 +1525,14 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             "202 github event={event} path={} no-unit-mapped",
             ctx.path
         ));
-        send_response(202, "Accepted", "event ignored")?;
+        respond_text(
+            ctx,
+            202,
+            "Accepted",
+            "event ignored",
+            "github-webhook",
+            Some(json!({ "reason": "no-unit", "event": event })),
+        )?;
         return Ok(());
     };
 
@@ -566,7 +1540,14 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         Ok(img) => img,
         Err(reason) => {
             log_message(&format!("202 github event={event} skipped reason={reason}"));
-            send_response(202, "Accepted", "event ignored")?;
+            respond_text(
+                ctx,
+                202,
+                "Accepted",
+                "event ignored",
+                "github-webhook",
+                Some(json!({ "reason": reason, "event": event })),
+            )?;
             return Ok(());
         }
     };
@@ -576,7 +1557,14 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             log_message(&format!(
                 "202 github event={event} unit={unit} image={image} expected={expected} skipped=tag-mismatch"
             ));
-            send_response(202, "Accepted", "tag mismatch")?;
+            respond_text(
+                ctx,
+                202,
+                "Accepted",
+                "tag mismatch",
+                "github-webhook",
+                Some(json!({ "unit": unit, "expected": expected, "image": image })),
+            )?;
             return Ok(());
         }
     }
@@ -593,14 +1581,28 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
                 log_message(&format!(
                     "429 github-rate-limit lock-timeout image={image} event={event}"
                 ));
-                send_response(429, "Too Many Requests", "rate limited")?;
+                respond_text(
+                    ctx,
+                    429,
+                    "Too Many Requests",
+                    "rate limited",
+                    "github-webhook",
+                    Some(json!({ "reason": "lock", "image": image })),
+                )?;
                 return Ok(());
             }
             RateLimitError::Exceeded { c1, l1, .. } => {
                 log_message(&format!(
                     "429 github-rate-limit image={image} count={c1}/{l1} event={event}"
                 ));
-                send_response(429, "Too Many Requests", "rate limited")?;
+                respond_text(
+                    ctx,
+                    429,
+                    "Too Many Requests",
+                    "rate limited",
+                    "github-webhook",
+                    Some(json!({ "c1": c1, "l1": l1, "image": image })),
+                )?;
                 return Ok(());
             }
             RateLimitError::Io(err) => return Err(err),
@@ -617,26 +1619,54 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             "500 github-dispatch-failed unit={unit} image={image} event={event} delivery={delivery} path={} err={err}",
             ctx.path
         ));
-        send_response(500, "InternalServerError", "failed to dispatch")?;
+        respond_text(
+            ctx,
+            500,
+            "InternalServerError",
+            "failed to dispatch",
+            "github-webhook",
+            Some(json!({ "unit": unit, "image": image })),
+        )?;
         return Ok(());
     }
 
-    send_response(202, "Accepted", "auto-update queued")
+    respond_text(
+        ctx,
+        202,
+        "Accepted",
+        "auto-update queued",
+        "github-webhook",
+        Some(json!({ "unit": unit, "image": image, "delivery": delivery })),
+    )
 }
 
-fn enforce_rate_limit(context: &str) -> Result<bool, String> {
+fn enforce_rate_limit(ctx: &RequestContext, context: &str) -> Result<bool, String> {
     match rate_limit_check() {
         Ok(()) => Ok(true),
         Err(RateLimitError::LockTimeout) => {
             log_message("429 rate-limit lock-timeout");
-            send_response(429, "Too Many Requests", "rate limited")?;
+            respond_text(
+                ctx,
+                429,
+                "Too Many Requests",
+                "rate limited",
+                "manual-auto-update",
+                Some(json!({ "reason": "lock" })),
+            )?;
             Ok(false)
         }
         Err(RateLimitError::Exceeded { c1, l1, c2, l2 }) => {
             log_message(&format!(
                 "429 rate-limit c1={c1}/{l1} c2={c2}/{l2} ({context})"
             ));
-            send_response(429, "Too Many Requests", "rate limited")?;
+            respond_text(
+                ctx,
+                429,
+                "Too Many Requests",
+                "rate limited",
+                "manual-auto-update",
+                Some(json!({ "c1": c1, "l1": l1, "c2": c2, "l2": l2 })),
+            )?;
             Ok(false)
         }
         Err(RateLimitError::Io(err)) => Err(err),
@@ -871,18 +1901,15 @@ fn spawn_background_task(
         "debug github-dispatch-launch unit={unit} image={image} event={event} delivery={delivery} path={path} exe={exe_str} task-unit={unit_name}"
     ));
 
+    let args = build_systemd_run_args(&unit_name, exe_str, unit, image, event, delivery, path);
+
+    if let Ok(snapshot) = env::var("WEBHOOK_SYSTEMD_RUN_SNAPSHOT") {
+        fs::write(snapshot, args.join("\n")).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     let status = Command::new("systemd-run")
-        .arg("--user")
-        .arg("--collect")
-        .arg("--quiet")
-        .arg(format!("--unit={unit_name}"))
-        .arg(exe_str)
-        .arg("--run-task")
-        .arg(unit)
-        .arg(image)
-        .arg(event)
-        .arg(delivery)
-        .arg(path)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -894,6 +1921,30 @@ fn spawn_background_task(
     } else {
         Err(exit_code_string(&status))
     }
+}
+
+fn build_systemd_run_args(
+    unit_name: &str,
+    exe: &str,
+    unit: &str,
+    image: &str,
+    event: &str,
+    delivery: &str,
+    path: &str,
+) -> Vec<String> {
+    vec![
+        "--user".into(),
+        "--collect".into(),
+        "--quiet".into(),
+        format!("--unit={unit_name}"),
+        exe.to_string(),
+        "--run-task".into(),
+        unit.to_string(),
+        image.to_string(),
+        event.to_string(),
+        delivery.to_string(),
+        path.to_string(),
+    ]
 }
 
 fn run_background_task(
@@ -1044,6 +2095,7 @@ fn images_match(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::env;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -1089,6 +2141,76 @@ mod tests {
             "ghcr.io/example/app:latest",
             "ghcr.io/example/app:v1"
         ));
+    }
+
+    #[test]
+    fn github_payload_builds_full_image() {
+        let payload = json!({
+            "package": {
+                "name": "demo",
+                "namespace": "Example",
+                "package_type": "CONTAINER"
+            },
+            "registry": { "host": "ghcr.io" },
+            "package_version": {
+                "metadata": { "container": { "tags": ["main"] } }
+            }
+        })
+        .to_string();
+
+        let image = extract_container_image(payload.as_bytes()).unwrap();
+        assert_eq!(image, "ghcr.io/example/demo:main");
+    }
+
+    #[test]
+    fn rate_limit_enforces_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe {
+            env::set_var("WEBHOOK_STATE_DIR", dir.path());
+            env::set_var("WEBHOOK_LIMIT1_COUNT", "1");
+            env::set_var("WEBHOOK_LIMIT1_WINDOW", "3600");
+            env::set_var("WEBHOOK_LIMIT2_COUNT", "5");
+            env::set_var("WEBHOOK_LIMIT2_WINDOW", "3600");
+        }
+
+        assert!(rate_limit_check().is_ok());
+        assert!(matches!(
+            rate_limit_check(),
+            Err(RateLimitError::Exceeded { .. })
+        ));
+
+        unsafe {
+            env::remove_var("WEBHOOK_STATE_DIR");
+            env::remove_var("WEBHOOK_LIMIT1_COUNT");
+            env::remove_var("WEBHOOK_LIMIT1_WINDOW");
+            env::remove_var("WEBHOOK_LIMIT2_COUNT");
+            env::remove_var("WEBHOOK_LIMIT2_WINDOW");
+        }
+    }
+
+    #[test]
+    fn systemd_run_args_match_expected() {
+        let args = build_systemd_run_args(
+            "webhook-task-demo",
+            "/usr/bin/webhook",
+            "demo.service",
+            "ghcr.io/example/demo:main",
+            "registry_package",
+            "delivery123",
+            "/github-package-update/demo",
+        );
+
+        assert_eq!(args[0], "--user");
+        assert_eq!(args[1], "--collect");
+        assert_eq!(args[2], "--quiet");
+        assert_eq!(args[3], "--unit=webhook-task-demo");
+        assert_eq!(args[4], "/usr/bin/webhook");
+        assert_eq!(args[5], "--run-task");
+        assert_eq!(args[6], "demo.service");
+        assert_eq!(args[7], "ghcr.io/example/demo:main");
+        assert_eq!(args[8], "registry_package");
+        assert_eq!(args[9], "delivery123");
+        assert_eq!(args[10], "/github-package-update/demo");
     }
 }
 
@@ -1325,6 +2447,299 @@ fn send_sse_event(event: &str, data: &str) -> Result<(), String> {
         }
         Err(err) => Err(err.to_string()),
     }
+}
+
+fn db_pool() -> Option<SqlitePool> {
+    DB_POOL.get_or_init(init_db_pool).clone()
+}
+
+fn init_db_pool() -> Option<SqlitePool> {
+    let url = env::var(WEBHOOK_DB_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("sqlite://{DEFAULT_DB_PATH}"));
+
+    ensure_sqlite_storage(&url);
+    let trimmed = url.trim();
+
+    let runtime = DB_RUNTIME.get_or_init(|| Runtime::new().expect("failed to create db runtime"));
+
+    match runtime.block_on(async {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(trimmed)
+            .await?;
+        MIGRATOR.run(&pool).await?;
+        Ok::<SqlitePool, sqlx::Error>(pool)
+    }) {
+        Ok(pool) => Some(pool),
+        Err(err) => {
+            log_message(&format!("warn db-init-failed err={err}"));
+            None
+        }
+    }
+}
+
+fn ensure_sqlite_storage(conn: &str) {
+    if let Some(path) = conn.strip_prefix("sqlite://") {
+        let path = Path::new(path);
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                log_message(&format!(
+                    "warn db-dir-create-failed path={} err={}",
+                    parent.display(),
+                    err
+                ));
+            }
+        }
+    }
+}
+
+fn persist_event_record(
+    request_id: &str,
+    ts_secs: u64,
+    method: &str,
+    path: Option<&str>,
+    status: u16,
+    action: &str,
+    elapsed_ms: u64,
+    meta: &Value,
+) {
+    let Some(pool) = db_pool() else {
+        return;
+    };
+    let runtime = match DB_RUNTIME.get() {
+        Some(rt) => rt,
+        None => return,
+    };
+
+    let Ok(meta_str) = serde_json::to_string(meta) else {
+        return;
+    };
+
+    let record = DbEventRecord {
+        request_id: request_id.to_string(),
+        ts: ts_secs as i64,
+        method: method.to_string(),
+        path: path.map(|p| p.to_string()),
+        status: status as i64,
+        action: action.to_string(),
+        duration_ms: elapsed_ms as i64,
+        meta: meta_str,
+    };
+    let pool = pool.clone();
+
+    runtime.spawn(async move {
+        if let Err(err) = sqlx::query(
+            "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.request_id)
+        .bind(record.ts)
+        .bind(record.method)
+        .bind(record.path)
+        .bind(record.status)
+        .bind(record.action)
+        .bind(record.duration_ms)
+        .bind(record.meta)
+        .execute(&pool)
+        .await
+        {
+            log_message(&format!("warn db-insert-failed err={err}"));
+        }
+    });
+}
+
+fn record_system_event(action: &str, status: u16, meta: Value) {
+    let ts = current_unix_secs();
+    persist_event_record("system", ts, "SYSTEM", None, status, action, 0, &meta);
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
+fn system_time_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs()
+}
+
+struct DbEventRecord {
+    request_id: String,
+    ts: i64,
+    method: String,
+    path: Option<String>,
+    status: i64,
+    action: String,
+    duration_ms: i64,
+    meta: String,
+}
+
+fn respond_text(
+    ctx: &RequestContext,
+    status: u16,
+    reason: &str,
+    body: &str,
+    action: &str,
+    extra: Option<Value>,
+) -> Result<(), String> {
+    let metadata = extra.unwrap_or_else(|| json!({ "body": reason }));
+    let result = send_response(status, reason, body);
+    log_audit_event(ctx, status, action, metadata);
+    result
+}
+
+fn respond_json(
+    ctx: &RequestContext,
+    status: u16,
+    reason: &str,
+    payload: &Value,
+    action: &str,
+    extra: Option<Value>,
+) -> Result<(), String> {
+    let body = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
+    let mut metadata = extra.unwrap_or_else(|| json!({}));
+    metadata["response_size"] = Value::from(body.len() as u64);
+    let result = send_binary_response(status, reason, "application/json; charset=utf-8", &body);
+    log_audit_event(ctx, status, action, metadata);
+    result
+}
+
+fn respond_binary(
+    ctx: &RequestContext,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+    action: &str,
+    extra: Option<Value>,
+) -> Result<(), String> {
+    let mut metadata = extra.unwrap_or_else(|| json!({}));
+    metadata["response_size"] = Value::from(body.len() as u64);
+    let result = send_binary_response(status, reason, content_type, body);
+    log_audit_event(ctx, status, action, metadata);
+    result
+}
+
+fn respond_head(
+    ctx: &RequestContext,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    content_length: usize,
+    action: &str,
+    extra: Option<Value>,
+) -> Result<(), String> {
+    let mut metadata = extra.unwrap_or_else(|| json!({}));
+    metadata["response_size"] = Value::from(content_length as u64);
+    let result = send_head_response(status, reason, content_type, content_length);
+    log_audit_event(ctx, status, action, metadata);
+    result
+}
+
+fn respond_sse(
+    ctx: &RequestContext,
+    event: &str,
+    payload: &str,
+    action: &str,
+    extra: Option<Value>,
+) -> Result<(), String> {
+    let mut metadata = extra.unwrap_or_else(|| json!({}));
+    metadata["event"] = Value::from(event);
+    metadata["response_size"] = Value::from(payload.len() as u64);
+    let result = send_sse_event(event, payload);
+    log_audit_event(ctx, 200, action, metadata);
+    result
+}
+
+fn respond_basic_error(
+    request_id: &str,
+    method: &str,
+    path: &str,
+    raw_request: &str,
+    status: u16,
+    reason: &str,
+    body: &str,
+    action: &str,
+    started_at: Instant,
+    received_at: SystemTime,
+) -> Result<(), String> {
+    let result = send_response(status, reason, body);
+    log_simple_audit(
+        request_id,
+        method,
+        path,
+        None,
+        raw_request,
+        status,
+        action,
+        json!({ "body": reason }),
+        started_at,
+        received_at,
+    );
+    result
+}
+
+fn log_audit_event(ctx: &RequestContext, status: u16, action: &str, mut meta: Value) {
+    let elapsed_ms = ctx.started_at.elapsed().as_millis() as u64;
+    let query = ctx.query.as_ref().map(|q| redact_token(q));
+    meta["path"] = Value::from(ctx.path.clone());
+    if let Some(q) = query.clone() {
+        meta["query"] = Value::from(q);
+    }
+    persist_event_record(
+        &ctx.request_id,
+        system_time_secs(ctx.received_at),
+        &ctx.method,
+        Some(&ctx.path),
+        status,
+        action,
+        elapsed_ms,
+        &meta,
+    );
+}
+
+fn log_simple_audit(
+    request_id: &str,
+    method: &str,
+    path: &str,
+    query: Option<String>,
+    raw_request: &str,
+    status: u16,
+    action: &str,
+    meta: Value,
+    started_at: Instant,
+    received_at: SystemTime,
+) {
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+    let meta_value = json!({
+        "path": path,
+        "query": query,
+        "raw": redact_token(raw_request),
+        "info": meta,
+    });
+    persist_event_record(
+        request_id,
+        system_time_secs(received_at),
+        method,
+        Some(path),
+        status,
+        action,
+        elapsed_ms,
+        &meta_value,
+    );
+}
+
+fn next_request_id() -> String {
+    let seq = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis();
+    format!("{ts:x}-{seq:04x}")
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, String> {
