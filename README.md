@@ -25,8 +25,8 @@ executes `webhook-auto-update server`). For housekeeping, use the CLI
 subcommands below; for example:
 
 ```bash
-webhook-auto-update prune-state --max-age-hours 48      # remove entries older than 48h
-webhook-auto-update prune-state --dry-run               # show what would be deleted
+PATH="$PWD/tests/mock-bin:$PATH" webhook-auto-update trigger-units demo.service --dry-run
+PATH="$PWD/tests/mock-bin:$PATH" webhook-auto-update prune-state --max-age-hours 48
 ```
 
 This command prunes stale timestamps, drops empty `.db` files, and removes lock

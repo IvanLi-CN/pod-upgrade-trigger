@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+log="$(dirname "$0")/log.txt"
+mkdir -p "$(dirname "$log")"
+
+echo "systemctl $*" >> "$log"
+
+if [[ "$*" =~ --user\ (start|restart)\ (.+) ]]; then
+  unit="${BASH_REMATCH[2]}"
+  IFS=',' read -ra FAILS <<< "${MOCK_SYSTEMCTL_FAIL:-}"
+  for u in "${FAILS[@]}"; do
+    if [[ "$u" == "$unit" ]]; then
+      echo "simulated systemctl fail for $unit" >&2
+      exit 44
+    fi
+  done
+fi
+
+exit 0
