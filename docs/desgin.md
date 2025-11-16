@@ -25,9 +25,9 @@
    - 支持 `--max-iterations`，方便在 CI 或短期任务中执行有限次数。
 
 5. **速率限制与状态维护**
-   - `/auto-update` 入口使用两级窗口（`ratelimit.db`）记录触发时间戳；
-   - GitHub 镜像级别的限制使用 `github-image-limits/<image>.db` 配合文件锁，保证每个镜像一定时间内最多触发指定次数；
-   - 提供 `--prune-state` 命令清理旧时间戳、删除空数据库与过期锁文件。
+   - `/auto-update` 入口使用 SQLite 中的 `rate_limit_tokens` 表记录触发时间戳（双窗口限制）；
+   - GitHub 镜像级别限制与并发锁也落在 SQLite（`rate_limit_tokens` + `image_locks`），保证同一镜像在指定窗口内的触发次数；
+   - 提供 `--prune-state` 命令清理旧令牌、过期锁，以及历史遗留的目录文件。
 
 6. **静态资源托管**
    - `try_serve_frontend` 将 `WEBHOOK_WEB_DIST`（默认 `state_dir/web/dist`）中的编译产物暴露在 `/`、`/assets/*`、`/favicon.ico` 等路径下，便于嵌入可视化界面。
@@ -64,7 +64,7 @@ Persistence & Rate limits
 ## 数据持久化
 
 - **State Dir**：依旧保留 `ratelimit.db`、`github-image-*` 等纯文本数据库，负责限流与锁机制。
-- **SQL 数据库**：默认连接 `sqlite://data/pod-upgrade-trigger.db`（可用 `WEBHOOK_DB_URL` 覆盖），启动时使用 `sqlx::migrate!` 自动执行 `migrations/` 目录中的脚本；所有 HTTP/CLI/调度事件都会异步写入 `event_log` 表（字段包含 `request_id/method/path/status/duration/meta` 等）。
+- **SQL 数据库**：默认连接 `sqlite://data/pod-upgrade-trigger.db`（可用 `WEBHOOK_DB_URL` 覆盖），启动时使用 `sqlx::migrate!` 自动执行 `migrations/` 目录中的脚本；同一个数据库同时保存请求事件（`event_log`）、限流令牌（`rate_limit_tokens`）以及镜像锁（`image_locks`）。
 
 ## 扩展点
 

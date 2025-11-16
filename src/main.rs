@@ -1,6 +1,5 @@
 use hex::decode;
 use hmac::{Hmac, Mac};
-use libc::{self, LOCK_EX, LOCK_NB, LOCK_UN};
 use regex::Regex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -10,9 +9,9 @@ use sqlx::migrate::Migrator;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+use std::future::Future;
 use std::io::{self, BufRead, Read, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
@@ -33,8 +32,6 @@ const DEFAULT_LIMIT2_COUNT: u64 = 10;
 const DEFAULT_LIMIT2_WINDOW: u64 = 18_000; // 5 hours
 const GITHUB_IMAGE_LIMIT_COUNT: u64 = 60;
 const GITHUB_IMAGE_LIMIT_WINDOW: u64 = 3_600; // 1 hour
-const GITHUB_IMAGE_LIMIT_SUBDIR: &str = "github-image-limits";
-const GITHUB_IMAGE_LOCK_SUBDIR: &str = "github-image-locks";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MANUAL_UNIT: &str = "podman-auto-update.service";
 const DEFAULT_REGISTRY_HOST: &str = "ghcr.io";
@@ -49,7 +46,7 @@ const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DB_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-static DB_POOL: OnceLock<Option<SqlitePool>> = OnceLock::new();
+static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 type HmacSha256 = Hmac<Sha256>;
@@ -353,8 +350,8 @@ fn run_prune_cli(args: &[String]) -> ! {
     match prune_state_dir(Duration::from_secs(retention_secs.max(1)), dry_run) {
         Ok(report) => {
             println!(
-                "Trimmed entries={} removed_dbs={} removed_locks={} dry_run={}",
-                report.trimmed_entries, report.removed_files, report.removed_locks, dry_run
+                "Removed tokens={} legacy_entries={} stale_locks={} dry_run={}",
+                report.tokens_removed, report.legacy_dirs_removed, report.locks_removed, dry_run
             );
             std::process::exit(0);
         }
@@ -1194,117 +1191,85 @@ fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result
 
 #[derive(Default)]
 struct StatePruneReport {
-    trimmed_entries: usize,
-    removed_files: usize,
-    removed_locks: usize,
+    tokens_removed: usize,
+    locks_removed: usize,
+    legacy_dirs_removed: usize,
 }
 
 fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneReport, String> {
     let dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
     let state_path = Path::new(&dir);
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
-    let cutoff_secs = now_secs.saturating_sub(retention.as_secs().max(1));
-    let cutoff_time = SystemTime::now()
-        .checked_sub(retention)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let now_secs = current_unix_secs();
+    let cutoff_secs = now_secs.saturating_sub(retention.as_secs().max(1)) as i64;
 
     let mut report = StatePruneReport::default();
 
-    let rate_db = state_path.join("ratelimit.db");
-    let (trimmed, removed) = prune_timestamp_db(&rate_db, cutoff_secs, dry_run)?;
-    report.trimmed_entries += trimmed;
-    if removed {
-        report.removed_files += 1;
-    }
+    report.tokens_removed = if dry_run {
+        with_db(|pool| async move {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM rate_limit_tokens WHERE ts < ?")
+                    .bind(cutoff_secs)
+                    .fetch_one(&pool)
+                    .await?;
+            Ok::<usize, sqlx::Error>(count as usize)
+        })?
+    } else {
+        with_db(|pool| async move {
+            let res = sqlx::query("DELETE FROM rate_limit_tokens WHERE ts < ?")
+                .bind(cutoff_secs)
+                .execute(&pool)
+                .await?;
+            Ok::<usize, sqlx::Error>(res.rows_affected() as usize)
+        })?
+    };
 
-    let limit_dir = state_path.join(GITHUB_IMAGE_LIMIT_SUBDIR);
-    if limit_dir.is_dir() {
-        for entry in fs::read_dir(&limit_dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("db") {
-                continue;
-            }
-            let (trimmed, removed) = prune_timestamp_db(&path, cutoff_secs, dry_run)?;
-            report.trimmed_entries += trimmed;
-            if removed {
-                report.removed_files += 1;
-            }
-        }
-    }
+    let lock_cutoff = SystemTime::now()
+        .checked_sub(retention)
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_secs() as i64;
 
-    let lock_dir = state_path.join(GITHUB_IMAGE_LOCK_SUBDIR);
-    report.removed_locks += prune_lock_dir(&lock_dir, cutoff_time, dry_run)?;
+    report.locks_removed = if dry_run {
+        with_db(|pool| async move {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM image_locks WHERE acquired_at < ?")
+                    .bind(lock_cutoff)
+                    .fetch_one(&pool)
+                    .await?;
+            Ok::<usize, sqlx::Error>(count as usize)
+        })?
+    } else {
+        with_db(|pool| async move {
+            let res = sqlx::query("DELETE FROM image_locks WHERE acquired_at < ?")
+                .bind(lock_cutoff)
+                .execute(&pool)
+                .await?;
+            Ok::<usize, sqlx::Error>(res.rows_affected() as usize)
+        })?
+    };
 
-    Ok(report)
-}
-
-fn prune_timestamp_db(
-    path: &Path,
-    cutoff_secs: u64,
-    dry_run: bool,
-) -> Result<(usize, bool), String> {
-    if !path.exists() {
-        return Ok((0, false));
-    }
-
-    let mut entries: Vec<u64> = fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<u64>().ok())
-        .collect();
-
-    let original_len = entries.len();
-    entries.retain(|&ts| ts >= cutoff_secs);
-    let removed = original_len.saturating_sub(entries.len());
-
-    if dry_run {
-        return Ok((removed, false));
-    }
-
-    if entries.is_empty() {
-        let _ = fs::remove_file(path);
-        return Ok((removed, true));
-    }
-
-    let mut file = File::create(path).map_err(|e| e.to_string())?;
-    for ts in entries {
-        writeln!(file, "{ts}").map_err(|e| e.to_string())?;
-    }
-
-    Ok((removed, false))
-}
-
-fn prune_lock_dir(dir: &Path, cutoff: SystemTime, dry_run: bool) -> Result<usize, String> {
-    if !dir.is_dir() {
-        return Ok(0);
-    }
-
-    let mut removed = 0;
-    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let metadata = match entry.metadata() {
-            Ok(meta) => meta,
-            Err(_) => continue,
-        };
-        if let Ok(modified) = metadata.modified() {
-            if modified < cutoff {
-                removed += 1;
-                if !dry_run {
-                    let _ = fs::remove_file(&path);
+    if !dry_run {
+        for legacy in [
+            "github-image-limits",
+            "github-image-locks",
+            "ratelimit.db",
+            "ratelimit.lock",
+        ] {
+            let path = state_path.join(legacy);
+            if path.exists() {
+                if path.is_dir() {
+                    if fs::remove_dir_all(&path).is_ok() {
+                        report.legacy_dirs_removed += 1;
+                    }
+                } else if fs::remove_file(&path).is_ok() {
+                    report.legacy_dirs_removed += 1;
                 }
             }
         }
     }
 
-    Ok(removed)
+    Ok(report)
 }
 
 fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
@@ -1674,122 +1639,179 @@ fn enforce_rate_limit(ctx: &RequestContext, context: &str) -> Result<bool, Strin
 }
 
 struct ImageTaskGuard {
-    _lock: FlockGuard,
+    _lock: ImageLockGuard,
+}
+
+struct ImageLockGuard {
+    bucket: String,
+}
+
+impl Drop for ImageLockGuard {
+    fn drop(&mut self) {
+        let bucket = self.bucket.clone();
+        let _ = with_db(move |pool| async move {
+            let _ = sqlx::query("DELETE FROM image_locks WHERE bucket = ?")
+                .bind(bucket)
+                .execute(&pool)
+                .await?;
+            Ok::<(), sqlx::Error>(())
+        });
+    }
 }
 
 fn check_github_image_limit(image: &str) -> Result<(), RateLimitError> {
-    let state_dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
-    let state_path = Path::new(&state_dir);
-    fs::create_dir_all(state_path).map_err(|e| RateLimitError::Io(e.to_string()))?;
-
-    let key = sanitize_image_key(image);
-
-    let limit_dir = state_path.join(GITHUB_IMAGE_LIMIT_SUBDIR);
-    fs::create_dir_all(&limit_dir).map_err(|e| RateLimitError::Io(e.to_string()))?;
-    let db_path = limit_dir.join(format!("{key}.db"));
-
-    let lock_dir = state_path.join(GITHUB_IMAGE_LOCK_SUBDIR);
-    fs::create_dir_all(&lock_dir).map_err(|e| RateLimitError::Io(e.to_string()))?;
-    let lock_path = lock_dir.join(format!("{key}.lock"));
-
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| RateLimitError::Io(e.to_string()))?;
-
-    let _guard = FlockGuard::lock_blocking(lock_file)?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
-    let cutoff = now.saturating_sub(GITHUB_IMAGE_LIMIT_WINDOW);
-
-    let mut entries: Vec<u64> = fs::read_to_string(&db_path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<u64>().ok())
-        .collect();
-
-    entries.retain(|&ts| ts >= cutoff);
-
-    let count = entries.len() as u64;
-    if count >= GITHUB_IMAGE_LIMIT_COUNT {
-        return Err(RateLimitError::Exceeded {
-            c1: count,
-            l1: GITHUB_IMAGE_LIMIT_COUNT,
-            c2: count,
-            l2: GITHUB_IMAGE_LIMIT_COUNT,
-        });
-    }
-
-    let mut file = File::create(&db_path).map_err(|e| RateLimitError::Io(e.to_string()))?;
-    for ts in entries {
-        writeln!(file, "{ts}").map_err(|e| RateLimitError::Io(e.to_string()))?;
-    }
-
-    Ok(())
+    let bucket = sanitize_image_key(image);
+    let windows = [RateWindow {
+        limit: GITHUB_IMAGE_LIMIT_COUNT,
+        window: GITHUB_IMAGE_LIMIT_WINDOW,
+    }];
+    apply_rate_limits(
+        "github-image",
+        &bucket,
+        current_unix_secs(),
+        &windows,
+        false,
+    )
 }
 
 fn enforce_github_image_limit(image: &str) -> Result<ImageTaskGuard, RateLimitError> {
-    let state_dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
-    let state_path = Path::new(&state_dir);
-    fs::create_dir_all(state_path).map_err(|e| RateLimitError::Io(e.to_string()))?;
+    let bucket = sanitize_image_key(image);
+    let lock = acquire_image_lock(&bucket)?;
+    let windows = [RateWindow {
+        limit: GITHUB_IMAGE_LIMIT_COUNT,
+        window: GITHUB_IMAGE_LIMIT_WINDOW,
+    }];
 
-    let key = sanitize_image_key(image);
-
-    let limit_dir = state_path.join(GITHUB_IMAGE_LIMIT_SUBDIR);
-    fs::create_dir_all(&limit_dir).map_err(|e| RateLimitError::Io(e.to_string()))?;
-    let db_path = limit_dir.join(format!("{key}.db"));
-
-    let lock_dir = state_path.join(GITHUB_IMAGE_LOCK_SUBDIR);
-    fs::create_dir_all(&lock_dir).map_err(|e| RateLimitError::Io(e.to_string()))?;
-    let lock_path = lock_dir.join(format!("{key}.lock"));
-
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| RateLimitError::Io(e.to_string()))?;
-
-    let guard = FlockGuard::lock_blocking(lock_file)?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
-    let cutoff = now.saturating_sub(GITHUB_IMAGE_LIMIT_WINDOW);
-
-    let mut entries: Vec<u64> = fs::read_to_string(&db_path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<u64>().ok())
-        .collect();
-
-    entries.retain(|&ts| ts >= cutoff);
-
-    let count = entries.len() as u64;
-    if count >= GITHUB_IMAGE_LIMIT_COUNT {
-        drop(guard);
-        return Err(RateLimitError::Exceeded {
-            c1: count,
-            l1: GITHUB_IMAGE_LIMIT_COUNT,
-            c2: count,
-            l2: GITHUB_IMAGE_LIMIT_COUNT,
-        });
+    match apply_rate_limits("github-image", &bucket, current_unix_secs(), &windows, true) {
+        Ok(()) => Ok(ImageTaskGuard { _lock: lock }),
+        Err(err) => {
+            drop(lock);
+            Err(err)
+        }
     }
+}
 
-    entries.push(now);
+fn acquire_image_lock(bucket: &str) -> Result<ImageLockGuard, RateLimitError> {
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    let bucket_owned = bucket.to_string();
+    loop {
+        let now = current_unix_secs();
+        let bucket_for_query = bucket_owned.clone();
+        let inserted = with_db(move |pool| async move {
+            let res = sqlx::query(
+                "INSERT INTO image_locks (bucket, acquired_at) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(bucket_for_query)
+            .bind(now as i64)
+            .execute(&pool)
+            .await?;
+            Ok::<u64, sqlx::Error>(res.rows_affected())
+        })
+        .map_err(RateLimitError::Io)?;
 
-    let mut file = File::create(&db_path).map_err(|e| RateLimitError::Io(e.to_string()))?;
-    for ts in entries {
-        writeln!(file, "{ts}").map_err(|e| RateLimitError::Io(e.to_string()))?;
+        if inserted > 0 {
+            return Ok(ImageLockGuard {
+                bucket: bucket_owned.clone(),
+            });
+        }
+
+        if Instant::now() >= deadline {
+            return Err(RateLimitError::LockTimeout);
+        }
+
+        thread::sleep(Duration::from_millis(50));
     }
+}
 
-    Ok(ImageTaskGuard { _lock: guard })
+#[derive(Clone)]
+struct RateWindow {
+    limit: u64,
+    window: u64,
+}
+
+enum RateLimitDbResult {
+    Allowed,
+    Exceeded(Vec<u64>),
+}
+
+fn apply_rate_limits(
+    scope: &str,
+    bucket: &str,
+    now_secs: u64,
+    windows: &[RateWindow],
+    insert_on_success: bool,
+) -> Result<(), RateLimitError> {
+    let max_window = windows.iter().map(|w| w.window).max().unwrap_or(0);
+    let scope_owned = scope.to_string();
+    let bucket_owned = bucket.to_string();
+    let windows_owned: Vec<RateWindow> = windows.to_vec();
+
+    let result = with_db(move |pool| async move {
+        let scope = scope_owned;
+        let bucket = bucket_owned;
+        let windows = windows_owned;
+        let mut tx = pool.begin().await?;
+        if max_window > 0 {
+            let cutoff = now_secs.saturating_sub(max_window) as i64;
+            sqlx::query("DELETE FROM rate_limit_tokens WHERE scope = ? AND bucket = ? AND ts < ?")
+                .bind(&scope)
+                .bind(&bucket)
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let mut counts = Vec::with_capacity(windows.len());
+        for window in &windows {
+            let cutoff = now_secs.saturating_sub(window.window) as i64;
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM rate_limit_tokens WHERE scope = ? AND bucket = ? AND ts >= ?",
+            )
+            .bind(&scope)
+            .bind(&bucket)
+            .bind(cutoff)
+            .fetch_one(&mut *tx)
+            .await?;
+            counts.push(count as u64);
+        }
+
+        let mut exceeded = false;
+        for (idx, window) in windows.iter().enumerate() {
+            if counts.get(idx).copied().unwrap_or(0) >= window.limit {
+                exceeded = true;
+                break;
+            }
+        }
+
+        if exceeded {
+            tx.rollback().await?;
+            return Ok(RateLimitDbResult::Exceeded(counts));
+        }
+
+        if insert_on_success {
+            sqlx::query("INSERT INTO rate_limit_tokens (scope, bucket, ts) VALUES (?, ?, ?)")
+                .bind(&scope)
+                .bind(&bucket)
+                .bind(now_secs as i64)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(RateLimitDbResult::Allowed)
+    })
+    .map_err(RateLimitError::Io)?;
+
+    match result {
+        RateLimitDbResult::Allowed => Ok(()),
+        RateLimitDbResult::Exceeded(counts) => {
+            let c1 = counts.get(0).copied().unwrap_or(0);
+            let l1 = windows.get(0).map(|w| w.limit).unwrap_or(0);
+            let c2 = counts.get(1).copied().unwrap_or(c1);
+            let l2 = windows.get(1).map(|w| w.limit).unwrap_or(l1);
+            Err(RateLimitError::Exceeded { c1, l1, c2, l2 })
+        }
+    }
 }
 
 struct CommandExecResult {
@@ -2097,7 +2119,28 @@ mod tests {
     use serde_json::json;
     use std::env;
     use std::io::Write;
+    use std::sync::Once;
     use tempfile::NamedTempFile;
+
+    fn init_test_db() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            unsafe {
+                env::set_var(WEBHOOK_DB_ENV, "sqlite::memory:?cache=shared");
+            }
+            let _ = super::db_pool();
+        });
+
+        let _ = with_db(|pool| async move {
+            sqlx::query("DELETE FROM rate_limit_tokens")
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM image_locks")
+                .execute(&pool)
+                .await?;
+            Ok::<(), sqlx::Error>(())
+        });
+    }
 
     #[test]
     fn parse_container_image_finds_image() {
@@ -2164,23 +2207,24 @@ mod tests {
 
     #[test]
     fn rate_limit_enforces_limits() {
-        let dir = tempfile::tempdir().unwrap();
+        init_test_db();
         unsafe {
-            env::set_var("WEBHOOK_STATE_DIR", dir.path());
             env::set_var("WEBHOOK_LIMIT1_COUNT", "1");
             env::set_var("WEBHOOK_LIMIT1_WINDOW", "3600");
             env::set_var("WEBHOOK_LIMIT2_COUNT", "5");
             env::set_var("WEBHOOK_LIMIT2_WINDOW", "3600");
         }
 
-        assert!(rate_limit_check().is_ok());
-        assert!(matches!(
-            rate_limit_check(),
-            Err(RateLimitError::Exceeded { .. })
-        ));
+        let first = rate_limit_check();
+        assert!(first.is_ok(), "first rate limit check failed: {:?}", first);
+        let second = rate_limit_check();
+        assert!(
+            matches!(second, Err(RateLimitError::Exceeded { .. })),
+            "second check expected limit hit, got {:?}",
+            second
+        );
 
         unsafe {
-            env::remove_var("WEBHOOK_STATE_DIR");
             env::remove_var("WEBHOOK_LIMIT1_COUNT");
             env::remove_var("WEBHOOK_LIMIT1_WINDOW");
             env::remove_var("WEBHOOK_LIMIT2_COUNT");
@@ -2449,11 +2493,11 @@ fn send_sse_event(event: &str, data: &str) -> Result<(), String> {
     }
 }
 
-fn db_pool() -> Option<SqlitePool> {
+fn db_pool() -> SqlitePool {
     DB_POOL.get_or_init(init_db_pool).clone()
 }
 
-fn init_db_pool() -> Option<SqlitePool> {
+fn init_db_pool() -> SqlitePool {
     let url = env::var(WEBHOOK_DB_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -2472,11 +2516,8 @@ fn init_db_pool() -> Option<SqlitePool> {
         MIGRATOR.run(&pool).await?;
         Ok::<SqlitePool, sqlx::Error>(pool)
     }) {
-        Ok(pool) => Some(pool),
-        Err(err) => {
-            log_message(&format!("warn db-init-failed err={err}"));
-            None
-        }
+        Ok(pool) => pool,
+        Err(err) => panic!("failed to initialize database: {err}"),
     }
 }
 
@@ -2495,6 +2536,21 @@ fn ensure_sqlite_storage(conn: &str) {
     }
 }
 
+fn with_db<F, Fut, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce(SqlitePool) -> Fut,
+    Fut: Future<Output = Result<T, sqlx::Error>> + Send + 'static,
+    T: Send + 'static,
+{
+    let pool = db_pool();
+    let runtime = DB_RUNTIME
+        .get()
+        .ok_or_else(|| "database runtime unavailable".to_string())?;
+    runtime
+        .block_on(async move { f(pool).await })
+        .map_err(|e| e.to_string())
+}
+
 fn persist_event_record(
     request_id: &str,
     ts_secs: u64,
@@ -2505,9 +2561,7 @@ fn persist_event_record(
     elapsed_ms: u64,
     meta: &Value,
 ) {
-    let Some(pool) = db_pool() else {
-        return;
-    };
+    let pool = db_pool();
     let runtime = match DB_RUNTIME.get() {
         Some(rt) => rt,
         None => return,
@@ -2751,114 +2805,50 @@ fn env_u64(name: &str, default: u64) -> Result<u64, String> {
 }
 
 fn rate_limit_check() -> Result<(), RateLimitError> {
-    let state_dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
-    let state_path = Path::new(&state_dir);
-    fs::create_dir_all(state_path).map_err(|e| RateLimitError::Io(e.to_string()))?;
+    let cfg = ManualRateLimitConfig::load()?;
+    let windows = [
+        RateWindow {
+            limit: cfg.l1_count,
+            window: cfg.l1_window,
+        },
+        RateWindow {
+            limit: cfg.l2_count,
+            window: cfg.l2_window,
+        },
+    ];
 
-    let db_path = state_path.join("ratelimit.db");
-    let lock_path = state_path.join("ratelimit.lock");
-
-    let l1_count =
-        env_u64("WEBHOOK_LIMIT1_COUNT", DEFAULT_LIMIT1_COUNT).map_err(RateLimitError::Io)?;
-    let l1_window =
-        env_u64("WEBHOOK_LIMIT1_WINDOW", DEFAULT_LIMIT1_WINDOW).map_err(RateLimitError::Io)?;
-    let l2_count =
-        env_u64("WEBHOOK_LIMIT2_COUNT", DEFAULT_LIMIT2_COUNT).map_err(RateLimitError::Io)?;
-    let l2_window =
-        env_u64("WEBHOOK_LIMIT2_WINDOW", DEFAULT_LIMIT2_WINDOW).map_err(RateLimitError::Io)?;
-
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| RateLimitError::Io(e.to_string()))?;
-
-    let _guard = FlockGuard::lock(lock_file, LOCK_TIMEOUT)?;
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
-
-    let cutoff_l1 = now.saturating_sub(l1_window);
-    let cutoff_l2 = now.saturating_sub(l2_window);
-
-    let mut entries: Vec<u64> = fs::read_to_string(&db_path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse::<u64>().ok())
-        .collect();
-
-    entries.retain(|&ts| ts >= cutoff_l2);
-
-    let c1 = entries.iter().filter(|&&ts| ts >= cutoff_l1).count() as u64;
-    let c2 = entries.len() as u64;
-
-    if c1 >= l1_count || c2 >= l2_count {
-        return Err(RateLimitError::Exceeded {
-            c1,
-            l1: l1_count,
-            c2,
-            l2: l2_count,
-        });
-    }
-
-    entries.push(now);
-
-    let mut file = File::create(&db_path).map_err(|e| RateLimitError::Io(e.to_string()))?;
-    for ts in entries {
-        writeln!(file, "{ts}").map_err(|e| RateLimitError::Io(e.to_string()))?;
-    }
-
-    Ok(())
+    apply_rate_limits(
+        "manual",
+        "manual-auto-update",
+        current_unix_secs(),
+        &windows,
+        true,
+    )
 }
 
-struct FlockGuard {
-    file: File,
+struct ManualRateLimitConfig {
+    l1_count: u64,
+    l1_window: u64,
+    l2_count: u64,
+    l2_window: u64,
 }
 
-impl FlockGuard {
-    fn lock(file: File, timeout: Duration) -> Result<Self, RateLimitError> {
-        let fd = file.as_raw_fd();
-        let start = Instant::now();
-        loop {
-            let result = unsafe { libc::flock(fd, LOCK_EX | LOCK_NB) };
-            if result == 0 {
-                break;
-            }
-
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
-                if start.elapsed() >= timeout {
-                    return Err(RateLimitError::LockTimeout);
-                }
-                thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-
-            return Err(RateLimitError::Io(err.to_string()));
-        }
-        Ok(Self { file })
-    }
-
-    fn lock_blocking(file: File) -> Result<Self, RateLimitError> {
-        let fd = file.as_raw_fd();
-        let result = unsafe { libc::flock(fd, LOCK_EX) };
-        if result == 0 {
-            Ok(Self { file })
-        } else {
-            Err(RateLimitError::Io(io::Error::last_os_error().to_string()))
-        }
+impl ManualRateLimitConfig {
+    fn load() -> Result<Self, RateLimitError> {
+        Ok(Self {
+            l1_count: env_u64("WEBHOOK_LIMIT1_COUNT", DEFAULT_LIMIT1_COUNT)
+                .map_err(RateLimitError::Io)?,
+            l1_window: env_u64("WEBHOOK_LIMIT1_WINDOW", DEFAULT_LIMIT1_WINDOW)
+                .map_err(RateLimitError::Io)?,
+            l2_count: env_u64("WEBHOOK_LIMIT2_COUNT", DEFAULT_LIMIT2_COUNT)
+                .map_err(RateLimitError::Io)?,
+            l2_window: env_u64("WEBHOOK_LIMIT2_WINDOW", DEFAULT_LIMIT2_WINDOW)
+                .map_err(RateLimitError::Io)?,
+        })
     }
 }
 
-impl Drop for FlockGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), LOCK_UN) };
-    }
-}
-
+#[derive(Debug)]
 enum RateLimitError {
     LockTimeout,
     Exceeded { c1: u64, l1: u64, c2: u64, l2: u64 },
