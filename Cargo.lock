@@ -1569,7 +1569,6 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "hmac",
- "libc",
  "regex",
  "serde",
  "serde_json",

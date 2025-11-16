@@ -13,12 +13,9 @@ The service stores durable data under `WEBHOOK_STATE_DIR` (defaults to
 
 | Path | Purpose |
 | --- | --- |
-| `ratelimit.db` / `ratelimit.lock` | Sliding-window timestamp log used by the global `/auto-update` throttler |
-| `github-image-limits/*.db` | Per-image timestamp logs that prevent spamming `podman pull` for the same image |
-| `github-image-locks/*.lock` | Lock files that ensure only one redeploy runs per image at a time |
+| `data/pod-upgrade-trigger.db` | SQLite 数据库，包含请求事件、限流计数与镜像锁 |
 | `last_payload.bin` | Dump of the last signature-mismatched payload for debugging |
 | `web/dist` | Optional static assets served on `/` when the web UI bundle is deployed |
-| SQLite `event_log` | 所有触发/调度请求都会同步写入 SQLite（默认 `data/pod-upgrade-trigger.db`） |
 
 Run the daemon via systemd (see `systemd/webhook-auto-update.service`, which now
 executes `webhook-auto-update server`). For housekeeping, use the CLI
@@ -29,16 +26,18 @@ PATH="$PWD/tests/mock-bin:$PATH" webhook-auto-update trigger-units demo.service 
 PATH="$PWD/tests/mock-bin:$PATH" webhook-auto-update prune-state --max-age-hours 48
 ```
 
-This command prunes stale timestamps, drops empty `.db` files, and removes lock
-files whose `mtime` is older than the retention window.
+The `prune-state` command deletes stale rate-limit rows and aged image locks
+from the SQLite database (and also removes any leftover legacy files from older
+versions).
 
 ### 结构化事件记录
 
 - 程序默认连接 `sqlite://data/pod-upgrade-trigger.db`，自动创建目录并运行
-  `migrations/` 内的脚本初始化 `event_log` 表。若要自定义位置，可设置
+  `migrations/` 内的脚本初始化事件表与限流表。若要自定义位置，可设置
   `WEBHOOK_DB_URL` 覆盖连接串。
-- 所有 HTTP 请求、CLI 手动触发与调度器 tick 都会异步插入数据库，字段包含
+- 所有 HTTP 请求、CLI 手动触发与调度器 tick 都会异步插入 `event_log` 表，字段包含
   `request_id/method/path/status/action/meta` 等，可用于报表、运营统计或问题定位。
+- 速率限制计数与镜像锁也存放在同一个 SQLite 数据库中，无需额外文件。
 
 ## Scheduler and Manual Triggers
 
