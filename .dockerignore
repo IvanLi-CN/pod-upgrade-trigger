@@ -1,0 +1,10 @@
+.git
+target
+web/node_modules
+web/dist
+bin
+downloads
+ratelimit.db
+ratelimit.lock
+last_payload.bin
+webhook.sock
