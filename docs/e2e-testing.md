@@ -60,12 +60,12 @@
 
 ## 执行与 CI 集成
 
-- 新增 `just test-e2e`（或 `make test-e2e`）目标：`PATH="$PWD/tests/mock-bin:$PATH" cargo test --test e2e -- --nocapture`。
+- 新增 `scripts/test-e2e.sh`：自动注入 `PATH="$PWD/tests/mock-bin:$PATH"` 并运行 `cargo test --test e2e -- --nocapture`，本地执行 `./scripts/test-e2e.sh` 即可。
 - 若运行时间较长，可使用 feature gate（如 `--features e2e-full`）在本地/CI 选择性开启。
 - CI Workflow：
   1. 安装依赖（Rust stable + sqlx 所需的 SQLite）。
   2. 运行 `cargo test`（快速单测）。
-  3. 设置 `PATH` 注入 mock，执行 `just test-e2e`；失败时上传 `tests/mock-bin/log.txt`、子进程 stdout/stderr、e2e 临时 SQLite DB 作为 artifacts。
+  3. 通过 `./scripts/test-e2e.sh` 执行全量 e2e；失败时上传 `tests/mock-bin/log.txt`、子进程 stdout/stderr、e2e 临时 SQLite DB 作为 artifacts。
   4. 成功后可继续 `cargo build --release` 以保持原有发布流程。
 
 ## 推进计划
