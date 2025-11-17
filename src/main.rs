@@ -6,13 +6,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use sqlx::migrate::Migrator;
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
+use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, BufRead, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +46,15 @@ const MANUAL_TOKEN_ENV: &str = "WEBHOOK_MANUAL_TOKEN";
 const DEFAULT_STATE_RETENTION_SECS: u64 = 86_400; // 24 hours
 const WEBHOOK_DB_ENV: &str = "WEBHOOK_DB_URL";
 const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
+const FORWARD_AUTH_HEADER_ENV: &str = "FORWARD_AUTH_HEADER";
+const FORWARD_AUTH_ADMIN_VALUE_ENV: &str = "FORWARD_AUTH_ADMIN_VALUE";
+const FORWARD_AUTH_NICKNAME_HEADER_ENV: &str = "FORWARD_AUTH_NICKNAME_HEADER";
+const ADMIN_MODE_NAME_ENV: &str = "ADMIN_MODE_NAME";
+const DEV_OPEN_ADMIN_ENV: &str = "DEV_OPEN_ADMIN";
+const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
+const EVENTS_MAX_PAGE_SIZE: u64 = 500;
+const EVENTS_MAX_LIMIT: u64 = 500;
+const WEBHOOK_STATUS_LOOKBACK: u64 = 500;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DB_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -61,6 +73,105 @@ struct RequestContext {
     request_id: String,
     started_at: Instant,
     received_at: SystemTime,
+}
+
+struct ForwardAuthConfig {
+    header_name: Option<String>,
+    admin_value: Option<String>,
+    nickname_header: Option<String>,
+    admin_mode_name: Option<String>,
+    dev_open_admin: bool,
+}
+
+impl ForwardAuthConfig {
+    fn load() -> Self {
+        let header_name = env::var(FORWARD_AUTH_HEADER_ENV)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty());
+        let admin_value = env::var(FORWARD_AUTH_ADMIN_VALUE_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let nickname_header = env::var(FORWARD_AUTH_NICKNAME_HEADER_ENV)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty());
+        let admin_mode_name = env::var(ADMIN_MODE_NAME_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let dev_open_admin = env::var(DEV_OPEN_ADMIN_ENV)
+            .ok()
+            .map(|v| {
+                let normalized = v.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes")
+            })
+            .unwrap_or(false);
+
+        ForwardAuthConfig {
+            header_name,
+            admin_value,
+            nickname_header,
+            admin_mode_name,
+            dev_open_admin,
+        }
+    }
+
+    fn open_mode(&self) -> bool {
+        self.dev_open_admin || self.header_name.is_none() || self.admin_value.is_none()
+    }
+}
+
+static FORWARD_AUTH_CONFIG: OnceLock<ForwardAuthConfig> = OnceLock::new();
+
+fn forward_auth_config() -> &'static ForwardAuthConfig {
+    FORWARD_AUTH_CONFIG.get_or_init(ForwardAuthConfig::load)
+}
+
+fn is_admin_request(ctx: &RequestContext) -> bool {
+    let cfg = forward_auth_config();
+    if cfg.open_mode() {
+        return true;
+    }
+
+    let header = match &cfg.header_name {
+        Some(name) => name,
+        None => return true,
+    };
+    let expected = match &cfg.admin_value {
+        Some(value) => value,
+        None => return true,
+    };
+
+    match ctx.headers.get(header) {
+        Some(value) => value == expected,
+        None => false,
+    }
+}
+
+fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
+    let cfg = forward_auth_config();
+    if cfg.open_mode() {
+        return Ok(true);
+    }
+
+    if is_admin_request(ctx) {
+        return Ok(true);
+    }
+
+    respond_text(
+        ctx,
+        401,
+        "Unauthorized",
+        "unauthorized",
+        action,
+        Some(json!({
+            "reason": "forward-auth",
+            "header": cfg.header_name,
+        })),
+    )?;
+    Ok(false)
 }
 
 fn manual_auto_update_unit() -> String {
@@ -145,6 +256,7 @@ fn main() {
 
     match command.as_str() {
         "server" => run_server(),
+        "http-server" => run_http_server_cli(&remaining),
         "run-task" => run_background_cli(&remaining),
         "scheduler" => run_scheduler_cli(&remaining),
         "trigger-units" => run_trigger_cli(&remaining, false),
@@ -197,6 +309,68 @@ fn run_server() -> ! {
         std::process::exit(1);
     }
     std::process::exit(0);
+}
+
+fn run_http_server_cli(_args: &[String]) -> ! {
+    let addr = env::var("WEBHOOK_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:25111".to_string());
+    let listener = TcpListener::bind(&addr).unwrap_or_else(|err| {
+        eprintln!("failed to bind HTTP address {addr}: {err}");
+        std::process::exit(1);
+    });
+
+    eprintln!("listening on http://{addr} (http-server)");
+
+    loop {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                // For each incoming TCP connection, spawn a short-lived child process
+                // running `webhook-auto-update server`, wiring the TCP stream to
+                // the child's stdin/stdout. This mirrors the systemd socket-activation
+                // model but without requiring systemd itself.
+                if let Err(err) = spawn_server_for_stream(stream) {
+                    eprintln!("failed to spawn server for {peer:?}: {err}");
+                }
+            }
+            Err(err) => {
+                eprintln!("accept failed: {err}");
+                // avoid busy loop on fatal errors
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+fn spawn_server_for_stream(stream: TcpStream) -> Result<(), String> {
+    stream
+        .set_nodelay(true)
+        .map_err(|e| format!("set_nodelay failed: {e}"))?;
+
+    // Duplicate the TCP stream for stdin/stdout and transfer ownership of both
+    // file descriptors to the child process. We use into_raw_fd so that the
+    // File wrappers in the parent do not close the descriptors before exec.
+    let stdin_stream = stream
+        .try_clone()
+        .map_err(|e| format!("failed to clone stream for stdin: {e}"))?;
+    let stdout_stream = stream;
+
+    let stdin_fd = stdin_stream.into_raw_fd();
+    let stdout_fd = stdout_stream.into_raw_fd();
+
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("server");
+    // Safety: we immediately transfer ownership of the raw FDs into File,
+    // which will be consumed by Stdio. The child process will then own these
+    // descriptors. We don't use these FDs again in the parent after this point.
+    unsafe {
+        cmd.stdin(Stdio::from(File::from_raw_fd(stdin_fd)));
+        cmd.stdout(Stdio::from(File::from_raw_fd(stdout_fd)));
+    }
+    cmd.stderr(Stdio::null());
+
+    cmd.spawn().map_err(|e| format!("failed to spawn server child: {e}"))?;
+    Ok(())
 }
 
 fn run_scheduler_cli(args: &[String]) -> ! {
@@ -453,6 +627,10 @@ fn handle_connection() -> Result<(), String> {
         .get("transfer-encoding")
         .map(|s| s.to_ascii_lowercase());
 
+    // Only read a body when the client explicitly signals one via
+    // Content-Length or chunked Transfer-Encoding. For typical GET/HEAD
+    // requests without these headers we must *not* read to EOF, otherwise
+    // the connection would deadlock when the client keeps the socket open.
     let mut body = Vec::new();
     if let Some(len) = content_length {
         body.resize(len, 0);
@@ -465,10 +643,6 @@ fn handle_connection() -> Result<(), String> {
         .unwrap_or(false)
     {
         body = read_chunked_body(&mut reader)?;
-    } else {
-        reader
-            .read_to_end(&mut body)
-            .map_err(|e| format!("failed to read body: {e}"))?;
     }
 
     let ctx = RequestContext {
@@ -488,6 +662,18 @@ fn handle_connection() -> Result<(), String> {
         respond_text(&ctx, 200, "OK", "ok", "health-check", None)?;
     } else if ctx.method == "GET" && ctx.path == "/sse/hello" {
         handle_hello_sse(&ctx)?;
+    } else if ctx.path == "/api/settings" {
+        handle_settings_api(&ctx)?;
+    } else if ctx.path == "/api/events" {
+        handle_events_api(&ctx)?;
+    } else if ctx.path == "/api/webhooks/status" {
+        handle_webhooks_status(&ctx)?;
+    } else if ctx.path == "/api/image-locks"
+        || ctx.path.starts_with("/api/image-locks/")
+    {
+        handle_image_locks_api(&ctx)?;
+    } else if ctx.path == "/api/prune-state" {
+        handle_prune_state_api(&ctx)?;
     } else if ctx.path.starts_with("/api/manual/") {
         handle_manual_api(&ctx)?;
     } else if is_github_route(&ctx.path) {
@@ -529,6 +715,376 @@ fn handle_hello_sse(ctx: &RequestContext) -> Result<(), String> {
 
     log_message("200 sse hello handshake");
     respond_sse(ctx, "hello", &payload.to_string(), "sse-hello", None)
+}
+
+fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "settings-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "settings-api")? {
+        return Ok(());
+    }
+
+    let state_dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    let web_dist = frontend_dist_dir();
+    let web_dist_str = web_dist.to_string_lossy().to_string();
+
+    let webhook_token_configured = env::var("WEBHOOK_TOKEN")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let manual_token_configured = env::var(MANUAL_TOKEN_ENV)
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let github_secret_configured = env::var("GITHUB_WEBHOOK_SECRET")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    let scheduler_interval_secs = env::var("AUTO_UPDATE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SCHEDULER_INTERVAL_SECS);
+    let scheduler_min_interval_secs = env::var("WEBHOOK_SCHEDULER_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    let scheduler_max_iterations = env::var("WEBHOOK_SCHEDULER_MAX_TICKS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+
+    let auto_update_unit = manual_auto_update_unit();
+    let trigger_units = manual_unit_list();
+
+    let db_url = env::var(WEBHOOK_DB_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("sqlite://{DEFAULT_DB_PATH}"));
+
+    let db_path = db_url
+        .strip_prefix("sqlite://")
+        .map(|p| Path::new(p).to_path_buf());
+
+    let cfg = forward_auth_config();
+    let forward_mode = if cfg.open_mode() {
+        "open"
+    } else {
+        "protected"
+    };
+
+    let build_timestamp = option_env!("WEBHOOK_BUILD_TIMESTAMP").map(|s| s.to_string());
+
+    let db_stats = db_path
+        .as_ref()
+        .map(|p| path_stats(p))
+        .unwrap_or_else(|| json!({ "exists": false, "path": db_url }));
+
+    let debug_payload_path = env::var("WEBHOOK_DEBUG_PAYLOAD_PATH")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| {
+            let default = Path::new(DEFAULT_STATE_DIR).join("last_payload.bin");
+            default.to_string_lossy().into_owned()
+        });
+    let debug_payload_stats = path_stats(Path::new(&debug_payload_path));
+    let web_dist_stats = path_stats(&web_dist);
+
+    let response = json!({
+        "env": {
+            "WEBHOOK_STATE_DIR": state_dir,
+            "WEBHOOK_WEB_DIST": web_dist_str,
+            "WEBHOOK_TOKEN_configured": webhook_token_configured,
+            "WEBHOOK_MANUAL_TOKEN_configured": manual_token_configured,
+            "GITHUB_WEBHOOK_SECRET_configured": github_secret_configured,
+        },
+        "scheduler": {
+            "interval_secs": scheduler_interval_secs,
+            "min_interval_secs": scheduler_min_interval_secs,
+            "max_iterations": scheduler_max_iterations,
+        },
+        "systemd": {
+            "auto_update_unit": auto_update_unit,
+            "trigger_units": trigger_units,
+        },
+        "database": {
+            "url": db_url,
+        },
+        "resources": {
+            "state_dir": {
+                "path": state_dir,
+            },
+            "database_file": db_stats,
+            "debug_payload": debug_payload_stats,
+            "web_dist": web_dist_stats,
+        },
+        "version": {
+            "package": env!("CARGO_PKG_VERSION"),
+            "build_timestamp": build_timestamp,
+        },
+        "forward_auth": {
+            "header": cfg.header_name,
+            "admin_value_configured": cfg.admin_value.is_some(),
+            "nickname_header": cfg.nickname_header,
+            "admin_mode_name": cfg.admin_mode_name,
+            "dev_open_admin": cfg.dev_open_admin,
+            "mode": forward_mode,
+        },
+    });
+
+    respond_json(ctx, 200, "OK", &response, "settings-api", None)
+}
+
+fn path_stats(path: &Path) -> Value {
+    match fs::metadata(path) {
+        Ok(meta) => {
+            let modified_ts = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|dur| dur.as_secs() as i64);
+            json!({
+                "exists": true,
+                "is_dir": meta.is_dir(),
+                "size": meta.len(),
+                "modified_ts": modified_ts,
+                "path": path.to_string_lossy(),
+            })
+        }
+        Err(_) => json!({
+            "exists": false,
+            "path": path.to_string_lossy(),
+        }),
+    }
+}
+
+fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "events-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "events-api")? {
+        return Ok(());
+    }
+
+    let mut limit: Option<u64> = None;
+    let mut page: u64 = 1;
+    let mut per_page: u64 = EVENTS_DEFAULT_PAGE_SIZE;
+    let mut request_id: Option<String> = None;
+    let mut path_prefix: Option<String> = None;
+    let mut status: Option<i64> = None;
+    let mut action: Option<String> = None;
+    let mut from_ts: Option<i64> = None;
+    let mut to_ts: Option<i64> = None;
+
+    if let Some(q) = &ctx.query {
+        for (key, value) in url::form_urlencoded::parse(q.as_bytes()) {
+            let key = key.as_ref();
+            let value = value.as_ref();
+            match key {
+                "limit" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        if v > 0 {
+                            limit = Some(v.min(EVENTS_MAX_LIMIT));
+                        }
+                    }
+                }
+                "page" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        if v > 0 {
+                            page = v;
+                        }
+                    }
+                }
+                "per_page" | "page_size" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        if v > 0 {
+                            per_page = v.min(EVENTS_MAX_PAGE_SIZE);
+                        }
+                    }
+                }
+                "request_id" => {
+                    if !value.is_empty() {
+                        request_id = Some(value.to_string());
+                    }
+                }
+                "path_prefix" | "path" => {
+                    if !value.is_empty() {
+                        path_prefix = Some(value.to_string());
+                    }
+                }
+                "status" => {
+                    if let Ok(v) = value.parse::<i64>() {
+                        status = Some(v);
+                    }
+                }
+                "action" => {
+                    if !value.is_empty() {
+                        action = Some(value.to_string());
+                    }
+                }
+                "from_ts" | "from" => {
+                    if let Ok(v) = value.parse::<i64>() {
+                        from_ts = Some(v);
+                    }
+                }
+                "to_ts" | "to" => {
+                    if let Ok(v) = value.parse::<i64>() {
+                        to_ts = Some(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let (effective_limit, offset, page_num, page_size) = if let Some(lim) = limit {
+        let lim = lim.max(1);
+        (lim, 0_i64, 1_u64, lim)
+    } else {
+        let page = page.max(1);
+        let size = per_page.max(1);
+        let offset = (page.saturating_sub(1)).saturating_mul(size) as i64;
+        (size, offset, page, size)
+    };
+
+    enum SqlParam {
+        I64(i64),
+        Str(String),
+    }
+
+    let db_result = with_db(|pool| async move {
+        let mut filters: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+
+        if let Some(id) = request_id {
+            filters.push("request_id = ?".to_string());
+            params.push(SqlParam::Str(id));
+        }
+        if let Some(prefix) = path_prefix {
+            filters.push("path LIKE ?".to_string());
+            params.push(SqlParam::Str(format!("{prefix}%")));
+        }
+        if let Some(code) = status {
+            filters.push("status = ?".to_string());
+            params.push(SqlParam::I64(code));
+        }
+        if let Some(act) = action {
+            filters.push("action = ?".to_string());
+            params.push(SqlParam::Str(act));
+        }
+        if let Some(from) = from_ts {
+            filters.push("ts >= ?".to_string());
+            params.push(SqlParam::I64(from));
+        }
+        if let Some(to) = to_ts {
+            filters.push("ts <= ?".to_string());
+            params.push(SqlParam::I64(to));
+        }
+
+        let mut where_sql = String::new();
+        if !filters.is_empty() {
+            where_sql.push_str(" WHERE ");
+            where_sql.push_str(&filters.join(" AND "));
+        }
+
+        let count_sql = format!("SELECT COUNT(*) as cnt FROM event_log{where_sql}");
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+        for param in &params {
+            match param {
+                SqlParam::I64(v) => {
+                    count_query = count_query.bind(*v);
+                }
+                SqlParam::Str(v) => {
+                    count_query = count_query.bind(v);
+                }
+            }
+        }
+        let total = count_query.fetch_one(&pool).await.unwrap_or(0);
+
+        let select_sql = format!(
+            "SELECT id, request_id, ts, method, path, status, action, duration_ms, meta, created_at FROM event_log{where_sql} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut query = sqlx::query(&select_sql);
+        for param in &params {
+            match param {
+                SqlParam::I64(v) => {
+                    query = query.bind(*v);
+                }
+                SqlParam::Str(v) => {
+                    query = query.bind(v);
+                }
+            }
+        }
+        query = query.bind(effective_limit as i64).bind(offset);
+
+        let rows: Vec<SqliteRow> = query.fetch_all(&pool).await?;
+        let mut events = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            let meta_raw: String = row.get("meta");
+            let meta_value: Value = serde_json::from_str(&meta_raw)
+                .unwrap_or_else(|_| json!({ "raw": meta_raw }));
+
+            let event = json!({
+                "id": row.get::<i64, _>("id"),
+                "request_id": row.get::<String, _>("request_id"),
+                "ts": row.get::<i64, _>("ts"),
+                "method": row.get::<String, _>("method"),
+                "path": row.get::<Option<String>, _>("path"),
+                "status": row.get::<i64, _>("status"),
+                "action": row.get::<String, _>("action"),
+                "duration_ms": row.get::<i64, _>("duration_ms"),
+                "meta": meta_value,
+                "created_at": row.get::<i64, _>("created_at"),
+            });
+            events.push(event);
+        }
+
+        Ok::<(Vec<Value>, i64), sqlx::Error>((events, total))
+    });
+
+    let (events, total) = match db_result {
+        Ok(ok) => ok,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to query events",
+                "events-api",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let response = json!({
+        "events": events,
+        "total": total,
+        "page": page_num,
+        "page_size": page_size,
+        "has_next": (page_num as i64) * (page_size as i64) < total,
+    });
+
+    respond_json(ctx, 200, "OK", &response, "events-api", None)
 }
 
 fn is_github_route(path: &str) -> bool {
@@ -721,6 +1277,10 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
 }
 
 fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.path == "/api/manual/services" || ctx.path == "/api/manual/services/" {
+        return handle_manual_services_list(ctx);
+    }
+
     if ctx.method != "POST" {
         respond_text(
             ctx,
@@ -749,6 +1309,47 @@ fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
         "manual-api",
         Some(json!({ "reason": "unknown-route" })),
     )
+}
+
+fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "manual-services",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "manual-services")? {
+        return Ok(());
+    }
+
+    let mut services = Vec::new();
+    for unit in manual_unit_list() {
+        let slug = unit
+            .trim()
+            .trim_matches('/')
+            .trim_end_matches(".service")
+            .to_string();
+        let display_name = unit.clone();
+        let default_image = unit_configured_image(&unit);
+        let github_path = format!("/{}/{}", GITHUB_ROUTE_PREFIX, slug);
+
+        services.push(json!({
+            "slug": slug,
+            "unit": unit,
+            "display_name": display_name,
+            "default_image": default_image,
+            "github_path": github_path,
+        }));
+    }
+
+    let response = json!({ "services": services });
+    respond_json(ctx, 200, "OK", &response, "manual-services", None)
 }
 
 fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
@@ -971,6 +1572,13 @@ struct ServiceTriggerRequest {
     caller: Option<String>,
     reason: Option<String>,
     image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PruneStateRequest {
+    max_age_hours: Option<u64>,
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1280,6 +1888,202 @@ fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneRepor
     Ok(report)
 }
 
+fn handle_image_locks_api(ctx: &RequestContext) -> Result<(), String> {
+    if !ensure_admin(ctx, "image-locks-api")? {
+        return Ok(());
+    }
+
+    if ctx.method == "GET" && ctx.path == "/api/image-locks" {
+        let db_result = with_db(|pool| async move {
+            let rows: Vec<SqliteRow> = sqlx::query(
+                "SELECT bucket, acquired_at FROM image_locks ORDER BY acquired_at DESC",
+            )
+            .fetch_all(&pool)
+            .await?;
+            Ok::<Vec<SqliteRow>, sqlx::Error>(rows)
+        });
+
+        let rows = match db_result {
+            Ok(ok) => ok,
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to query image locks",
+                    "image-locks-api",
+                    Some(json!({ "error": err })),
+                )?;
+                return Ok(());
+            }
+        };
+
+        let now = current_unix_secs() as i64;
+        let mut locks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let bucket: String = row.get("bucket");
+            let acquired_at: i64 = row.get("acquired_at");
+            let age_secs = now.saturating_sub(acquired_at).max(0);
+
+            locks.push(json!({
+                "bucket": bucket,
+                "acquired_at": acquired_at,
+                "age_secs": age_secs,
+            }));
+        }
+
+        let response = json!({
+            "now": now,
+            "locks": locks,
+        });
+        return respond_json(ctx, 200, "OK", &response, "image-locks-api", None);
+    }
+
+    if ctx.method == "DELETE" {
+        let Some(rest) = ctx.path.strip_prefix("/api/image-locks/") else {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "missing lock name",
+                "image-locks-api",
+                Some(json!({ "reason": "bucket" })),
+            )?;
+            return Ok(());
+        };
+
+        let bucket = rest.trim_matches('/');
+        if bucket.is_empty() {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "missing lock name",
+                "image-locks-api",
+                Some(json!({ "reason": "bucket" })),
+            )?;
+            return Ok(());
+        }
+
+        let bucket_owned = bucket.to_string();
+        let db_result = with_db(|pool| async move {
+            let res = sqlx::query("DELETE FROM image_locks WHERE bucket = ?")
+                .bind(bucket_owned)
+                .execute(&pool)
+                .await?;
+            Ok::<u64, sqlx::Error>(res.rows_affected())
+        });
+
+        let deleted = match db_result {
+            Ok(rows) => rows,
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to delete image lock",
+                    "image-locks-api",
+                    Some(json!({ "error": err })),
+                )?;
+                return Ok(());
+            }
+        };
+
+        let status = if deleted > 0 { 200 } else { 404 };
+        let reason = if status == 200 { "OK" } else { "NotFound" };
+        let response = json!({
+            "bucket": bucket,
+            "removed": deleted > 0,
+            "rows": deleted,
+        });
+
+        respond_json(ctx, status, reason, &response, "image-locks-api", None)?;
+        return Ok(());
+    }
+
+    respond_text(
+        ctx,
+        405,
+        "MethodNotAllowed",
+        "method not allowed",
+        "image-locks-api",
+        Some(json!({ "reason": "method" })),
+    )?;
+    Ok(())
+}
+
+fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "POST" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "prune-state-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "prune-state-api")? {
+        return Ok(());
+    }
+
+    let request: PruneStateRequest = if ctx.body.is_empty() {
+        PruneStateRequest {
+            max_age_hours: None,
+            dry_run: false,
+        }
+    } else {
+        match parse_json_body(ctx) {
+            Ok(body) => body,
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    400,
+                    "BadRequest",
+                    "invalid request",
+                    "prune-state-api",
+                    Some(json!({ "error": err })),
+                )?;
+                return Ok(());
+            }
+        }
+    };
+
+    let retention_secs = request
+        .max_age_hours
+        .unwrap_or(DEFAULT_STATE_RETENTION_SECS / 3600)
+        .saturating_mul(3600)
+        .max(1);
+    let dry_run = request.dry_run;
+
+    match prune_state_dir(Duration::from_secs(retention_secs), dry_run) {
+        Ok(report) => {
+            let response = json!({
+                "tokens_removed": report.tokens_removed,
+                "locks_removed": report.locks_removed,
+                "legacy_dirs_removed": report.legacy_dirs_removed,
+                "dry_run": dry_run,
+                "max_age_hours": retention_secs / 3600,
+            });
+            respond_json(ctx, 200, "OK", &response, "prune-state-api", None)?;
+            Ok(())
+        }
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to prune state",
+                "prune-state-api",
+                Some(json!({ "error": err })),
+            )?;
+            Ok(())
+        }
+    }
+}
+
 fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     if ctx.method != "GET" && ctx.method != "HEAD" {
         return Ok(false);
@@ -1411,6 +2215,185 @@ fn content_type_for(path: &Path) -> &'static str {
         Some("webmanifest") => "application/manifest+json",
         _ => "application/octet-stream",
     }
+}
+
+fn handle_webhooks_status(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "webhooks-status",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "webhooks-status")? {
+        return Ok(());
+    }
+
+    let secret_configured = env::var("GITHUB_WEBHOOK_SECRET")
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    #[derive(Clone)]
+    struct UnitStatusAgg {
+        unit: String,
+        slug: String,
+        last_ts: Option<i64>,
+        last_status: Option<i64>,
+        last_request_id: Option<String>,
+        last_success_ts: Option<i64>,
+        last_failure_ts: Option<i64>,
+        last_hmac_error_ts: Option<i64>,
+        last_hmac_error_reason: Option<String>,
+    }
+
+    impl UnitStatusAgg {
+        fn new(unit: String) -> Self {
+            let slug = unit
+                .trim()
+                .trim_matches('/')
+                .trim_end_matches(".service")
+                .to_string();
+            UnitStatusAgg {
+                unit,
+                slug,
+                last_ts: None,
+                last_status: None,
+                last_request_id: None,
+                last_success_ts: None,
+                last_failure_ts: None,
+                last_hmac_error_ts: None,
+                last_hmac_error_reason: None,
+            }
+        }
+    }
+
+    let db_result = with_db(|pool| async move {
+        let rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT id, request_id, ts, status, path, meta FROM event_log WHERE action = 'github-webhook' ORDER BY ts DESC, id DESC LIMIT ?",
+        )
+        .bind(WEBHOOK_STATUS_LOOKBACK as i64)
+        .fetch_all(&pool)
+        .await?;
+        Ok::<Vec<SqliteRow>, sqlx::Error>(rows)
+    });
+
+    let rows = match db_result {
+        Ok(ok) => ok,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to query webhooks",
+                "webhooks-status",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut units: HashMap<String, UnitStatusAgg> = HashMap::new();
+
+    for unit in manual_unit_list() {
+        units
+            .entry(unit.clone())
+            .or_insert_with(|| UnitStatusAgg::new(unit));
+    }
+
+    for row in rows {
+        let ts: i64 = row.get("ts");
+        let status_code: i64 = row.get("status");
+        let path: Option<String> = row.get("path");
+        let request_id: String = row.get("request_id");
+        let meta_raw: String = row.get("meta");
+        let meta: Value = serde_json::from_str(&meta_raw).unwrap_or_else(|_| json!({}));
+
+        let unit_name = meta
+            .get("unit")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                path.as_deref()
+                    .and_then(|p| lookup_unit_from_path(p))
+            });
+
+        let Some(unit_name) = unit_name else {
+            continue;
+        };
+
+        let entry = units
+            .entry(unit_name.clone())
+            .or_insert_with(|| UnitStatusAgg::new(unit_name.clone()));
+
+        if entry.last_ts.map_or(true, |existing| ts > existing) {
+            entry.last_ts = Some(ts);
+            entry.last_status = Some(status_code);
+            entry.last_request_id = Some(request_id.clone());
+        }
+
+        if status_code == 202 {
+            if entry.last_success_ts.map_or(true, |existing| ts > existing) {
+                entry.last_success_ts = Some(ts);
+            }
+        } else if status_code >= 400 {
+            if entry.last_failure_ts.map_or(true, |existing| ts > existing) {
+                entry.last_failure_ts = Some(ts);
+            }
+        }
+
+        if status_code == 401 {
+            if let Some(reason) = meta.get("reason").and_then(|v| v.as_str()) {
+                if entry
+                    .last_hmac_error_ts
+                    .map_or(true, |existing| ts > existing)
+                {
+                    entry.last_hmac_error_ts = Some(ts);
+                    entry.last_hmac_error_reason = Some(reason.to_string());
+                }
+            }
+        }
+    }
+
+    let now = current_unix_secs() as i64;
+    let mut unit_values: Vec<UnitStatusAgg> = units.into_iter().map(|(_, v)| v).collect();
+    unit_values.sort_by(|a, b| a.slug.cmp(&b.slug));
+
+    let mut entries = Vec::with_capacity(unit_values.len());
+    for u in unit_values {
+        let expected_image = unit_configured_image(&u.unit);
+        let webhook_url = format!("/{}/{}", GITHUB_ROUTE_PREFIX, u.slug);
+        let redeploy_url = format!("{webhook_url}/redeploy");
+        let hmac_ok = u.last_hmac_error_ts.is_none();
+
+        entries.push(json!({
+            "unit": u.unit,
+            "slug": u.slug,
+            "webhook_url": webhook_url,
+            "redeploy_url": redeploy_url,
+            "expected_image": expected_image,
+            "last_ts": u.last_ts,
+            "last_status": u.last_status,
+            "last_request_id": u.last_request_id,
+            "last_success_ts": u.last_success_ts,
+            "last_failure_ts": u.last_failure_ts,
+            "hmac_ok": hmac_ok,
+            "hmac_last_error": u.last_hmac_error_reason,
+        }));
+    }
+
+    let response = json!({
+        "now": now,
+        "secret_configured": secret_configured,
+        "units": entries,
+    });
+
+    respond_json(ctx, 200, "OK", &response, "webhooks-status", None)
 }
 
 fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
@@ -2537,6 +3520,19 @@ fn ensure_sqlite_storage(conn: &str) {
                 log_message(&format!(
                     "warn db-dir-create-failed path={} err={}",
                     parent.display(),
+                    err
+                ));
+            }
+        }
+
+        // Ensure the database file exists before sqlx tries to open it. On some
+        // platforms/sqlite builds, connecting to a non-existent file path can
+        // fail with `code: 14` instead of creating the file implicitly.
+        if !path.exists() {
+            if let Err(err) = File::create(path) {
+                log_message(&format!(
+                    "warn db-file-create-failed path={} err={}",
+                    path.display(),
                     err
                 ));
             }
