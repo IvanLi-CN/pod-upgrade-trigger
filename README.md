@@ -1,10 +1,10 @@
 # pod-upgrade-trigger
 
-`webhook-auto-update` is a socket-activated webhook dispatcher that validates GitHub
-package events, enforces rate limits, refreshes Podman images, and restarts the
-correct systemd units. The binary also ships a JSON API for manual triggers,
-a scheduler loop for `podman-auto-update`, and utilities for maintaining the
-state directory.
+`webhook-auto-update` is a small HTTP service that validates GitHub package events,
+enforces rate limits, refreshes Podman images, and restarts the correct systemd
+units. The binary also ships a JSON API for manual triggers, a scheduler loop for
+`podman-auto-update`, and utilities for maintaining the state directory. It can be
+run as a normal HTTP server (`http-server` 子命令)，也可以在需要时通过 systemd socket 兼容旧部署。
 
 ## State Directory Layout
 
@@ -17,9 +17,12 @@ The service stores durable data under `WEBHOOK_STATE_DIR` (defaults to
 | `last_payload.bin` | Dump of the last signature-mismatched payload for debugging |
 | `web/dist` | Optional static assets served on `/` when the web UI bundle is deployed |
 
-Run the daemon via systemd (see `systemd/webhook-auto-update.service`, which now
-executes `webhook-auto-update server`). For housekeeping, use the CLI
-subcommands below; for example:
+Run the daemon as a normal HTTP service for most deployments. The recommended
+unit is `webhook-auto-update http-server`, which listens on `WEBHOOK_HTTP_ADDR`
+(`0.0.0.0:25111` by default when not overridden). A legacy systemd socket unit
+is still shipped for backward compatibility but should not be used for new setups.
+
+For housekeeping, use the CLI subcommands below; for example:
 
 ```bash
 PATH="$PWD/tests/mock-bin:$PATH" webhook-auto-update trigger-units demo.service --dry-run
@@ -29,6 +32,35 @@ PATH="$PWD/tests/mock-bin:$PATH" webhook-auto-update prune-state --max-age-hours
 The `prune-state` command deletes stale rate-limit rows and aged image locks
 from the SQLite database (and also removes any leftover legacy files from older
 versions).
+
+## Local HTTP server + Web UI
+
+To try the built-in web UI locally:
+
+1. Build the Rust binary:
+   ```bash
+   cargo build --bin webhook-auto-update
+   ```
+2. Build the frontend bundle:
+   ```bash
+   cd web
+   npm install
+   npm run build
+   cd ..
+   ```
+3. Start the HTTP server with a local state dir and dev-friendly auth:
+   ```bash
+   WEBHOOK_STATE_DIR="$PWD" \
+   WEBHOOK_WEB_DIST="$PWD/web/dist" \
+   WEBHOOK_TOKEN="dev-token" \
+   WEBHOOK_MANUAL_TOKEN="dev-token" \
+   DEV_OPEN_ADMIN="1" \
+   WEBHOOK_HTTP_ADDR="127.0.0.1:25111" \
+   target/debug/webhook-auto-update http-server
+   ```
+
+Then open `http://127.0.0.1:25111/` in your browser. In the top status bar,
+enter `dev-token` as the manual token to access admin-only APIs via the UI.
 
 ### 结构化事件记录
 

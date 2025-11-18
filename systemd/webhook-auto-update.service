@@ -1,14 +1,12 @@
 [Unit]
 Description=Webhook auto-update dispatcher
-Requires=webhook-auto-update.socket
 After=network.target
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/webhook-auto-update.env
 WorkingDirectory=/var/lib/webhook-auto-update
-ExecStart=/usr/local/bin/webhook-auto-update server
-StandardInput=socket
+ExecStart=/usr/local/bin/webhook-auto-update http-server
 Restart=on-failure
 RestartSec=5
 
