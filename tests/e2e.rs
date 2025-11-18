@@ -5,7 +5,8 @@ use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,6 +24,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_error_paths().await?;
     scenario_static_assets().await?;
     scenario_cli_maintenance().await?;
+    scenario_http_server().await?;
     Ok(())
 }
 
@@ -226,7 +228,13 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
         .arg("--max-iterations")
         .arg("2");
     let output = env.run_command(cmd)?;
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "scheduler failed: status={} stdout={} stderr={}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
 
     let log_lines = env.read_mock_log()?;
     assert!(
@@ -341,14 +349,26 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
     let mut trigger_alpha = env.command();
     trigger_alpha.arg("trigger-units").arg("svc-alpha.service");
     let alpha_output = env.run_command(trigger_alpha)?;
-    assert!(alpha_output.status.success());
+    assert!(
+        alpha_output.status.success(),
+        "trigger-units svc-alpha.service failed: status={} stdout={} stderr={}",
+        alpha_output.status,
+        alpha_output.stdout,
+        alpha_output.stderr
+    );
 
     let mut trigger_manual = env.command();
     trigger_manual
         .arg("trigger-units")
         .arg("podman-auto-update.service");
     let manual_output = env.run_command(trigger_manual)?;
-    assert!(manual_output.status.success());
+    assert!(
+        manual_output.status.success(),
+        "trigger-units podman-auto-update.service failed: status={} stdout={} stderr={}",
+        manual_output.status,
+        manual_output.stdout,
+        manual_output.stderr
+    );
 
     let log_lines = env.read_mock_log()?;
     assert!(
@@ -372,7 +392,13 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
         .arg("--reason")
         .arg("smoke");
     let trigger_all_output = env.run_command(trigger_all)?;
-    assert!(trigger_all_output.status.success());
+    assert!(
+        trigger_all_output.status.success(),
+        "trigger-all failed: status={} stdout={} stderr={}",
+        trigger_all_output.status,
+        trigger_all_output.stdout,
+        trigger_all_output.stderr
+    );
     assert!(env.read_mock_log()?.is_empty());
 
     let mut prune_cmd = env.command();
@@ -382,7 +408,13 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
         .arg("1")
         .arg("--dry-run");
     let prune_output = env.run_command(prune_cmd)?;
-    assert!(prune_output.status.success());
+    assert!(
+        prune_output.status.success(),
+        "prune-state --dry-run failed: status={} stdout={} stderr={}",
+        prune_output.status,
+        prune_output.stdout,
+        prune_output.stderr
+    );
 
     let pool = env.connect_db().await?;
     let cli_events: Vec<_> = env
@@ -394,6 +426,59 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
     assert!(cli_events.len() >= 3);
 
     Ok(())
+}
+
+async fn scenario_http_server() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    let addr = "127.0.0.1:25111";
+
+    let mut cmd = env.command();
+    cmd.arg("http-server");
+    cmd.env("WEBHOOK_HTTP_ADDR", addr);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    let mut child = cmd.spawn()?;
+
+    // Give the server a short window to start listening.
+    let mut last_err: Option<io::Error> = None;
+    for _ in 0..20 {
+        match TcpStream::connect(addr) {
+            Ok(mut stream) => {
+                let request = HttpRequest::get("/health").into_bytes();
+                stream.write_all(&request)?;
+                // Signal end of request body.
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf)?;
+                let response = HttpResponse::parse(&buf)?;
+                assert_eq!(response.status, 200, "http-server /health status");
+                assert!(
+                    response.body_text().contains("ok"),
+                    "http-server /health body: {}",
+                    response.body_text()
+                );
+
+                child.kill().ok();
+                child.wait().ok();
+                return Ok(());
+            }
+            Err(err) => {
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "http-server did not start on {addr} in time: last_err={:?}",
+        last_err
+    )
+    .into())
 }
 
 fn github_registry_payload(owner: &str, name: &str, tag: &str) -> Vec<u8> {
@@ -426,6 +511,7 @@ fn current_unix_secs() -> u64 {
 }
 
 struct TestEnv {
+    #[allow(dead_code)]
     temp: TempDir,
     state_dir: PathBuf,
     db_path: PathBuf,
@@ -691,7 +777,9 @@ impl HttpRequest {
 
 struct HttpResponse {
     status: u16,
+    #[allow(dead_code)]
     reason: String,
+    #[allow(dead_code)]
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
