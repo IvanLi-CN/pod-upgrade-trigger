@@ -174,6 +174,10 @@ fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+fn dev_mode_open_admin() -> bool {
+    forward_auth_config().dev_open_admin
+}
+
 fn manual_auto_update_unit() -> String {
     env::var("MANUAL_AUTO_UPDATE_UNIT").unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string())
 }
@@ -1370,7 +1374,9 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
     };
 
     let expected = manual_api_token();
-    if expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected {
+    let dev_open = dev_mode_open_admin();
+    if !dev_open && (expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected)
+    {
         respond_text(
             ctx,
             401,
@@ -1481,7 +1487,9 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
     };
 
     let expected = manual_api_token();
-    if expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected {
+    let dev_open = dev_mode_open_admin();
+    if !dev_open && (expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected)
+    {
         respond_text(
             ctx,
             401,
