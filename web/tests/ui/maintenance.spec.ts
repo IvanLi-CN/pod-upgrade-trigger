@@ -16,4 +16,13 @@ test.describe('Maintenance page', () => {
     const payloadStatusCell = payloadRow.getByRole('cell').nth(1)
     await expect(payloadStatusCell.getByText('缺失', { exact: true })).toBeVisible()
   })
+
+  test('can trigger prune-state cleanup', async ({ page }) => {
+    await page.goto('/maintenance')
+
+    await page.getByLabel('最大保留时间（小时）').fill('24')
+    await page.getByRole('button', { name: '清理' }).click()
+
+    await expect(page.getByText('清理完成')).toBeVisible()
+  })
 })

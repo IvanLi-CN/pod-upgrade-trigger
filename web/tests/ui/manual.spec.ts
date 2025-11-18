@@ -42,4 +42,21 @@ test.describe('Manual triggers', () => {
     await expect(page.getByText('单元触发成功')).toBeVisible()
     await expect(page.getByText(/trigger-unit svc-alpha\.service/)).toBeVisible()
   })
+
+  test('shows error toast when trigger-all fails', async ({ page }) => {
+    await page.route('**/api/manual/trigger', async (route) => {
+      await route.fulfill({
+        status: 500,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'simulated failure' }),
+      })
+    })
+
+    await openManualPage(page)
+
+    await page.getByRole('button', { name: '触发全部' }).click()
+
+    await expect(page.getByText('触发失败')).toBeVisible()
+    await expect(page.getByText('暂无手动触发记录。')).toBeVisible()
+  })
 })

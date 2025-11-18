@@ -1,6 +1,6 @@
 import { Icon } from '@iconify/react'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
 
@@ -48,9 +48,9 @@ export default function WebhooksPage() {
   const { pushToast } = useToast()
   const [status, setStatus] = useState<WebhooksStatusResponse | null>(null)
   const [locks, setLocks] = useState<LockEntry[]>([])
-  const [_searchParams, setSearchParams] = useSearchParams()
   const [config, setConfig] = useState<ConfigResponse | null>(null)
   const [configLoaded, setConfigLoaded] = useState(false)
+  const navigate = useNavigate()
 
   useEffect(() => {
     let cancelled = false
@@ -152,7 +152,7 @@ export default function WebhooksPage() {
 
   const openEventsForUnit = (unit: WebhookUnit) => {
     const path = unit.webhook_url
-    setSearchParams({ path_prefix: path })
+    navigate(`/events?path_prefix=${encodeURIComponent(path)}`)
   }
 
   const buildWebhookUrl = (unit: WebhookUnit): string => {
