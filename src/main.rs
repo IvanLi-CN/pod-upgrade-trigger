@@ -325,8 +325,8 @@ fn run_http_server_cli(_args: &[String]) -> ! {
             Ok((stream, peer)) => {
                 // For each incoming TCP connection, spawn a short-lived child process
                 // running `webhook-auto-update server`, wiring the TCP stream to
-                // the child's stdin/stdout. This mirrors the systemd socket-activation
-                // model but without requiring systemd itself.
+                // the child's stdin/stdout. This keeps the HTTP handler simple and
+                // isolates per-request state in a dedicated process.
                 if let Err(err) = spawn_server_for_stream(stream) {
                     eprintln!("failed to spawn server for {peer:?}: {err}");
                 }
@@ -557,7 +557,8 @@ fn expect_u64(value: Option<&String>, label: &str) -> u64 {
 fn print_usage(exe: &str) {
     eprintln!("Usage: {exe} <command> [options]\n");
     eprintln!("Commands:");
-    eprintln!("  server                       Run the socket-activated HTTP server");
+    eprintln!("  server                       Run a single HTTP request on stdin/stdout (internal)");
+    eprintln!("  http-server                  Run the persistent HTTP server bound to WEBHOOK_HTTP_ADDR");
     eprintln!("  scheduler [options]          Run the periodic auto-update trigger");
     eprintln!("  trigger-units <units...>     Restart specific units immediately");
     eprintln!("  trigger-all [options]        Restart all configured units");

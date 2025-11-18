@@ -3,8 +3,8 @@
 `webhook-auto-update` is a small HTTP service that validates GitHub package events,
 enforces rate limits, refreshes Podman images, and restarts the correct systemd
 units. The binary also ships a JSON API for manual triggers, a scheduler loop for
-`podman-auto-update`, and utilities for maintaining the state directory. It can be
-run as a normal HTTP server (`http-server` 子命令)，也可以在需要时通过 systemd socket 兼容旧部署。
+`podman-auto-update`, and utilities for maintaining the state directory. It is
+designed to run as a normal HTTP server via the `http-server` subcommand.
 
 ## State Directory Layout
 

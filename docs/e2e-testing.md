@@ -20,7 +20,7 @@
 ### 2. 进程管理器
 
 - 封装 `std::process::Command` 以 server/CLI 模式拉起 `webhook-auto-update`，可捕获 stdout/stderr。
-- 通过向子进程 STDIN 写入 HTTP 报文模拟 systemd socket 激活；如需 TCP，可引入测试特性禁用 socket 激活并监听 127.0.0.1。
+- 通过向子进程 STDIN 写入 HTTP 报文驱动单次 `server` 子命令，或在需要时使用 `http-server` 子命令监听 `127.0.0.1` 并通过 TCP 发送请求。
 - 为调度器与 CLI 子命令封装 helper（如 `run_scheduler`, `trigger_units_cli`）。
 
 ### 3. Mock 服务矩阵

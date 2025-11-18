@@ -4,8 +4,9 @@
 
 ## 总体结构
 
-1. **HTTP Frontend（同步 STDIN 服务器）**
-   - 由 systemd-socket 激活，一旦有连接便从 STDIN 读取请求行、头、主体。
+1. **HTTP Frontend（常驻监听服务器）**
+   - 通过 `http-server` 子命令在 `WEBHOOK_HTTP_ADDR`（默认 `0.0.0.0:25111`）上监听 TCP 连接。
+   - 对每个进入的连接派生子进程运行 `server` 子命令，在该子进程内从 STDIN 读取请求行、头、主体并写回响应。
    - 支持 `/health`、`/sse/hello`、GitHub webhook 路由、传统 `/auto-update` 令牌触发以及 `/api/manual/*` JSON API。
    - 根据路径决定后续处理逻辑，并通过统一的 `RequestContext` 承载 method/path/query/body 等信息。
 
