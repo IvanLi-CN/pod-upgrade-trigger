@@ -36,12 +36,21 @@ type ImageLocksResponse = {
   locks: LockEntry[]
 }
 
+type ConfigResponse = {
+  web?: {
+    webhook_url_prefix?: string | null
+    github_webhook_path_prefix?: string
+  }
+}
+
 export default function WebhooksPage() {
   const { getJson } = useApi()
   const { pushToast } = useToast()
   const [status, setStatus] = useState<WebhooksStatusResponse | null>(null)
   const [locks, setLocks] = useState<LockEntry[]>([])
   const [_searchParams, setSearchParams] = useSearchParams()
+  const [config, setConfig] = useState<ConfigResponse | null>(null)
+  const [configLoaded, setConfigLoaded] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -64,6 +73,22 @@ export default function WebhooksPage() {
         }
       } catch (err) {
         console.error('Failed to load image locks', err)
+      }
+    })()
+
+    ;(async () => {
+      try {
+        const cfg = await getJson<ConfigResponse>('/api/config')
+        if (!cancelled) {
+          setConfig(cfg)
+          setConfigLoaded(true)
+        }
+      } catch (err) {
+        console.error('Failed to load config for webhooks', err)
+        // fall back to window.location.origin in render
+        if (!cancelled) {
+          setConfigLoaded(true)
+        }
       }
     })()
 
@@ -130,6 +155,22 @@ export default function WebhooksPage() {
     setSearchParams({ path_prefix: path })
   }
 
+  const buildWebhookUrl = (unit: WebhookUnit): string => {
+    const path = unit.webhook_url
+    const fromConfig = config?.web?.webhook_url_prefix
+    const base =
+      (fromConfig && fromConfig.trim().length > 0 && fromConfig) ||
+      (typeof window !== 'undefined' ? window.location.origin : '')
+    if (!base) return path
+    try {
+      return new URL(path, base).toString()
+    } catch {
+      return path
+    }
+  }
+
+  const isReady = Boolean(status && configLoaded)
+
   return (
     <div className="space-y-6">
       <section className="card bg-base-100 shadow">
@@ -147,8 +188,14 @@ export default function WebhooksPage() {
             </span>
           </div>
           <div className="space-y-3">
-            {status?.units?.length ? (
-              status.units.map((unit) => (
+            {!isReady && (
+              <p className="text-xs text-base-content/60">Loading config and webhook status…</p>
+            )}
+            {isReady && status?.units?.length ? (
+              status.units.map((unit) => {
+                const fullWebhookUrl = buildWebhookUrl(unit)
+                const disabled = !configLoaded
+                return (
                 <div
                   key={unit.slug}
                   className="flex flex-col gap-2 rounded-lg border border-base-200 bg-base-100 px-3 py-2 text-xs md:flex-row md:items-center"
@@ -168,7 +215,7 @@ export default function WebhooksPage() {
                     <div className="flex flex-wrap items-center gap-1 text-[10px]">
                       <span className="badge badge-outline badge-xs gap-1">
                         <Icon icon="mdi:webhook" />
-                        {unit.webhook_url}
+                        {fullWebhookUrl}
                       </span>
                       <span className="badge badge-outline badge-xs gap-1">
                         <Icon icon="mdi:refresh" />
@@ -196,7 +243,8 @@ export default function WebhooksPage() {
                     <button
                       type="button"
                       className="btn btn-xs btn-outline"
-                      onClick={() => handleCopy(unit.webhook_url)}
+                      onClick={() => handleCopy(fullWebhookUrl)}
+                      disabled={disabled}
                     >
                       <Icon icon="mdi:content-copy" className="text-sm" />
                       复制 URL
@@ -205,13 +253,15 @@ export default function WebhooksPage() {
                       type="button"
                       className="btn btn-xs btn-ghost gap-1"
                       onClick={() => openEventsForUnit(unit)}
+                      disabled={disabled}
                     >
                       <Icon icon="mdi:open-in-new" className="text-sm" />
                       查看事件
                     </button>
                   </div>
                 </div>
-              ))
+                )
+              })
             ) : (
               <p className="text-xs text-base-content/60">
                 未检测到任何 GitHub webhook 单元。请检查 WEBHOOK_MANUAL_UNITS 和 systemd

@@ -51,6 +51,7 @@ const FORWARD_AUTH_ADMIN_VALUE_ENV: &str = "FORWARD_AUTH_ADMIN_VALUE";
 const FORWARD_AUTH_NICKNAME_HEADER_ENV: &str = "FORWARD_AUTH_NICKNAME_HEADER";
 const ADMIN_MODE_NAME_ENV: &str = "ADMIN_MODE_NAME";
 const DEV_OPEN_ADMIN_ENV: &str = "DEV_OPEN_ADMIN";
+const WEBHOOK_PUBLIC_BASE_URL_ENV: &str = "WEBHOOK_PUBLIC_BASE_URL";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -176,6 +177,13 @@ fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
 
 fn dev_mode_open_admin() -> bool {
     forward_auth_config().dev_open_admin
+}
+
+fn public_base_url() -> Option<String> {
+    env::var(WEBHOOK_PUBLIC_BASE_URL_ENV)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn manual_auto_update_unit() -> String {
@@ -667,6 +675,8 @@ fn handle_connection() -> Result<(), String> {
         respond_text(&ctx, 200, "OK", "ok", "health-check", None)?;
     } else if ctx.method == "GET" && ctx.path == "/sse/hello" {
         handle_hello_sse(&ctx)?;
+    } else if ctx.path == "/api/config" {
+        handle_config_api(&ctx)?;
     } else if ctx.path == "/api/settings" {
         handle_settings_api(&ctx)?;
     } else if ctx.path == "/api/events" {
@@ -2100,7 +2110,9 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     let head_only = ctx.method == "HEAD";
 
     let relative = match ctx.path.as_str() {
-        "/" | "/index.html" => PathBuf::from("index.html"),
+        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/maintenance" | "/settings" | "/401" => {
+            PathBuf::from("index.html")
+        }
         path if path.starts_with("/assets/") => match sanitize_frontend_path(path) {
             Some(p) => p,
             None => return Ok(false),
@@ -2173,6 +2185,35 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
         Some(json!({ "asset": relative.to_string_lossy() })),
     )?;
     Ok(true)
+}
+
+fn handle_config_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "config-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    // This endpoint is intentionally open: it only exposes values that are
+    // either already visible to the user (current origin) or safe to know
+    // from the UI.
+    let webhook_prefix = public_base_url();
+    let path_prefix = format!("/{GITHUB_ROUTE_PREFIX}");
+
+    let response = json!({
+        "web": {
+            "webhook_url_prefix": webhook_prefix,
+            "github_webhook_path_prefix": path_prefix,
+        },
+    });
+
+    respond_json(ctx, 200, "OK", &response, "config-api", None)
 }
 
 fn frontend_dist_dir() -> PathBuf {
@@ -2374,15 +2415,26 @@ fn handle_webhooks_status(ctx: &RequestContext) -> Result<(), String> {
     unit_values.sort_by(|a, b| a.slug.cmp(&b.slug));
 
     let mut entries = Vec::with_capacity(unit_values.len());
+    let base_url = public_base_url();
     for u in unit_values {
         let expected_image = unit_configured_image(&u.unit);
-        let webhook_url = format!("/{}/{}", GITHUB_ROUTE_PREFIX, u.slug);
-        let redeploy_url = format!("{webhook_url}/redeploy");
+        let webhook_path = format!("/{}/{}", GITHUB_ROUTE_PREFIX, u.slug);
+        let redeploy_path = format!("{webhook_path}/redeploy");
+        let webhook_url = base_url
+            .as_ref()
+            .map(|base| format!("{base}{webhook_path}"))
+            .unwrap_or_else(|| webhook_path.clone());
+        let redeploy_url = base_url
+            .as_ref()
+            .map(|base| format!("{base}{redeploy_path}"))
+            .unwrap_or_else(|| redeploy_path.clone());
         let hmac_ok = u.last_hmac_error_ts.is_none();
 
         entries.push(json!({
             "unit": u.unit,
             "slug": u.slug,
+            "webhook_path": webhook_path,
+            "redeploy_path": redeploy_path,
             "webhook_url": webhook_url,
             "redeploy_url": redeploy_url,
             "expected_image": expected_image,
