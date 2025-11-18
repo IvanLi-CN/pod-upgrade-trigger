@@ -19,8 +19,8 @@ The service stores durable data under `WEBHOOK_STATE_DIR` (defaults to
 
 Run the daemon as a normal HTTP service for most deployments. The recommended
 unit is `webhook-auto-update http-server`, which listens on `WEBHOOK_HTTP_ADDR`
-(`0.0.0.0:25111` by default when not overridden). A legacy systemd socket unit
-is still shipped for backward compatibility but should not be used for new setups.
+(`0.0.0.0:25111` by default when not overridden). Older socket-activation units
+have been removed; the only supported entry point is the `http-server` subcommand.
 
 For housekeeping, use the CLI subcommands below; for example:
 
@@ -61,6 +61,25 @@ To try the built-in web UI locally:
 
 Then open `http://127.0.0.1:25111/` in your browser. In the top status bar,
 enter `dev-token` as the manual token to access admin-only APIs via the UI.
+
+## ForwardAuth and dev mode
+
+The service can optionally protect admin-only APIs (Events, Manual, Webhooks)
+using a ForwardAuth-style header:
+
+- In production:
+  - Set `FORWARD_AUTH_HEADER`, e.g. `X-Forwarded-User`;
+  - Set `FORWARD_AUTH_ADMIN_VALUE` to the value that identifies an admin user;
+  - Optionally configure `FORWARD_AUTH_NICKNAME_HEADER` and `ADMIN_MODE_NAME`.
+  - Do **not** set `DEV_OPEN_ADMIN`.
+- In development:
+  - Either leave `FORWARD_AUTH_HEADER` / `FORWARD_AUTH_ADMIN_VALUE` unset, **or**
+  - Set `DEV_OPEN_ADMIN=1` to completely bypass ForwardAuth checks and treat all
+    requests as admin.
+
+If `FORWARD_AUTH_HEADER` and `FORWARD_AUTH_ADMIN_VALUE` are set but `DEV_OPEN_ADMIN`
+is not, missing/incorrect auth headers will cause `401 Unauthorized` on admin APIs
+and the UI will route to `/401`.
 
 ### 结构化事件记录
 
