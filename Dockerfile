@@ -37,15 +37,15 @@ RUN apt-get update \
 
 WORKDIR /srv/app
 
-ENV WEBHOOK_STATE_DIR=/srv/app/data \
-    WEBHOOK_WEB_DIST=/srv/app/web \
+ENV PODUP_STATE_DIR=/srv/app/data \
+    PODUP_WEB_DIST=/srv/app/web \
     APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}
 
-COPY --from=rust-builder /app/target/release/webhook-auto-update /usr/local/bin/webhook-auto-update
+COPY --from=rust-builder /app/target/release/pod-upgrade-trigger /usr/local/bin/pod-upgrade-trigger
 COPY --from=web-builder /app/web/dist /srv/app/web
 RUN mkdir -p /srv/app/data
 
 VOLUME ["/srv/app/data"]
 EXPOSE 8080
 
-CMD ["webhook-auto-update"]
+CMD ["pod-upgrade-trigger"]

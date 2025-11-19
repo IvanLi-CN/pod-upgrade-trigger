@@ -262,12 +262,12 @@ export default function WebhooksPage() {
                 </div>
                 )
               })
-            ) : (
-              <p className="text-xs text-base-content/60">
-                未检测到任何 GitHub webhook 单元。请检查 WEBHOOK_MANUAL_UNITS 和 systemd
+          ) : (
+            <p className="text-xs text-base-content/60">
+                未检测到任何 GitHub webhook 单元。请检查 PODUP_MANUAL_UNITS 和 systemd
                 配置。
-              </p>
-            )}
+            </p>
+          )}
           </div>
         </div>
       </section>

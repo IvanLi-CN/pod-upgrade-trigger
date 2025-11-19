@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 use url::Url;
 
-const LOG_TAG: &str = "webhook-auto-update";
+const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
 const DEFAULT_WEB_DIST_DIR: &str = "web/dist";
 const DEFAULT_CONTAINER_DIR: &str = "/home/<user>/.config/containers/systemd";
@@ -41,17 +41,33 @@ const DEFAULT_REGISTRY_HOST: &str = "ghcr.io";
 const PULL_RETRY_ATTEMPTS: u8 = 3;
 const PULL_RETRY_DELAY_SECS: u64 = 5;
 const DEFAULT_SCHEDULER_INTERVAL_SECS: u64 = 900;
-const MANUAL_UNITS_ENV: &str = "WEBHOOK_MANUAL_UNITS";
-const MANUAL_TOKEN_ENV: &str = "WEBHOOK_MANUAL_TOKEN";
 const DEFAULT_STATE_RETENTION_SECS: u64 = 86_400; // 24 hours
-const WEBHOOK_DB_ENV: &str = "WEBHOOK_DB_URL";
 const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
-const FORWARD_AUTH_HEADER_ENV: &str = "FORWARD_AUTH_HEADER";
-const FORWARD_AUTH_ADMIN_VALUE_ENV: &str = "FORWARD_AUTH_ADMIN_VALUE";
-const FORWARD_AUTH_NICKNAME_HEADER_ENV: &str = "FORWARD_AUTH_NICKNAME_HEADER";
-const ADMIN_MODE_NAME_ENV: &str = "ADMIN_MODE_NAME";
-const DEV_OPEN_ADMIN_ENV: &str = "DEV_OPEN_ADMIN";
-const WEBHOOK_PUBLIC_BASE_URL_ENV: &str = "WEBHOOK_PUBLIC_BASE_URL";
+
+// Environment variable names (external interface). All variables use the
+// PODUP_ prefix to avoid ambiguity with legacy naming.
+const ENV_STATE_DIR: &str = "PODUP_STATE_DIR";
+const ENV_WEB_DIST: &str = "PODUP_WEB_DIST";
+const ENV_DB_URL: &str = "PODUP_DB_URL";
+const ENV_TOKEN: &str = "PODUP_TOKEN";
+const ENV_MANUAL_TOKEN: &str = "PODUP_MANUAL_TOKEN";
+const ENV_GH_WEBHOOK_SECRET: &str = "PODUP_GH_WEBHOOK_SECRET";
+const ENV_HTTP_ADDR: &str = "PODUP_HTTP_ADDR";
+const ENV_PUBLIC_BASE_URL: &str = "PODUP_PUBLIC_BASE_URL";
+const ENV_DEBUG_PAYLOAD_PATH: &str = "PODUP_DEBUG_PAYLOAD_PATH";
+const ENV_AUDIT_SYNC: &str = "PODUP_AUDIT_SYNC";
+const ENV_SCHEDULER_INTERVAL_SECS: &str = "PODUP_SCHEDULER_INTERVAL_SECS";
+const ENV_SCHEDULER_MIN_INTERVAL_SECS: &str = "PODUP_SCHEDULER_MIN_INTERVAL_SECS";
+const ENV_SCHEDULER_MAX_TICKS: &str = "PODUP_SCHEDULER_MAX_TICKS";
+const ENV_MANUAL_UNITS: &str = "PODUP_MANUAL_UNITS";
+const ENV_MANUAL_AUTO_UPDATE_UNIT: &str = "PODUP_MANUAL_AUTO_UPDATE_UNIT";
+const ENV_FWD_AUTH_HEADER: &str = "PODUP_FWD_AUTH_HEADER";
+const ENV_FWD_AUTH_ADMIN_VALUE: &str = "PODUP_FWD_AUTH_ADMIN_VALUE";
+const ENV_FWD_AUTH_NICKNAME_HEADER: &str = "PODUP_FWD_AUTH_NICKNAME_HEADER";
+const ENV_ADMIN_MODE_NAME: &str = "PODUP_ADMIN_MODE_NAME";
+const ENV_DEV_OPEN_ADMIN: &str = "PODUP_DEV_OPEN_ADMIN";
+const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
+const ENV_GH_ALLOWED_EVENTS: &str = "PODUP_GH_ALLOWED_EVENTS";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -86,29 +102,38 @@ struct ForwardAuthConfig {
 
 impl ForwardAuthConfig {
     fn load() -> Self {
-        let header_name = env::var(FORWARD_AUTH_HEADER_ENV)
+        // Determine environment profile for default behavior.
+        let profile = env::var("PODUP_ENV")
+            .unwrap_or_else(|_| "dev".to_string())
+            .to_ascii_lowercase();
+        let profile_dev_open = matches!(profile.as_str(), "dev" | "development" | "demo");
+
+        let header_name = env::var(ENV_FWD_AUTH_HEADER)
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .filter(|v| !v.is_empty());
-        let admin_value = env::var(FORWARD_AUTH_ADMIN_VALUE_ENV)
+        let admin_value = env::var(ENV_FWD_AUTH_ADMIN_VALUE)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let nickname_header = env::var(FORWARD_AUTH_NICKNAME_HEADER_ENV)
+        let nickname_header = env::var(ENV_FWD_AUTH_NICKNAME_HEADER)
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .filter(|v| !v.is_empty());
-        let admin_mode_name = env::var(ADMIN_MODE_NAME_ENV)
+        let admin_mode_name = env::var(ENV_ADMIN_MODE_NAME)
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let dev_open_admin = env::var(DEV_OPEN_ADMIN_ENV)
+        let dev_open_admin = env::var(ENV_DEV_OPEN_ADMIN)
             .ok()
             .map(|v| {
                 let normalized = v.trim().to_ascii_lowercase();
                 matches!(normalized.as_str(), "1" | "true" | "yes")
             })
-            .unwrap_or(false);
+            // In dev/demo profiles, default to open-admin even when the explicit
+            // flag is not provided, so local development and demo modes do not
+            // accidentally require ForwardAuth configuration.
+            .unwrap_or(profile_dev_open);
 
         ForwardAuthConfig {
             header_name,
@@ -176,18 +201,29 @@ fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
 }
 
 fn dev_mode_open_admin() -> bool {
-    forward_auth_config().dev_open_admin
+    // Manual/admin APIs use this to decide whether to bypass token checks. We
+    // treat PODUP_DEV_OPEN_ADMIN as an explicit override; otherwise dev/demo
+    // profiles default to open-admin.
+    if let Ok(raw) = env::var(ENV_DEV_OPEN_ADMIN) {
+        let normalized = raw.trim().to_ascii_lowercase();
+        return matches!(normalized.as_str(), "1" | "true" | "yes");
+    }
+
+    let profile = env::var("PODUP_ENV")
+        .unwrap_or_else(|_| "dev".to_string())
+        .to_ascii_lowercase();
+    matches!(profile.as_str(), "dev" | "development" | "demo")
 }
 
 fn public_base_url() -> Option<String> {
-    env::var(WEBHOOK_PUBLIC_BASE_URL_ENV)
+    env::var(ENV_PUBLIC_BASE_URL)
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
 }
 
 fn manual_auto_update_unit() -> String {
-    env::var("MANUAL_AUTO_UPDATE_UNIT").unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string())
+    env::var(ENV_MANUAL_AUTO_UPDATE_UNIT).unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string())
 }
 
 fn lookup_unit_from_path(path: &str) -> Option<String> {
@@ -257,11 +293,13 @@ fn extract_container_image(body: &[u8]) -> Result<String, String> {
 
 fn main() {
     let mut args = env::args();
-    let exe = args.next().unwrap_or_else(|| "webhook-auto-update".into());
+    let exe = args.next().unwrap_or_else(|| "pod-upgrade-trigger".into());
     let Some(raw_cmd) = args.next() else {
         print_usage(&exe);
         std::process::exit(1);
     };
+
+    apply_env_profile_defaults();
 
     let command = normalize_command(&raw_cmd);
     let remaining: Vec<String> = args.collect();
@@ -274,6 +312,7 @@ fn main() {
         "trigger-units" => run_trigger_cli(&remaining, false),
         "trigger-all" => run_trigger_cli(&remaining, true),
         "prune-state" => run_prune_cli(&remaining),
+        "seed-demo" => run_seed_demo_cli(&remaining),
         "help" => {
             print_usage(&exe);
             std::process::exit(0);
@@ -284,6 +323,98 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn apply_env_profile_defaults() {
+    // PODUP_ENV controls a coarse-grained runtime profile:
+    // - "test": favor in-memory / throw-away DB defaults
+    // - "demo": ephemeral local demo state with UI bundle under ./web/dist
+    // - "prod": production-style defaults (minimal assumptions)
+    // - anything else (or unset): treated as "dev"
+    let profile = env::var("PODUP_ENV")
+        .unwrap_or_else(|_| "dev".to_string())
+        .to_ascii_lowercase();
+
+    // Only set a variable if it is currently unset or empty, so explicit
+    // configuration (including tests and systemd units) always wins.
+    let ensure = |key: &str, value: String| {
+        if env::var(key).ok().map(|v| v.trim().is_empty()).unwrap_or(true) {
+            // SAFETY: This is called once at process start in main(), before any
+            // other threads are spawned, so mutating the environment here is safe.
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+    };
+
+    // Common defaults for non-test profiles.
+    if profile != "test" && profile != "testing" {
+        // Default DB URL: point to the data directory under the compiled project
+        // root, so the path is stable and not dependent on the process CWD.
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let db_abs = manifest_dir.join(DEFAULT_DB_PATH);
+        ensure(
+            ENV_DB_URL,
+            format!("sqlite://{}", db_abs.to_string_lossy()),
+        );
+
+        // Prefer using the current working directory as the implicit state dir
+        // when no explicit state dir is provided.
+        if env::var(ENV_STATE_DIR).is_err() {
+            if let Ok(cwd) = env::current_dir() {
+                ensure(
+                    ENV_STATE_DIR,
+                    cwd.to_string_lossy().into_owned(),
+                );
+            }
+        }
+
+        // For dev/demo, default PODUP_WEB_DIST to ./web/dist when present so
+        // a typical local build works out of the box.
+        if profile == "dev" || profile == "demo" || profile.is_empty() {
+            if env::var(ENV_WEB_DIST).ok().map(|v| v.trim().is_empty()).unwrap_or(true) {
+                if let Ok(cwd) = env::current_dir() {
+                    let candidate = cwd.join("web").join("dist");
+                    if candidate.is_dir() {
+                        ensure(
+                            ENV_WEB_DIST,
+                            candidate.to_string_lossy().into_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        // Test profile: prefer an in-memory shared SQLite database unless a DB
+        // URL is explicitly provided. This keeps tests isolated and fast.
+        if env::var(ENV_DB_URL)
+            .ok()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
+            unsafe {
+                env::set_var(ENV_DB_URL, "sqlite::memory:?cache=shared");
+            }
+        }
+    }
+
+    // When we have a state dir, we can also derive a reasonable default for the
+    // debug payload path. This avoids writing under DEFAULT_STATE_DIR in dev/demo.
+    if env::var(ENV_DEBUG_PAYLOAD_PATH)
+        .ok()
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+    {
+        if let Ok(state_dir) = env::var(ENV_STATE_DIR) {
+            if !state_dir.trim().is_empty() {
+                let path = Path::new(&state_dir).join("last_payload.bin");
+                unsafe {
+                    env::set_var(ENV_DEBUG_PAYLOAD_PATH, path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
 }
 
 fn normalize_command(raw: &str) -> String {
@@ -323,8 +454,21 @@ fn run_server() -> ! {
     std::process::exit(0);
 }
 
+fn run_seed_demo_cli(_args: &[String]) -> ! {
+    match seed_demo_data() {
+        Ok(()) => {
+            println!("seed-demo completed");
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("seed-demo failed: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_http_server_cli(_args: &[String]) -> ! {
-    let addr = env::var("WEBHOOK_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:25111".to_string());
+    let addr = env::var(ENV_HTTP_ADDR).unwrap_or_else(|_| "0.0.0.0:25111".to_string());
     let listener = TcpListener::bind(&addr).unwrap_or_else(|err| {
         eprintln!("failed to bind HTTP address {addr}: {err}");
         std::process::exit(1);
@@ -336,7 +480,7 @@ fn run_http_server_cli(_args: &[String]) -> ! {
         match listener.accept() {
             Ok((stream, peer)) => {
                 // For each incoming TCP connection, spawn a short-lived child process
-                // running `webhook-auto-update server`, wiring the TCP stream to
+                // running `pod-upgrade-trigger server`, wiring the TCP stream to
                 // the child's stdin/stdout. This keeps the HTTP handler simple and
                 // isolates per-request state in a dedicated process.
                 if let Err(err) = spawn_server_for_stream(stream) {
@@ -386,11 +530,11 @@ fn spawn_server_for_stream(stream: TcpStream) -> Result<(), String> {
 }
 
 fn run_scheduler_cli(args: &[String]) -> ! {
-    let mut interval = env::var("AUTO_UPDATE_INTERVAL_SECS")
+    let mut interval = env::var(ENV_SCHEDULER_INTERVAL_SECS)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_SCHEDULER_INTERVAL_SECS);
-    let mut max_iterations = env::var("WEBHOOK_SCHEDULER_MAX_TICKS")
+    let mut max_iterations = env::var(ENV_SCHEDULER_MAX_TICKS)
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
 
@@ -570,7 +714,7 @@ fn print_usage(exe: &str) {
     eprintln!("Usage: {exe} <command> [options]\n");
     eprintln!("Commands:");
     eprintln!("  server                       Run a single HTTP request on stdin/stdout (internal)");
-    eprintln!("  http-server                  Run the persistent HTTP server bound to WEBHOOK_HTTP_ADDR");
+    eprintln!("  http-server                  Run the persistent HTTP server bound to PODUP_HTTP_ADDR");
     eprintln!("  scheduler [options]          Run the periodic auto-update trigger");
     eprintln!("  trigger-units <units...>     Restart specific units immediately");
     eprintln!("  trigger-all [options]        Restart all configured units");
@@ -749,39 +893,39 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
-    let state_dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    let state_dir = env::var(ENV_STATE_DIR).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
     let web_dist = frontend_dist_dir();
     let web_dist_str = web_dist.to_string_lossy().to_string();
 
-    let webhook_token_configured = env::var("WEBHOOK_TOKEN")
+    let webhook_token_configured = env::var(ENV_TOKEN)
         .ok()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    let manual_token_configured = env::var(MANUAL_TOKEN_ENV)
+    let manual_token_configured = env::var(ENV_MANUAL_TOKEN)
         .ok()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    let github_secret_configured = env::var("GITHUB_WEBHOOK_SECRET")
+    let github_secret_configured = env::var(ENV_GH_WEBHOOK_SECRET)
         .ok()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
 
-    let scheduler_interval_secs = env::var("AUTO_UPDATE_INTERVAL_SECS")
+    let scheduler_interval_secs = env::var(ENV_SCHEDULER_INTERVAL_SECS)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SCHEDULER_INTERVAL_SECS);
-    let scheduler_min_interval_secs = env::var("WEBHOOK_SCHEDULER_MIN_INTERVAL_SECS")
+    let scheduler_min_interval_secs = env::var(ENV_SCHEDULER_MIN_INTERVAL_SECS)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(60);
-    let scheduler_max_iterations = env::var("WEBHOOK_SCHEDULER_MAX_TICKS")
+    let scheduler_max_iterations = env::var(ENV_SCHEDULER_MAX_TICKS)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok());
 
     let auto_update_unit = manual_auto_update_unit();
     let trigger_units = manual_unit_list();
 
-    let db_url = env::var(WEBHOOK_DB_ENV)
+    let db_url = env::var(ENV_DB_URL)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("sqlite://{DEFAULT_DB_PATH}"));
@@ -797,14 +941,14 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
         "protected"
     };
 
-    let build_timestamp = option_env!("WEBHOOK_BUILD_TIMESTAMP").map(|s| s.to_string());
+    let build_timestamp = option_env!("PODUP_BUILD_TIMESTAMP").map(|s| s.to_string());
 
     let db_stats = db_path
         .as_ref()
         .map(|p| path_stats(p))
         .unwrap_or_else(|| json!({ "exists": false, "path": db_url }));
 
-    let debug_payload_path = env::var("WEBHOOK_DEBUG_PAYLOAD_PATH")
+    let debug_payload_path = env::var(ENV_DEBUG_PAYLOAD_PATH)
         .ok()
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| {
@@ -816,11 +960,11 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
 
     let response = json!({
         "env": {
-            "WEBHOOK_STATE_DIR": state_dir,
-            "WEBHOOK_WEB_DIST": web_dist_str,
-            "WEBHOOK_TOKEN_configured": webhook_token_configured,
-            "WEBHOOK_MANUAL_TOKEN_configured": manual_token_configured,
-            "GITHUB_WEBHOOK_SECRET_configured": github_secret_configured,
+            "PODUP_STATE_DIR": state_dir,
+            "PODUP_WEB_DIST": web_dist_str,
+            "PODUP_TOKEN_configured": webhook_token_configured,
+            "PODUP_MANUAL_TOKEN_configured": manual_token_configured,
+            "PODUP_GH_WEBHOOK_SECRET_configured": github_secret_configured,
         },
         "scheduler": {
             "interval_secs": scheduler_interval_secs,
@@ -1234,7 +1378,7 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
         .and_then(extract_query_token)
         .unwrap_or_default();
 
-    let expected = env::var("WEBHOOK_TOKEN").unwrap_or_default();
+    let expected = env::var(ENV_TOKEN).unwrap_or_default();
     if expected.is_empty() || token.is_empty() || token != expected {
         log_message(&format!("401 {}", redacted_line));
         respond_text(
@@ -1384,9 +1528,12 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
     };
 
     let expected = manual_api_token();
-    let dev_open = dev_mode_open_admin();
-    if !dev_open && (expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected)
-    {
+    let profile = env::var("PODUP_ENV")
+        .unwrap_or_else(|_| "dev".to_string())
+        .to_ascii_lowercase();
+    let is_dev_like = matches!(profile.as_str(), "dev" | "development" | "demo");
+    let require_token = !is_dev_like && !expected.is_empty();
+    if require_token && request.token.as_deref().unwrap_or_default() != expected {
         respond_text(
             ctx,
             401,
@@ -1497,9 +1644,12 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
     };
 
     let expected = manual_api_token();
-    let dev_open = dev_mode_open_admin();
-    if !dev_open && (expected.is_empty() || request.token.as_deref().unwrap_or_default() != expected)
-    {
+    let profile = env::var("PODUP_ENV")
+        .unwrap_or_else(|_| "dev".to_string())
+        .to_ascii_lowercase();
+    let is_dev_like = matches!(profile.as_str(), "dev" | "development" | "demo");
+    let require_token = !is_dev_like && !expected.is_empty();
+    if require_token && request.token.as_deref().unwrap_or_default() != expected {
         respond_text(
             ctx,
             401,
@@ -1628,10 +1778,10 @@ struct ManualCliOptions {
 }
 
 fn manual_api_token() -> String {
-    env::var(MANUAL_TOKEN_ENV)
+    env::var(ENV_MANUAL_TOKEN)
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| env::var("WEBHOOK_TOKEN").unwrap_or_default())
+        .unwrap_or_else(|| env::var(ENV_TOKEN).unwrap_or_default())
 }
 
 fn manual_unit_list() -> Vec<String> {
@@ -1642,7 +1792,7 @@ fn manual_unit_list() -> Vec<String> {
     seen.insert(manual.clone());
     units.push(manual);
 
-    if let Ok(raw) = env::var(MANUAL_UNITS_ENV) {
+    if let Ok(raw) = env::var(ENV_MANUAL_UNITS) {
         for entry in raw.split(|ch| ch == ',' || ch == '\n') {
             if let Some(unit) = resolve_unit_identifier(entry) {
                 if seen.insert(unit.clone()) {
@@ -1744,7 +1894,7 @@ fn trigger_single_unit(unit: &str, dry_run: bool) -> UnitActionResult {
 }
 
 fn scheduler_sleep_duration(interval_secs: u64) -> Duration {
-    let min_interval = env::var("WEBHOOK_SCHEDULER_MIN_INTERVAL_SECS")
+    let min_interval = env::var(ENV_SCHEDULER_MIN_INTERVAL_SECS)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(60);
@@ -1832,7 +1982,7 @@ struct StatePruneReport {
 }
 
 fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneReport, String> {
-    let dir = env::var("WEBHOOK_STATE_DIR").unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    let dir = env::var(ENV_STATE_DIR).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
     let state_path = Path::new(&dir);
     let now_secs = current_unix_secs();
     let cutoff_secs = now_secs.saturating_sub(retention.as_secs().max(1)) as i64;
@@ -2217,7 +2367,7 @@ fn handle_config_api(ctx: &RequestContext) -> Result<(), String> {
 }
 
 fn frontend_dist_dir() -> PathBuf {
-    env::var("WEBHOOK_WEB_DIST")
+    env::var(ENV_WEB_DIST)
         .ok()
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from)
@@ -2284,7 +2434,7 @@ fn handle_webhooks_status(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
-    let secret_configured = env::var("GITHUB_WEBHOOK_SECRET")
+    let secret_configured = env::var(ENV_GH_WEBHOOK_SECRET)
         .ok()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
@@ -2474,7 +2624,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
-    let secret = env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default();
+    let secret = env::var(ENV_GH_WEBHOOK_SECRET).unwrap_or_default();
     if secret.is_empty() {
         log_message("500 github-misconfigured missing secret");
         respond_text(
@@ -2977,7 +3127,7 @@ fn spawn_background_task(
 
     let args = build_systemd_run_args(&unit_name, exe_str, unit, image, event, delivery, path);
 
-    if let Ok(snapshot) = env::var("WEBHOOK_SYSTEMD_RUN_SNAPSHOT") {
+    if let Ok(snapshot) = env::var(ENV_SYSTEMD_RUN_SNAPSHOT) {
         fs::write(snapshot, args.join("\n")).map_err(|e| e.to_string())?;
         return Ok(());
     }
@@ -3174,11 +3324,11 @@ mod tests {
     use std::sync::Once;
     use tempfile::NamedTempFile;
 
-    fn init_test_db() {
+fn init_test_db() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             unsafe {
-                env::set_var(WEBHOOK_DB_ENV, "sqlite::memory:?cache=shared");
+                env::set_var(ENV_DB_URL, "sqlite::memory:?cache=shared");
             }
             let _ = super::db_pool();
         });
@@ -3261,10 +3411,10 @@ mod tests {
     fn rate_limit_enforces_limits() {
         init_test_db();
         unsafe {
-            env::set_var("WEBHOOK_LIMIT1_COUNT", "1");
-            env::set_var("WEBHOOK_LIMIT1_WINDOW", "3600");
-            env::set_var("WEBHOOK_LIMIT2_COUNT", "5");
-            env::set_var("WEBHOOK_LIMIT2_WINDOW", "3600");
+            env::set_var("PODUP_LIMIT1_COUNT", "1");
+            env::set_var("PODUP_LIMIT1_WINDOW", "3600");
+            env::set_var("PODUP_LIMIT2_COUNT", "5");
+            env::set_var("PODUP_LIMIT2_WINDOW", "3600");
         }
 
         let first = rate_limit_check();
@@ -3277,10 +3427,10 @@ mod tests {
         );
 
         unsafe {
-            env::remove_var("WEBHOOK_LIMIT1_COUNT");
-            env::remove_var("WEBHOOK_LIMIT1_WINDOW");
-            env::remove_var("WEBHOOK_LIMIT2_COUNT");
-            env::remove_var("WEBHOOK_LIMIT2_WINDOW");
+            env::remove_var("PODUP_LIMIT1_COUNT");
+            env::remove_var("PODUP_LIMIT1_WINDOW");
+            env::remove_var("PODUP_LIMIT2_COUNT");
+            env::remove_var("PODUP_LIMIT2_WINDOW");
         }
     }
 
@@ -3392,7 +3542,7 @@ fn verify_github_signature(signature: &str, secret: &str, body: &[u8]) -> Result
     let expected = mac.finalize().into_bytes();
     let body_hash = sha2::Sha256::digest(body);
 
-    let debug_path = env::var("WEBHOOK_DEBUG_PAYLOAD_PATH")
+    let debug_path = env::var(ENV_DEBUG_PAYLOAD_PATH)
         .ok()
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| {
@@ -3550,7 +3700,7 @@ fn db_pool() -> SqlitePool {
 }
 
 fn init_db_pool() -> SqlitePool {
-    let url = env::var(WEBHOOK_DB_ENV)
+    let url = env::var(ENV_DB_URL)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("sqlite://{DEFAULT_DB_PATH}"));
@@ -3616,6 +3766,164 @@ where
         .map_err(|e| e.to_string())
 }
 
+fn seed_demo_data() -> Result<(), String> {
+    // Seed a small, deterministic dataset for demo/dev/test modes. All rows are
+    // tagged with demo-specific identifiers so the operation is idempotent.
+    with_db(|pool| async move {
+        // Remove any previous demo seed rows to keep the operation repeatable.
+        sqlx::query("DELETE FROM event_log WHERE request_id LIKE 'demo-%'")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM rate_limit_tokens WHERE scope = 'demo'")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM image_locks WHERE bucket LIKE 'demo-%'")
+            .execute(&pool)
+            .await?;
+
+        let now = current_unix_secs() as i64;
+
+        // Event log: mix of manual, webhook, scheduler and health events.
+        let events = vec![
+            (
+                "demo-0001",
+                now - 1800,
+                "POST",
+                Some("/api/manual/trigger"),
+                202,
+                "manual-trigger",
+                12,
+                json!({
+                    "units": ["podman-auto-update.service", "svc-alpha.service", "svc-beta.service"],
+                    "dry_run": true,
+                    "caller": "demo",
+                    "reason": "initial-seed"
+                }),
+            ),
+            (
+                "demo-0002",
+                now - 1700,
+                "POST",
+                Some("/api/manual/services/svc-alpha"),
+                202,
+                "manual-service",
+                34,
+                json!({
+                    "unit": "svc-alpha.service",
+                    "image": "ghcr.io/example/svc-alpha:demo",
+                    "dry_run": false,
+                    "caller": "demo",
+                    "reason": "alpha-rollout"
+                }),
+            ),
+            (
+                "demo-0003",
+                now - 1600,
+                "POST",
+                Some("/github-package-update/svc-beta"),
+                202,
+                "github-webhook",
+                48,
+                json!({
+                    "unit": "svc-beta.service",
+                    "image": "ghcr.io/example/svc-beta:main",
+                    "delivery": "demo-delivery-1",
+                    "event": "registry_package"
+                }),
+            ),
+            (
+                "demo-0004",
+                now - 1500,
+                "POST",
+                Some("/github-package-update/svc-beta"),
+                500,
+                "github-webhook",
+                51,
+                json!({
+                    "unit": "svc-beta.service",
+                    "image": "ghcr.io/example/svc-beta:broken",
+                    "delivery": "demo-delivery-2",
+                    "event": "registry_package",
+                    "error": "simulated podman failure"
+                }),
+            ),
+            (
+                "demo-0005",
+                now - 1400,
+                "GET",
+                Some("/health"),
+                200,
+                "health-check",
+                3,
+                json!({
+                    "status": "ok",
+                    "scheduler_interval_secs": DEFAULT_SCHEDULER_INTERVAL_SECS
+                }),
+            ),
+            (
+                "demo-0006",
+                now - 1300,
+                "GET",
+                Some("/events"),
+                200,
+                "frontend",
+                27,
+                json!({
+                    "route": "/events",
+                    "page": 1,
+                    "per_page": 50
+                }),
+            ),
+        ];
+
+        for (request_id, ts, method, path, status, action, duration_ms, meta) in events {
+            sqlx::query(
+                "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(request_id)
+            .bind(ts)
+            .bind(method)
+            .bind(path)
+            .bind(status as i64)
+            .bind(action)
+            .bind(duration_ms as i64)
+            .bind(serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string()))
+            .execute(&pool)
+            .await?;
+        }
+
+        // Rate limit tokens: one "hot" bucket and one aged-out bucket.
+        sqlx::query(
+            "INSERT INTO rate_limit_tokens (scope, bucket, ts) VALUES ('demo', 'manual-hot', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO rate_limit_tokens (scope, bucket, ts) VALUES ('demo', 'manual-aged', ?)",
+        )
+        .bind(now - 200_000)
+        .execute(&pool)
+        .await?;
+
+        // Image locks: one fresh, one stale.
+        sqlx::query(
+            "INSERT OR REPLACE INTO image_locks (bucket, acquired_at) VALUES ('demo-lock-fresh', ?)",
+        )
+        .bind(now)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO image_locks (bucket, acquired_at) VALUES ('demo-lock-stale', ?)",
+        )
+        .bind(now - 200_000)
+        .execute(&pool)
+        .await?;
+
+        Ok::<(), sqlx::Error>(())
+    })
+}
+
 fn persist_event_record(
     request_id: &str,
     ts_secs: u64,
@@ -3677,7 +3985,7 @@ fn persist_event_record(
 fn audit_sync_mode() -> bool {
     static SYNC_MODE: OnceLock<bool> = OnceLock::new();
     *SYNC_MODE.get_or_init(|| {
-        env::var("WEBHOOK_AUDIT_SYNC")
+        env::var(ENV_AUDIT_SYNC)
             .ok()
             .map(|value| {
                 let normalized = value.trim().to_ascii_lowercase();
@@ -3920,13 +4228,13 @@ struct ManualRateLimitConfig {
 impl ManualRateLimitConfig {
     fn load() -> Result<Self, RateLimitError> {
         Ok(Self {
-            l1_count: env_u64("WEBHOOK_LIMIT1_COUNT", DEFAULT_LIMIT1_COUNT)
+            l1_count: env_u64("PODUP_LIMIT1_COUNT", DEFAULT_LIMIT1_COUNT)
                 .map_err(RateLimitError::Io)?,
-            l1_window: env_u64("WEBHOOK_LIMIT1_WINDOW", DEFAULT_LIMIT1_WINDOW)
+            l1_window: env_u64("PODUP_LIMIT1_WINDOW", DEFAULT_LIMIT1_WINDOW)
                 .map_err(RateLimitError::Io)?,
-            l2_count: env_u64("WEBHOOK_LIMIT2_COUNT", DEFAULT_LIMIT2_COUNT)
+            l2_count: env_u64("PODUP_LIMIT2_COUNT", DEFAULT_LIMIT2_COUNT)
                 .map_err(RateLimitError::Io)?,
-            l2_window: env_u64("WEBHOOK_LIMIT2_WINDOW", DEFAULT_LIMIT2_WINDOW)
+            l2_window: env_u64("PODUP_LIMIT2_WINDOW", DEFAULT_LIMIT2_WINDOW)
                 .map_err(RateLimitError::Io)?,
         })
     }

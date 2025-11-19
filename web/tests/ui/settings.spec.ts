@@ -4,15 +4,15 @@ test.describe('Settings page', () => {
   test('shows environment and systemd configuration', async ({ page }) => {
     await page.goto('/settings')
 
-    const stateRow = page.getByRole('row', { name: /WEBHOOK_STATE_DIR/ })
+    const stateRow = page.getByRole('row', { name: /PODUP_STATE_DIR/ })
     await expect(stateRow.getByText('configured')).toBeVisible()
     await expect(stateRow.getByRole('cell').nth(2)).not.toHaveText('(empty)')
 
-    const webDistRow = page.getByRole('row', { name: /WEBHOOK_WEB_DIST/ })
+    const webDistRow = page.getByRole('row', { name: /PODUP_WEB_DIST/ })
     await expect(webDistRow.getByText('configured')).toBeVisible()
     await expect(webDistRow.getByRole('cell').nth(2)).toContainText('web/dist')
 
-    const manualTokenRow = page.getByRole('row', { name: /WEBHOOK_MANUAL_TOKEN/ })
+    const manualTokenRow = page.getByRole('row', { name: /PODUP_MANUAL_TOKEN/ })
     await expect(manualTokenRow.getByText('configured')).toBeVisible()
     await expect(manualTokenRow.getByText('***')).toBeVisible()
 
@@ -45,4 +45,3 @@ test.describe('Settings page', () => {
     await expect(page).toHaveURL(/\/manual$/)
   })
 })
-

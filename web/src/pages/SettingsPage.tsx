@@ -5,11 +5,11 @@ import { useApi } from '../hooks/useApi'
 
 type SettingsResponse = {
   env: {
-    WEBHOOK_STATE_DIR?: string
-    WEBHOOK_WEB_DIST?: string
-    WEBHOOK_TOKEN_configured?: boolean
-    WEBHOOK_MANUAL_TOKEN_configured?: boolean
-    GITHUB_WEBHOOK_SECRET_configured?: boolean
+    PODUP_STATE_DIR?: string
+    PODUP_WEB_DIST?: string
+    PODUP_TOKEN_configured?: boolean
+    PODUP_MANUAL_TOKEN_configured?: boolean
+    PODUP_GH_WEBHOOK_SECRET_configured?: boolean
   }
   scheduler: {
     interval_secs?: number
@@ -78,28 +78,28 @@ export default function SettingsPage() {
               </thead>
               <tbody>
                 <EnvRow
-                  name="WEBHOOK_STATE_DIR"
-                  value={settings?.env.WEBHOOK_STATE_DIR}
+                  name="PODUP_STATE_DIR"
+                  value={settings?.env.PODUP_STATE_DIR}
                   secret={false}
                 />
                 <EnvRow
-                  name="WEBHOOK_WEB_DIST"
-                  value={settings?.env.WEBHOOK_WEB_DIST}
+                  name="PODUP_WEB_DIST"
+                  value={settings?.env.PODUP_WEB_DIST}
                   secret={false}
                 />
                 <EnvRow
-                  name="WEBHOOK_TOKEN"
-                  configured={settings?.env.WEBHOOK_TOKEN_configured}
+                  name="PODUP_TOKEN"
+                  configured={settings?.env.PODUP_TOKEN_configured}
                   secret
                 />
                 <EnvRow
-                  name="WEBHOOK_MANUAL_TOKEN"
-                  configured={settings?.env.WEBHOOK_MANUAL_TOKEN_configured}
+                  name="PODUP_MANUAL_TOKEN"
+                  configured={settings?.env.PODUP_MANUAL_TOKEN_configured}
                   secret
                 />
                 <EnvRow
-                  name="GITHUB_WEBHOOK_SECRET"
-                  configured={settings?.env.GITHUB_WEBHOOK_SECRET_configured}
+                  name="PODUP_GH_WEBHOOK_SECRET"
+                  configured={settings?.env.PODUP_GH_WEBHOOK_SECRET_configured}
                   secret
                 />
               </tbody>
@@ -268,4 +268,3 @@ function EnvRow({ name, value, configured, secret }: EnvRowProps) {
     </tr>
   )
 }
-

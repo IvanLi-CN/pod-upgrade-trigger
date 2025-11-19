@@ -5,6 +5,10 @@ tests/mock-bin/log.txt
 /data/
 /http-server.log
 /http-server.pid
+
+# Local HTTP dev/demo/test logs & pids
+/*-http*.log
+/*-http*.pid
 /last_payload.bin
 /tmp-events-*.txt
 

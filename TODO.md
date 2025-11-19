@@ -18,5 +18,5 @@
 
 ## Future Enhancements
 - [ ] Optional auto-discovery of webhook-capable systemd units:
-  - When enabled via a dedicated flag/env (e.g. `WEBHOOK_AUTO_DISCOVER=1`), scan systemd units by naming convention or explicit marker (such as `X-Webhook-Enabled=yes`) to build the GitHub Webhooks list instead of (or in addition to) `WEBHOOK_MANUAL_UNITS`.
+  - When enabled via a dedicated flag/env (e.g. `PODUP_AUTO_DISCOVER=1`), scan systemd units by naming convention or explicit marker (such as `X-Webhook-Enabled=yes`) to build the GitHub Webhooks list instead of (or in addition to) `PODUP_MANUAL_UNITS`.
   - Keep the current explicit list as the default/safe behavior; auto-discovery should be opt-in and clearly documented.

@@ -2,7 +2,7 @@
 
 ## 背景与目标
 
-`webhook-auto-update` 在同一进程中承担 GitHub Webhook 校验、Podman 镜像刷新、systemd 单元重启、手动触发 API、调度器与 SQLite 状态维护等职责。由于大部分副作用可以通过 PATH 注入 mock 二进制以及可配置的 `WEBHOOK_STATE_DIR` 隔离，本方案旨在：
+`pod-upgrade-trigger` 在同一进程中承担 GitHub Webhook 校验、Podman 镜像刷新、systemd 单元重启、手动触发 API、调度器与 SQLite 状态维护等职责。由于大部分副作用可以通过 PATH 注入 mock 二进制以及可配置的 `PODUP_STATE_DIR` 隔离，本方案旨在：
 
 1. 为所有关键路径提供可重复、完全离线的自动化验证能力；
 2. 通过 mock 服务记录与断言 Podman/systemctl/systemd-run 调用；
@@ -14,24 +14,24 @@
 ### 1. Tokio 异步 e2e 测试套件
 
 - 新建 `tests/e2e.rs`（或拆分多文件）并使用 `#[tokio::test]`。
-- 每个用例创建 `TempDir`，设置 `WEBHOOK_STATE_DIR`、`WEBHOOK_DB_URL=sqlite://<tmp>/pod-upgrade-trigger.db`、`WEBHOOK_WEB_DIST=<tmp>/web/dist` 等环境变量。
+- 每个用例创建 `TempDir`，设置 `PODUP_STATE_DIR`、`PODUP_DB_URL=sqlite://<tmp>/pod-upgrade-trigger.db`、`PODUP_WEB_DIST=<tmp>/web/dist` 等环境变量。
 - 测试前通过 `PATH="$(pwd)/tests/mock-bin:$PATH"` 注入 mock，可并行运行。
 
 ### 2. 进程管理器
 
-- 封装 `std::process::Command` 以 server/CLI 模式拉起 `webhook-auto-update`，可捕获 stdout/stderr。
+- 封装 `std::process::Command` 以 server/CLI 模式拉起 `pod-upgrade-trigger`，可捕获 stdout/stderr。
 - 通过向子进程 STDIN 写入 HTTP 报文驱动单次 `server` 子命令，或在需要时使用 `http-server` 子命令监听 `127.0.0.1` 并通过 TCP 发送请求。
 - 为调度器与 CLI 子命令封装 helper（如 `run_scheduler`, `trigger_units_cli`）。
 
 ### 3. Mock 服务矩阵
 
-- 复用 `tests/mock-bin/podman`、`systemctl`，并新增 `systemd-run` mock：记录参数、可配置失败或延迟、必要时触发 `webhook-auto-update run-task`。
+- 复用 `tests/mock-bin/podman`、`systemctl`，并新增 `systemd-run` mock：记录参数、可配置失败或延迟、必要时触发 `pod-upgrade-trigger run-task`。
 - 所有 mock 输出统一写入 `tests/mock-bin/log.txt`（JSON Lines 或 key=value），测试读取后断言调用顺序、参数与失败注入是否生效。
 - 通过环境变量控制失败：`MOCK_PODMAN_FAIL`、`MOCK_PODMAN_PRUNE_FAIL`、`MOCK_SYSTEMCTL_FAIL`，新增 `MOCK_SYSTEMD_RUN_FAIL`、`MOCK_SYSTEMD_RUN_DELAY_MS` 等。
 
 ### 4. 客户端与数据构造
 
-- 提供 helper 生成 GitHub `package` 与 `registry_package` 事件 JSON，并使用 `GITHUB_WEBHOOK_SECRET` 计算 `x-hub-signature-256`。
+- 提供 helper 生成 GitHub `package` 与 `registry_package` 事件 JSON，并使用 `PODUP_GH_WEBHOOK_SECRET` 计算 `x-hub-signature-256`。
 - 封装 `/api/manual/trigger`、`/api/manual/services/<name>`、`/auto-update` 的 HTTP 请求构建，支持 dry-run/实跑。
 - 对静态资源测试，在 `TempDir/web/dist` 写入伪造的 `index.html`、`assets/` 内容。
 
@@ -51,11 +51,11 @@
 ## 关键端到端场景
 
 1. **GitHub Webhook 正常流程**：发送签名请求 → 通过镜像限流 → `systemd-run` mock 触发 `run-task` → `podman pull` 与 `systemctl restart` 按顺序记入日志 → `event_log` 存储对应行。
-2. **速率限制与清理**：预填 `rate_limit_tokens`，短时间重复触发得到 HTTP 429，执行 `webhook-auto-update prune-state --max-age-hours 48` 后重试成功。
+2. **速率限制与清理**：预填 `rate_limit_tokens`，短时间重复触发得到 HTTP 429，执行 `pod-upgrade-trigger prune-state --max-age-hours 48` 后重试成功。
 3. **手动触发 API**：`POST /api/manual/trigger`（`all=true`、`dry_run` 与正常模式）以及 `/api/manual/services/<slug>`（携带 `image/caller/reason`）；断言 dry-run 不产生 systemctl 调用、审计字段正确写入。
-4. **调度器循环**：`webhook-auto-update scheduler --interval 1 --max-iterations 2`；验证 mock 里 `podman-auto-update.service` 的调用和 `record_system_event` 记录。
+4. **调度器循环**：`pod-upgrade-trigger scheduler --interval 1 --max-iterations 2`；验证 mock 里 `podman-auto-update.service` 的调用和 `record_system_event` 记录。
 5. **错误路径**：设置 `MOCK_PODMAN_FAIL=1` 或 `MOCK_SYSTEMD_RUN_FAIL=unitA`；确认 HTTP/CLI 返回值、SQLite 中的失败事件，以及 `last_payload.bin` dump。
-6. **静态资源与健康检查**：`GET /health` 正常返回；`WEBHOOK_WEB_DIST` 存在时 `GET /`、`/assets/*` 提供对应文件。
+6. **静态资源与健康检查**：`GET /health` 正常返回；`PODUP_WEB_DIST` 存在时 `GET /`、`/assets/*` 提供对应文件。
 7. **维护命令**：执行 `trigger-units`、`trigger-all --dry-run`、`prune-state` 等 CLI，查证 mock 日志与数据库状态。
 
 ## 执行与 CI 集成
@@ -88,7 +88,7 @@
 **目标**
 
 - 在本地与 CI 中一键运行 Web UI E2E：
-  - 启动真实后端 `webhook-auto-update http-server`（完全 mock 副作用）；
+- 启动真实后端 `pod-upgrade-trigger http-server`（完全 mock 副作用）；
   - 使用无头浏览器驱动 UI，覆盖核心功能与典型错误路径；
   - 从浏览器视角验证页面渲染、交互、导航与 API 行为。
 
@@ -96,7 +96,7 @@
 
 - 不接入真实 systemd/podman，所有命令均走 `tests/mock-bin`。
 - 不依赖真实 ForwardAuth，测试环境统一使用 `DEV_OPEN_ADMIN=1` 或无需配置 ForwardAuth。
-- 每次测试使用独立 `WEBHOOK_STATE_DIR`/SQLite 文件，保证结果可重复、无共享状态污染。
+- 每次测试使用独立 `PODUP_STATE_DIR`/SQLite 文件，保证结果可重复、无共享状态污染。
 
 ### 2. 技术选型与总体框架
 
@@ -108,7 +108,7 @@
   - `web/tests/ui/*.spec.ts`：UI E2E 测试用例。
 - 统一入口脚本：
   - `scripts/test-ui-e2e.sh`：
-    1. 构建后端：`cargo build --bin webhook-auto-update`
+    1. 构建后端：`cargo build --bin pod-upgrade-trigger`
     2. 构建前端：`cd web && npm install && npm run build`
     3. 创建临时 state 目录（如 `target/ui-e2e/state-XXXX`）
     4. 以 mock 环境启动 `http-server`
@@ -117,19 +117,19 @@
 **http-server 启动环境（示例）**
 
 ```bash
-WEBHOOK_STATE_DIR="$STATE_DIR" \
-WEBHOOK_DB_URL="sqlite://$STATE_DIR/pod-upgrade-trigger.db" \
-WEBHOOK_WEB_DIST="$REPO/web/dist" \
-WEBHOOK_TOKEN="e2e-token" \
-WEBHOOK_MANUAL_TOKEN="e2e-token" \
-GITHUB_WEBHOOK_SECRET="e2e-secret" \
-WEBHOOK_MANUAL_UNITS="svc-alpha.service,svc-beta.service" \
-DEV_OPEN_ADMIN="1" \
-WEBHOOK_HTTP_ADDR="127.0.0.1:25211" \
-WEBHOOK_PUBLIC_BASE_URL="http://127.0.0.1:25211" \
-WEBHOOK_AUDIT_SYNC="1" \
+PODUP_STATE_DIR="$STATE_DIR" \
+PODUP_DB_URL="sqlite://$STATE_DIR/pod-upgrade-trigger.db" \
+PODUP_WEB_DIST="$REPO/web/dist" \
+PODUP_TOKEN="e2e-token" \
+PODUP_MANUAL_TOKEN="e2e-token" \
+PODUP_GH_WEBHOOK_SECRET="e2e-secret" \
+PODUP_MANUAL_UNITS="svc-alpha.service,svc-beta.service" \
+PODUP_DEV_OPEN_ADMIN="1" \
+PODUP_HTTP_ADDR="127.0.0.1:25211" \
+PODUP_PUBLIC_BASE_URL="http://127.0.0.1:25211" \
+PODUP_AUDIT_SYNC="1" \
 PATH="$REPO/tests/mock-bin:$PATH" \
-nohup target/debug/webhook-auto-update http-server >ui-e2e-http.log 2>&1 &
+nohup target/debug/pod-upgrade-trigger http-server >ui-e2e-http.log 2>&1 &
 ```
 
 Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
@@ -220,7 +220,7 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
      - 按钮恢复为可用。
 
 2. **多 unit 展示**
-   - 配置 `WEBHOOK_MANUAL_UNITS=svc-alpha.service,svc-beta.service`：
+   - 配置 `PODUP_MANUAL_UNITS=svc-alpha.service,svc-beta.service`：
      - Webhooks 页面显示两个单元卡片：`svc-alpha.service`、`svc-beta.service`；
      - 卡片内包含：
        - unit 名、slug、HMAC 状态；
@@ -228,12 +228,12 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
        - 预期镜像（若配置）。
 
 3. **完整 URL 显示与复制**
-   - 设置 `WEBHOOK_PUBLIC_BASE_URL=https://example.com`：
+   - 设置 `PODUP_PUBLIC_BASE_URL=https://example.com`：
      - `/api/webhooks/status` 返回：
        - `webhook_path=/github-package-update/svc-alpha`
        - `webhook_url=https://example.com/github-package-update/svc-alpha`
      - UI 显示与 “复制 URL” 按钮都使用完整 URL，而非裸路径。
-   - 未设置 `WEBHOOK_PUBLIC_BASE_URL` 时：
+   - 未设置 `PODUP_PUBLIC_BASE_URL` 时：
      - UI 使用 `window.location.origin` 作为前缀构造完整 URL；
      - 在本地测试中应为 `http://127.0.0.1:25211/github-package-update/svc-alpha`。
 
@@ -299,11 +299,11 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
 
 1. **环境变量展示**
    - 根据当前 env 设置：
-     - `WEBHOOK_STATE_DIR / WEBHOOK_WEB_DIST / WEBHOOK_TOKEN / WEBHOOK_MANUAL_TOKEN / GITHUB_WEBHOOK_SECRET` 的 configured/missing 与 UI 状态一致；
+     - `PODUP_STATE_DIR / PODUP_WEB_DIST / PODUP_TOKEN / PODUP_MANUAL_TOKEN / PODUP_GH_WEBHOOK_SECRET` 的 configured/missing 与 UI 状态一致；
      - secret 变量值使用 `***` 掩码显示。
 
 2. **systemd 单元列表**
-   - 显示 auto-update unit 以及 `WEBHOOK_MANUAL_UNITS` 中所有单元；
+   - 显示 auto-update unit 以及 `PODUP_MANUAL_UNITS` 中所有单元；
    - 每行的 “手动触发” 链接跳转 `/manual`，页面滚动到对应行（可选）。
 
 3. **ForwardAuth 信息**

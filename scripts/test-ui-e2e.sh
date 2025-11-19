@@ -20,7 +20,7 @@ export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
 cd "$repo_root"
 
 echo "[ui-e2e] building backend binary"
-cargo build --bin webhook-auto-update
+cargo build --bin pod-upgrade-trigger
 
 echo "[ui-e2e] installing front-end dependencies with Bun"
 cd "$repo_root/web"
@@ -36,38 +36,38 @@ fi
 cd "$repo_root"
 echo "[ui-e2e] starting http-server on 127.0.0.1:25211"
 : >"$http_log"
-WEBHOOK_STATE_DIR="$state_dir" \
-WEBHOOK_DB_URL="sqlite://$state_dir/pod-upgrade-trigger.db" \
-WEBHOOK_WEB_DIST="$repo_root/web/dist" \
-WEBHOOK_TOKEN="e2e-token" \
-WEBHOOK_MANUAL_TOKEN="e2e-token" \
-GITHUB_WEBHOOK_SECRET="e2e-secret" \
-WEBHOOK_MANUAL_UNITS="svc-alpha.service,svc-beta.service" \
-WEBHOOK_DEBUG_PAYLOAD_PATH="$state_dir/last_payload.bin" \
-DEV_OPEN_ADMIN="1" \
-WEBHOOK_HTTP_ADDR="127.0.0.1:25211" \
-WEBHOOK_PUBLIC_BASE_URL="http://127.0.0.1:25211" \
-WEBHOOK_AUDIT_SYNC="1" \
-target/debug/webhook-auto-update http-server >"$http_log" 2>&1 &
+PODUP_STATE_DIR="$state_dir" \
+PODUP_DB_URL="sqlite://$state_dir/pod-upgrade-trigger.db" \
+PODUP_WEB_DIST="$repo_root/web/dist" \
+PODUP_TOKEN="e2e-token" \
+PODUP_MANUAL_TOKEN="e2e-token" \
+PODUP_GH_WEBHOOK_SECRET="e2e-secret" \
+PODUP_MANUAL_UNITS="svc-alpha.service,svc-beta.service" \
+PODUP_DEBUG_PAYLOAD_PATH="$state_dir/last_payload.bin" \
+PODUP_DEV_OPEN_ADMIN="1" \
+PODUP_HTTP_ADDR="127.0.0.1:25211" \
+PODUP_PUBLIC_BASE_URL="http://127.0.0.1:25211" \
+PODUP_AUDIT_SYNC="1" \
+target/debug/pod-upgrade-trigger http-server >"$http_log" 2>&1 &
 server_pid_main=$!
 
 echo "[ui-e2e] starting auth http-server on 127.0.0.1:25212"
 : >"$auth_http_log"
-WEBHOOK_STATE_DIR="$auth_state_dir" \
-WEBHOOK_DB_URL="sqlite://$auth_state_dir/pod-upgrade-trigger.db" \
-WEBHOOK_WEB_DIST="$repo_root/web/dist" \
-WEBHOOK_TOKEN="e2e-token" \
-WEBHOOK_MANUAL_TOKEN="e2e-token" \
-GITHUB_WEBHOOK_SECRET="e2e-secret" \
-WEBHOOK_MANUAL_UNITS="svc-alpha.service,svc-beta.service" \
-WEBHOOK_DEBUG_PAYLOAD_PATH="$auth_state_dir/last_payload.bin" \
-DEV_OPEN_ADMIN="0" \
-FORWARD_AUTH_HEADER="X-Forwarded-User" \
-FORWARD_AUTH_ADMIN_VALUE="admin" \
-WEBHOOK_HTTP_ADDR="127.0.0.1:25212" \
-WEBHOOK_PUBLIC_BASE_URL="http://127.0.0.1:25212" \
-WEBHOOK_AUDIT_SYNC="1" \
-target/debug/webhook-auto-update http-server >"$auth_http_log" 2>&1 &
+PODUP_STATE_DIR="$auth_state_dir" \
+PODUP_DB_URL="sqlite://$auth_state_dir/pod-upgrade-trigger.db" \
+PODUP_WEB_DIST="$repo_root/web/dist" \
+PODUP_TOKEN="e2e-token" \
+PODUP_MANUAL_TOKEN="e2e-token" \
+PODUP_GH_WEBHOOK_SECRET="e2e-secret" \
+PODUP_MANUAL_UNITS="svc-alpha.service,svc-beta.service" \
+PODUP_DEBUG_PAYLOAD_PATH="$auth_state_dir/last_payload.bin" \
+PODUP_DEV_OPEN_ADMIN="0" \
+PODUP_FWD_AUTH_HEADER="X-Forwarded-User" \
+PODUP_FWD_AUTH_ADMIN_VALUE="admin" \
+PODUP_HTTP_ADDR="127.0.0.1:25212" \
+PODUP_PUBLIC_BASE_URL="http://127.0.0.1:25212" \
+PODUP_AUDIT_SYNC="1" \
+target/debug/pod-upgrade-trigger http-server >"$auth_http_log" 2>&1 &
 server_pid_auth=$!
 
 cleanup() {

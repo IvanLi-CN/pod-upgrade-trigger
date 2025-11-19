@@ -436,7 +436,7 @@ async fn scenario_http_server() -> AnyResult<()> {
 
     let mut cmd = env.command();
     cmd.arg("http-server");
-    cmd.env("WEBHOOK_HTTP_ADDR", addr);
+    cmd.env("PODUP_HTTP_ADDR", addr);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     let mut child = cmd.spawn()?;
@@ -547,7 +547,7 @@ impl TestEnv {
         )?;
         let manual_token = "e2e-manual".to_string();
         let github_secret = "e2e-github-secret".to_string();
-        let bin_path = PathBuf::from(env!("CARGO_BIN_EXE_webhook-auto-update"));
+        let bin_path = PathBuf::from(env!("CARGO_BIN_EXE_pod-upgrade-trigger"));
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mock_dir = manifest_dir.join("tests/mock-bin");
         let mock_log = mock_dir.join("log.txt");
@@ -596,15 +596,15 @@ impl TestEnv {
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(&self.bin_path);
-        cmd.env("WEBHOOK_STATE_DIR", &self.state_dir);
-        cmd.env("WEBHOOK_DB_URL", self.db_url());
-        cmd.env("WEBHOOK_WEB_DIST", &self.web_dist);
-        cmd.env("WEBHOOK_TOKEN", &self.manual_token);
-        cmd.env("GITHUB_WEBHOOK_SECRET", &self.github_secret);
-        cmd.env("WEBHOOK_MANUAL_UNITS", "svc-alpha.service,svc-beta.service");
-        cmd.env("WEBHOOK_DEBUG_PAYLOAD_PATH", &self.debug_payload);
-        cmd.env("WEBHOOK_AUDIT_SYNC", "1");
-        cmd.env("WEBHOOK_SCHEDULER_MIN_INTERVAL_SECS", "0");
+        cmd.env("PODUP_STATE_DIR", &self.state_dir);
+        cmd.env("PODUP_DB_URL", self.db_url());
+        cmd.env("PODUP_WEB_DIST", &self.web_dist);
+        cmd.env("PODUP_TOKEN", &self.manual_token);
+        cmd.env("PODUP_GH_WEBHOOK_SECRET", &self.github_secret);
+        cmd.env("PODUP_MANUAL_UNITS", "svc-alpha.service,svc-beta.service");
+        cmd.env("PODUP_DEBUG_PAYLOAD_PATH", &self.debug_payload);
+        cmd.env("PODUP_AUDIT_SYNC", "1");
+        cmd.env("PODUP_SCHEDULER_MIN_INTERVAL_SECS", "0");
         cmd.env("PATH", &self.path_override);
         cmd.stdin(Stdio::null());
         cmd

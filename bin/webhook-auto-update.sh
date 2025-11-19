@@ -8,7 +8,7 @@ read -r REQUEST_LINE || true
 METHOD=$(awk '{print $1}' <<<"${REQUEST_LINE:-}" 2>/dev/null || echo "")
 REQUEST_PATH=$(awk '{print $2}' <<<"${REQUEST_LINE:-}" 2>/dev/null || echo "")
 
-log() { logger -t webhook-auto-update -- "$*"; }
+log() { logger -t pod-upgrade-trigger -- "$*"; }
 
 # Helper: write HTTP response
 http_resp() {
@@ -25,12 +25,12 @@ http_resp() {
 # Rate limit guard: two windows (defaults: 2/10m and 10/5h)
 rate_limit_check() {
   local now ts path db lock
-  local l1_count="${WEBHOOK_LIMIT1_COUNT:-2}"
-  local l1_window="${WEBHOOK_LIMIT1_WINDOW:-600}"
-  local l2_count="${WEBHOOK_LIMIT2_COUNT:-10}"
-  local l2_window="${WEBHOOK_LIMIT2_WINDOW:-18000}"
+  local l1_count="${PODUP_LIMIT1_COUNT:-2}"
+  local l1_window="${PODUP_LIMIT1_WINDOW:-600}"
+  local l2_count="${PODUP_LIMIT2_COUNT:-10}"
+  local l2_window="${PODUP_LIMIT2_WINDOW:-18000}"
 
-  path="${WEBHOOK_STATE_DIR:-/srv/pod-upgrade-trigger}"
+  path="${PODUP_STATE_DIR:-/srv/pod-upgrade-trigger}"
   db="$path/ratelimit.db"
   lock="$path/ratelimit.lock"
   now="$(date +%s)"
@@ -87,7 +87,7 @@ fi
 TOKEN_QUERY=$(sed -n 's/.*token=\([^& ]*\).*/\1/p' <<<"$REQUEST_PATH" || true)
 REQ_TOKEN="${TOKEN_QUERY:-}"
 
-if [[ -z "${WEBHOOK_TOKEN:-}" || -z "$REQ_TOKEN" || "$REQ_TOKEN" != "$WEBHOOK_TOKEN" ]]; then
+if [[ -z "${PODUP_TOKEN:-}" || -z "$REQ_TOKEN" || "$REQ_TOKEN" != "$PODUP_TOKEN" ]]; then
   log "401 $(redact_token "$REQUEST_LINE")"
   http_resp 401 Unauthorized "unauthorized"
   exit 0

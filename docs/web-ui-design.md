@@ -1,6 +1,6 @@
 # Web 界面设计
 
-为 `webhook-auto-update` 的内置前端拟定页面路由、模块组成与跳转关系。该设计默认通过 `WEBHOOK_WEB_DIST`（默认 `state_dir/web/dist`）托管静态资源。
+为 `pod-upgrade-trigger` 的内置前端拟定页面路由、模块组成与跳转关系。该设计默认通过 `PODUP_WEB_DIST`（默认 `state_dir/web/dist`）托管静态资源。
 
 ## 导航结构
 
@@ -34,7 +34,7 @@
 
 - 单元卡片：展示 `/github-package-update/<unit>` 与 `/github-package-update/<unit>/redeploy` URL、最近成功/失败时间、HMAC 校验状态（需 `GET /api/webhooks/status`）。
 - 镜像速率与锁：读取 `image_locks`，列出被锁镜像、预计解锁倒计时，提供“释放”操作（对应新 `DELETE /api/image-locks/<name>`）。
-- GitHub 配置提示：显示 `GITHUB_WEBHOOK_SECRET` 是否配置（true/false），链接到文档。
+- GitHub 配置提示：显示 `PODUP_GH_WEBHOOK_SECRET` 是否配置（true/false），链接到文档。
 
 ### `/events` 事件与审计
 
@@ -52,7 +52,7 @@
 
 ### `/settings` 配置总览
 
-- 环境变量展示（只读值/布尔）：`WEBHOOK_STATE_DIR`、`WEBHOOK_WEB_DIST`、`WEBHOOK_TOKEN/WEBHOOK_MANUAL_TOKEN` 已配置与否、`GITHUB_WEBHOOK_SECRET` 配置状态、调度器 interval/max-iterations。
+- 环境变量展示（只读值/布尔）：`PODUP_STATE_DIR`、`PODUP_WEB_DIST`、`PODUP_TOKEN/PODUP_MANUAL_TOKEN` 已配置与否、`PODUP_GH_WEBHOOK_SECRET` 配置状态、调度器 interval/max-iterations。
 - systemd 单元表：列出 `podman-auto-update.service` 与各业务 unit 名称，标记是否在 `trigger_unints`（sic）可见列表；跳转到 `/manual` 的对应单元操作。
 - API 基础信息：显示后端版本、构建时间、当前数据库连接串；链接到 `/events`。
 - ForwardAuth 信息：显示 `FORWARD_AUTH_HEADER`、`FORWARD_AUTH_ADMIN_VALUE`、`FORWARD_AUTH_NICKNAME_HEADER`、`ADMIN_MODE_NAME` 是否配置，便于排查登录问题；仅在生产模式展示。
