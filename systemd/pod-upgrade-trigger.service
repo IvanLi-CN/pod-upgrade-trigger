@@ -1,0 +1,14 @@
+[Unit]
+Description=Pod upgrade trigger dispatcher
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pod-upgrade-trigger.env
+WorkingDirectory=/var/lib/pod-upgrade-trigger
+ExecStart=/usr/local/bin/pod-upgrade-trigger http-server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

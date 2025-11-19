@@ -1,11 +1,12 @@
 # 项目设计概览
 
-`pod-upgrade-trigger`（可执行文件名 `webhook-auto-update`）是一套围绕 Podman/systemd 自动升级流程构建的多通道触发系统。该二进制在同一进程中承担网络监听、鉴权、速率限制、静态资源托管、CLI 管理工具以及后台调度等职责。本设计文档拆解主要模块及其交互方式，方便后续扩展与运维追踪。
+`pod-upgrade-trigger`（可执行文件名 `pod-upgrade-trigger`）是一套围绕 Podman/systemd 自动升级流程构建的多通道触发系统。该二进制在同一进程中承担网络监听、鉴权、速率限制、静态资源托管、CLI 管理工具以及后台调度等职责。本设计文档拆解主要模块及其交互方式，方便后续扩展与运维追踪。
 
 ## 总体结构
 
-1. **HTTP Frontend（同步 STDIN 服务器）**
-   - 由 systemd-socket 激活，一旦有连接便从 STDIN 读取请求行、头、主体。
+1. **HTTP Frontend（常驻监听服务器）**
+   - 通过 `http-server` 子命令在 `PODUP_HTTP_ADDR`（默认 `0.0.0.0:25111`）上监听 TCP 连接。
+   - 对每个进入的连接派生子进程运行 `server` 子命令，在该子进程内从 STDIN 读取请求行、头、主体并写回响应。
    - 支持 `/health`、`/sse/hello`、GitHub webhook 路由、传统 `/auto-update` 令牌触发以及 `/api/manual/*` JSON API。
    - 根据路径决定后续处理逻辑，并通过统一的 `RequestContext` 承载 method/path/query/body 等信息。
 
@@ -30,11 +31,11 @@
    - 提供 `--prune-state` 命令清理旧令牌、过期锁，以及历史遗留的目录文件。
 
 6. **静态资源托管**
-   - `try_serve_frontend` 将 `WEBHOOK_WEB_DIST`（默认 `state_dir/web/dist`）中的编译产物暴露在 `/`、`/assets/*`、`/favicon.ico` 等路径下，便于嵌入可视化界面。
+   - `try_serve_frontend` 将 `PODUP_WEB_DIST`（默认 `state_dir/web/dist`）中的编译产物暴露在 `/`、`/assets/*`、`/favicon.ico` 等路径下，便于嵌入可视化界面。
 
 7. **安全与鉴权**
-   - GitHub Webhook 依赖 `GITHUB_WEBHOOK_SECRET` 进行 HMAC 校验；
-   - 手动 API / `/auto-update` 使用 `WEBHOOK_TOKEN` 或 `WEBHOOK_MANUAL_TOKEN`；
+   - GitHub Webhook 依赖 `PODUP_GH_WEBHOOK_SECRET` 进行 HMAC 校验；
+   - 手动 API / `/auto-update` 使用 `PODUP_TOKEN` 或 `PODUP_MANUAL_TOKEN`；
    - 响应内容通过 `respond_*` 系列函数集中封装，便于统一返回体与事件记录。
 
 8. **事件追踪**
@@ -64,7 +65,7 @@ Persistence & Rate limits
 ## 数据持久化
 
 - **State Dir**：依旧保留 `ratelimit.db`、`github-image-*` 等纯文本数据库，负责限流与锁机制。
-- **SQL 数据库**：默认连接 `sqlite://data/pod-upgrade-trigger.db`（可用 `WEBHOOK_DB_URL` 覆盖），启动时使用 `sqlx::migrate!` 自动执行 `migrations/` 目录中的脚本；同一个数据库同时保存请求事件（`event_log`）、限流令牌（`rate_limit_tokens`）以及镜像锁（`image_locks`）。
+- **SQL 数据库**：默认连接 `sqlite://data/pod-upgrade-trigger.db`（可用 `PODUP_DB_URL` 覆盖），启动时使用 `sqlx::migrate!` 自动执行 `migrations/` 目录中的脚本；同一个数据库同时保存请求事件（`event_log`）、限流令牌（`rate_limit_tokens`）以及镜像锁（`image_locks`）。
 
 ## 扩展点
 

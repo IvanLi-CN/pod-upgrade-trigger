@@ -9,12 +9,14 @@
     "lint": "biome lint --colors=off ./src ./index.html",
     "format": "biome format ./src ./index.html --write",
     "check": "biome check ./src ./index.html",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:ui:e2e": "playwright test"
   },
   "dependencies": {
     "@iconify/icons-mdi": "^1.2.48",
     "@iconify/react": "^6.0.2",
     "daisyui": "^5.5.4",
+    "react-router-dom": "^7.9.6",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
@@ -24,6 +26,7 @@
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
+    "@playwright/test": "^1.51.0",
     "@vitejs/plugin-react-swc": "^4.2.1",
     "autoprefixer": "^10.4.22",
     "eslint": "^9.39.1",

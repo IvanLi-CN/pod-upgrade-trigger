@@ -10,13 +10,15 @@
 
 ## 当前阻点
 
-1) **缺少 HTTP 常驻监听**：程序以 inetd/socket 方式从 stdin 处理单次请求；容器虽可 `EXPOSE 8080`，但没有监听逻辑，需未来改成自带 HTTP server 后才可直接 `--net host` 对外服务。
+1) **HTTP 常驻监听已提供但仍依赖宿主环境**：
+   - 程序现在提供 `http-server` 子命令，使用 `PODUP_HTTP_ADDR`（默认 `0.0.0.0:25111`）进行正常 HTTP 监听，可直接用于容器和宿主部署。
+   - 早期依赖 inetd/systemd socket 的 stdin 模式仍保留作兼容，但不再推荐作为主入口。
 2) **依赖宿主 Podman/systemd**：
    - 代码内部依赖 `podman pull`、`systemd-run` 等命令驱动宿主容器和 systemd unit。
    - 容器内需要 `podman-remote`（或完整 podman）并挂载宿主 Podman socket，设置 `PODMAN_HOST=unix:///run/podman/podman.sock`（或 rootless 路径 `/run/user/$UID/podman/podman.sock`）。
 3) **权限与状态目录**：
-   - 状态/锁文件路径可通过 `WEBHOOK_STATE_DIR` 自定义并挂载到容器；需确保 UID/GID 与宿主一致，避免权限问题。
-   - 访问前端静态资源时，`WEBHOOK_WEB_DIST` 需要指向镜像内或挂载的 dist 目录。
+   - 状态/锁文件路径可通过 `PODUP_STATE_DIR` 自定义并挂载到容器；需确保 UID/GID 与宿主一致，避免权限问题。
+   - 访问前端静态资源时，`PODUP_WEB_DIST` 需要指向镜像内或挂载的 dist 目录。
 
 ## 镜像侧的改造建议
 
@@ -27,23 +29,24 @@
       && rm -rf /var/lib/apt/lists/*
   ```
 - 保留现有多阶段构建（Bun 构建前端，Rust release 二进制）。
-- 为未来 HTTP 监听预留入口，例如 `CMD ["webhook-auto-update", "--http-bind", "0.0.0.0:8080"]`，并在添加监听后更新。
+- 为未来 HTTP 监听预留入口，例如 `CMD ["pod-upgrade-trigger", "--http-bind", "0.0.0.0:8080"]`，并在添加监听后更新。
 
-## 推荐运行参数（待 HTTP 监听就绪后）
+## 推荐运行参数（http-server 模式）
 
 示例（root 场景，宿主 Podman socket：`/run/podman/podman.sock`）：
 
 ```bash
 podman run -d --name pod-upgrade-trigger \
   --network host \
-  -e WEBHOOK_STATE_DIR=/srv/webhook/data \
-  -e WEBHOOK_WEB_DIST=/srv/webhook/web \
+  -e PODUP_HTTP_ADDR=0.0.0.0:8080 \
+  -e PODUP_STATE_DIR=/srv/webhook/data \
+  -e PODUP_WEB_DIST=/srv/webhook/web \
   -e PODMAN_HOST=unix:///run/podman/podman.sock \
   -v /srv/webhook/data:/srv/webhook/data:Z \
   -v /srv/webhook/web:/srv/webhook/web:Z \
   -v /run/podman/podman.sock:/run/podman/podman.sock:Z \
   ghcr.io/ivanli-cn/pod-upgrade-trigger:latest \
-  /usr/local/bin/webhook-auto-update --http-bind 0.0.0.0:8080
+  /usr/local/bin/pod-upgrade-trigger http-server
 ```
 
 Rootless 场景：将 socket 改为 `/run/user/$UID/podman/podman.sock`，容器需以同 UID 运行（`--user $(id -u):$(id -g)`），并确保挂载目录的属主一致。
