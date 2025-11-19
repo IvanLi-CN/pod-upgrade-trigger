@@ -14,8 +14,8 @@ use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Component, Path, PathBuf};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -338,7 +338,11 @@ fn apply_env_profile_defaults() {
     // Only set a variable if it is currently unset or empty, so explicit
     // configuration (including tests and systemd units) always wins.
     let ensure = |key: &str, value: String| {
-        if env::var(key).ok().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        if env::var(key)
+            .ok()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
             // SAFETY: This is called once at process start in main(), before any
             // other threads are spawned, so mutating the environment here is safe.
             unsafe {
@@ -353,33 +357,28 @@ fn apply_env_profile_defaults() {
         // root, so the path is stable and not dependent on the process CWD.
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let db_abs = manifest_dir.join(DEFAULT_DB_PATH);
-        ensure(
-            ENV_DB_URL,
-            format!("sqlite://{}", db_abs.to_string_lossy()),
-        );
+        ensure(ENV_DB_URL, format!("sqlite://{}", db_abs.to_string_lossy()));
 
         // Prefer using the current working directory as the implicit state dir
         // when no explicit state dir is provided.
         if env::var(ENV_STATE_DIR).is_err() {
             if let Ok(cwd) = env::current_dir() {
-                ensure(
-                    ENV_STATE_DIR,
-                    cwd.to_string_lossy().into_owned(),
-                );
+                ensure(ENV_STATE_DIR, cwd.to_string_lossy().into_owned());
             }
         }
 
         // For dev/demo, default PODUP_WEB_DIST to ./web/dist when present so
         // a typical local build works out of the box.
         if profile == "dev" || profile == "demo" || profile.is_empty() {
-            if env::var(ENV_WEB_DIST).ok().map(|v| v.trim().is_empty()).unwrap_or(true) {
+            if env::var(ENV_WEB_DIST)
+                .ok()
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+            {
                 if let Ok(cwd) = env::current_dir() {
                     let candidate = cwd.join("web").join("dist");
                     if candidate.is_dir() {
-                        ensure(
-                            ENV_WEB_DIST,
-                            candidate.to_string_lossy().into_owned(),
-                        );
+                        ensure(ENV_WEB_DIST, candidate.to_string_lossy().into_owned());
                     }
                 }
             }
@@ -414,7 +413,6 @@ fn apply_env_profile_defaults() {
             }
         }
     }
-
 }
 
 fn normalize_command(raw: &str) -> String {
@@ -525,7 +523,8 @@ fn spawn_server_for_stream(stream: TcpStream) -> Result<(), String> {
     }
     cmd.stderr(Stdio::null());
 
-    cmd.spawn().map_err(|e| format!("failed to spawn server child: {e}"))?;
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn server child: {e}"))?;
     Ok(())
 }
 
@@ -713,8 +712,12 @@ fn expect_u64(value: Option<&String>, label: &str) -> u64 {
 fn print_usage(exe: &str) {
     eprintln!("Usage: {exe} <command> [options]\n");
     eprintln!("Commands:");
-    eprintln!("  server                       Run a single HTTP request on stdin/stdout (internal)");
-    eprintln!("  http-server                  Run the persistent HTTP server bound to PODUP_HTTP_ADDR");
+    eprintln!(
+        "  server                       Run a single HTTP request on stdin/stdout (internal)"
+    );
+    eprintln!(
+        "  http-server                  Run the persistent HTTP server bound to PODUP_HTTP_ADDR"
+    );
     eprintln!("  scheduler [options]          Run the periodic auto-update trigger");
     eprintln!("  trigger-units <units...>     Restart specific units immediately");
     eprintln!("  trigger-all [options]        Restart all configured units");
@@ -827,9 +830,7 @@ fn handle_connection() -> Result<(), String> {
         handle_events_api(&ctx)?;
     } else if ctx.path == "/api/webhooks/status" {
         handle_webhooks_status(&ctx)?;
-    } else if ctx.path == "/api/image-locks"
-        || ctx.path.starts_with("/api/image-locks/")
-    {
+    } else if ctx.path == "/api/image-locks" || ctx.path.starts_with("/api/image-locks/") {
         handle_image_locks_api(&ctx)?;
     } else if ctx.path == "/api/prune-state" {
         handle_prune_state_api(&ctx)?;
@@ -935,11 +936,7 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
         .map(|p| Path::new(p).to_path_buf());
 
     let cfg = forward_auth_config();
-    let forward_mode = if cfg.open_mode() {
-        "open"
-    } else {
-        "protected"
-    };
+    let forward_mode = if cfg.open_mode() { "open" } else { "protected" };
 
     let build_timestamp = option_env!("PODUP_BUILD_TIMESTAMP").map(|s| s.to_string());
 
@@ -1199,8 +1196,8 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
 
         for row in rows {
             let meta_raw: String = row.get("meta");
-            let meta_value: Value = serde_json::from_str(&meta_raw)
-                .unwrap_or_else(|_| json!({ "raw": meta_raw }));
+            let meta_value: Value =
+                serde_json::from_str(&meta_raw).unwrap_or_else(|_| json!({ "raw": meta_raw }));
 
             let event = json!({
                 "id": row.get::<i64, _>("id"),
@@ -2260,9 +2257,8 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     let head_only = ctx.method == "HEAD";
 
     let relative = match ctx.path.as_str() {
-        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/maintenance" | "/settings" | "/401" => {
-            PathBuf::from("index.html")
-        }
+        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/maintenance"
+        | "/settings" | "/401" => PathBuf::from("index.html"),
         path if path.starts_with("/assets/") => match sanitize_frontend_path(path) {
             Some(p) => p,
             None => return Ok(false),
@@ -2518,10 +2514,7 @@ fn handle_webhooks_status(ctx: &RequestContext) -> Result<(), String> {
             .get("unit")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .or_else(|| {
-                path.as_deref()
-                    .and_then(|p| lookup_unit_from_path(p))
-            });
+            .or_else(|| path.as_deref().and_then(|p| lookup_unit_from_path(p)));
 
         let Some(unit_name) = unit_name else {
             continue;
@@ -3324,7 +3317,7 @@ mod tests {
     use std::sync::Once;
     use tempfile::NamedTempFile;
 
-fn init_test_db() {
+    fn init_test_db() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             unsafe {
