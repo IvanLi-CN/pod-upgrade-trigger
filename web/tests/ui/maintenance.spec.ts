@@ -13,8 +13,7 @@ test.describe('Maintenance page', () => {
     await expect(webDistRow.getByText('存在')).toBeVisible()
 
     const payloadRow = page.getByRole('row', { name: /last_payload\.bin/ })
-    const payloadStatusCell = payloadRow.getByRole('cell').nth(1)
-    await expect(payloadStatusCell.getByText('缺失', { exact: true })).toBeVisible()
+    await expect(payloadRow).toBeVisible()
   })
 
   test('can trigger prune-state cleanup', async ({ page }) => {
@@ -24,5 +23,43 @@ test.describe('Maintenance page', () => {
     await page.getByRole('button', { name: '清理' }).click()
 
     await expect(page.getByText('清理完成')).toBeVisible()
+  })
+
+  test('shows and downloads debug payload after signature mismatch', async ({
+    page,
+    request,
+  }) => {
+    const body = {
+      package: {
+        package_type: 'container',
+        name: 'svc-alpha',
+        owner: { login: 'example' },
+      },
+      registry: {
+        host: 'ghcr.io',
+      },
+      package_version: {
+        metadata: {
+          container: {
+            tags: ['latest'],
+          },
+        },
+      },
+    }
+
+    await request.post('/github-package-update/svc-alpha', {
+      headers: {
+        'content-type': 'application/json',
+        'x-hub-signature-256': 'sha256=00',
+        'x-github-event': 'package',
+      },
+      data: body,
+    })
+
+    await page.goto('/maintenance')
+
+    const payloadRow = page.getByRole('row', { name: /last_payload\.bin/ })
+    const payloadStatusCell = payloadRow.getByRole('cell').nth(1)
+    await expect(payloadStatusCell.getByText('存在')).toBeVisible()
   })
 })
