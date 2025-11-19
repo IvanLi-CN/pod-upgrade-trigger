@@ -61,5 +61,10 @@ test.describe('Maintenance page', () => {
     const payloadRow = page.getByRole('row', { name: /last_payload\.bin/ })
     const payloadStatusCell = payloadRow.getByRole('cell').nth(1)
     await expect(payloadStatusCell.getByText('存在')).toBeVisible()
+
+    const downloadResponse = await request.get('/last_payload.bin')
+    await expect(downloadResponse.status()).toBe(200)
+    const downloaded = await downloadResponse.body()
+    expect(downloaded.byteLength).toBeGreaterThan(0)
   })
 })

@@ -116,9 +116,25 @@ export default function WebhooksPage() {
 
   const handleReleaseLock = async (bucket: string) => {
     try {
-      await fetch(`/api/image-locks/${encodeURIComponent(bucket)}`, {
-        method: 'DELETE',
-      })
+      type ReleaseResponse = {
+        bucket: string
+        removed: boolean
+        rows?: number
+      }
+      const response = await getJson<ReleaseResponse>(
+        `/api/image-locks/${encodeURIComponent(bucket)}`,
+        { method: 'DELETE' },
+      )
+
+      if (!response.removed) {
+        pushToast({
+          variant: 'warning',
+          title: '未找到锁',
+          message: bucket,
+        })
+        return
+      }
+
       setLocks((prev) => prev.filter((lock) => lock.bucket !== bucket))
       pushToast({
         variant: 'info',

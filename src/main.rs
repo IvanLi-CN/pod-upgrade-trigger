@@ -834,6 +834,8 @@ fn handle_connection() -> Result<(), String> {
         handle_image_locks_api(&ctx)?;
     } else if ctx.path == "/api/prune-state" {
         handle_prune_state_api(&ctx)?;
+    } else if ctx.path == "/last_payload.bin" {
+        handle_debug_payload_download(&ctx)?;
     } else if ctx.path.starts_with("/api/manual/") {
         handle_manual_api(&ctx)?;
     } else if is_github_route(&ctx.path) {
@@ -2248,6 +2250,141 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn handle_debug_payload_download(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" && ctx.method != "HEAD" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "debug-payload-download",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "debug-payload-download")? {
+        return Ok(());
+    }
+
+    let debug_path = env::var(ENV_DEBUG_PAYLOAD_PATH)
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| {
+            let default = Path::new(DEFAULT_STATE_DIR).join("last_payload.bin");
+            default.to_string_lossy().into_owned()
+        });
+
+    let path = Path::new(&debug_path);
+    let meta = match fs::metadata(path) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => {
+            respond_text(
+                ctx,
+                404,
+                "NotFound",
+                "debug payload not found",
+                "debug-payload-download",
+                Some(json!({ "path": debug_path, "reason": "not-file" })),
+            )?;
+            return Ok(());
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            respond_text(
+                ctx,
+                404,
+                "NotFound",
+                "debug payload not found",
+                "debug-payload-download",
+                Some(json!({ "path": debug_path })),
+            )?;
+            return Ok(());
+        }
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to read debug payload",
+                "debug-payload-download",
+                Some(json!({ "path": debug_path, "error": err.to_string() })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let len = meta.len().min(usize::MAX as u64) as usize;
+
+    if ctx.method == "HEAD" {
+        respond_head(
+            ctx,
+            200,
+            "OK",
+            "application/octet-stream",
+            len,
+            "debug-payload-download",
+            Some(json!({ "path": debug_path })),
+        )?;
+        return Ok(());
+    }
+
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(err) => {
+            let status = if err.kind() == io::ErrorKind::NotFound {
+                404
+            } else {
+                500
+            };
+            let reason = if status == 404 {
+                "NotFound"
+            } else {
+                "InternalServerError"
+            };
+            let body = if status == 404 {
+                "debug payload not found"
+            } else {
+                "failed to read debug payload"
+            };
+            respond_text(
+                ctx,
+                status,
+                reason,
+                body,
+                "debug-payload-download",
+                Some(json!({ "path": debug_path, "error": err.to_string() })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut buf = Vec::with_capacity(len);
+    if let Err(err) = file.read_to_end(&mut buf) {
+        respond_text(
+            ctx,
+            500,
+            "InternalServerError",
+            "failed to read debug payload",
+            "debug-payload-download",
+            Some(json!({ "path": debug_path, "error": err.to_string() })),
+        )?;
+        return Ok(());
+    }
+
+    respond_binary(
+        ctx,
+        200,
+        "OK",
+        "application/octet-stream",
+        &buf,
+        "debug-payload-download",
+        Some(json!({
+            "path": debug_path,
+            "size": len as u64,
+        })),
+    )
 }
 
 fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {

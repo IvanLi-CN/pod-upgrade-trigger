@@ -69,7 +69,7 @@ export default function DashboardPage() {
   )
 
   const rateHint: RateLimitHint = useMemo(() => {
-    const recentManuals = events.filter((e) => e.action === 'manual-auto-update')
+    const recentManuals = events.filter((e) => e.action === 'manual-trigger')
     if (!recentManuals.length) {
       return {
         title: 'Rate limit relaxed',
