@@ -38,7 +38,6 @@ RUN apt-get update \
 WORKDIR /srv/app
 
 ENV PODUP_STATE_DIR=/srv/app/data \
-    PODUP_WEB_DIST=/srv/app/web \
     APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}
 
 COPY --from=rust-builder /app/target/release/pod-upgrade-trigger /usr/local/bin/pod-upgrade-trigger

@@ -38,7 +38,6 @@ echo "[ui-e2e] starting http-server on 127.0.0.1:25211"
 : >"$http_log"
 PODUP_STATE_DIR="$state_dir" \
 PODUP_DB_URL="sqlite://$state_dir/pod-upgrade-trigger.db" \
-PODUP_WEB_DIST="$repo_root/web/dist" \
 PODUP_TOKEN="e2e-token" \
 PODUP_MANUAL_TOKEN="e2e-token" \
 PODUP_GH_WEBHOOK_SECRET="e2e-secret" \
@@ -55,7 +54,6 @@ echo "[ui-e2e] starting auth http-server on 127.0.0.1:25212"
 : >"$auth_http_log"
 PODUP_STATE_DIR="$auth_state_dir" \
 PODUP_DB_URL="sqlite://$auth_state_dir/pod-upgrade-trigger.db" \
-PODUP_WEB_DIST="$repo_root/web/dist" \
 PODUP_TOKEN="e2e-token" \
 PODUP_MANUAL_TOKEN="e2e-token" \
 PODUP_GH_WEBHOOK_SECRET="e2e-secret" \

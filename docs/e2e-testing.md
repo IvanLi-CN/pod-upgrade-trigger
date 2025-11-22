@@ -14,7 +14,7 @@
 ### 1. Tokio 异步 e2e 测试套件
 
 - 新建 `tests/e2e.rs`（或拆分多文件）并使用 `#[tokio::test]`。
-- 每个用例创建 `TempDir`，设置 `PODUP_STATE_DIR`、`PODUP_DB_URL=sqlite://<tmp>/pod-upgrade-trigger.db`、`PODUP_WEB_DIST=<tmp>/web/dist` 等环境变量。
+- 每个用例创建 `TempDir`，设置 `PODUP_STATE_DIR`、`PODUP_DB_URL=sqlite://<tmp>/pod-upgrade-trigger.db` 等环境变量。
 - 测试前通过 `PATH="$(pwd)/tests/mock-bin:$PATH"` 注入 mock，可并行运行。
 
 ### 2. 进程管理器
@@ -55,7 +55,7 @@
 3. **手动触发 API**：`POST /api/manual/trigger`（`all=true`、`dry_run` 与正常模式）以及 `/api/manual/services/<slug>`（携带 `image/caller/reason`）；断言 dry-run 不产生 systemctl 调用、审计字段正确写入。
 4. **调度器循环**：`pod-upgrade-trigger scheduler --interval 1 --max-iterations 2`；验证 mock 里 `podman-auto-update.service` 的调用和 `record_system_event` 记录。
 5. **错误路径**：设置 `MOCK_PODMAN_FAIL=1` 或 `MOCK_SYSTEMD_RUN_FAIL=unitA`；确认 HTTP/CLI 返回值、SQLite 中的失败事件，以及 `last_payload.bin` dump。
-6. **静态资源与健康检查**：`GET /health` 正常返回；`PODUP_WEB_DIST` 存在时 `GET /`、`/assets/*` 提供对应文件。
+6. **静态资源与健康检查**：`GET /health` 正常返回；`PODUP_STATE_DIR/web/dist` 或内置 `/srv/app/web` 存在时 `GET /`、`/assets/*` 提供对应文件。
 7. **维护命令**：执行 `trigger-units`、`trigger-all --dry-run`、`prune-state` 等 CLI，查证 mock 日志与数据库状态。
 
 ## 执行与 CI 集成
@@ -119,7 +119,6 @@
 ```bash
 PODUP_STATE_DIR="$STATE_DIR" \
 PODUP_DB_URL="sqlite://$STATE_DIR/pod-upgrade-trigger.db" \
-PODUP_WEB_DIST="$REPO/web/dist" \
 PODUP_TOKEN="e2e-token" \
 PODUP_MANUAL_TOKEN="e2e-token" \
 PODUP_GH_WEBHOOK_SECRET="e2e-secret" \
@@ -299,7 +298,7 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
 
 1. **环境变量展示**
    - 根据当前 env 设置：
-     - `PODUP_STATE_DIR / PODUP_WEB_DIST / PODUP_TOKEN / PODUP_MANUAL_TOKEN / PODUP_GH_WEBHOOK_SECRET` 的 configured/missing 与 UI 状态一致；
+     - `PODUP_STATE_DIR / PODUP_TOKEN / PODUP_MANUAL_TOKEN / PODUP_GH_WEBHOOK_SECRET` 的 configured/missing 与 UI 状态一致；
      - secret 变量值使用 `***` 掩码显示。
 
 2. **systemd 单元列表**

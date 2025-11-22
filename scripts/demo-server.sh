@@ -39,7 +39,6 @@ echo "[demo] seeding demo data into sqlite://$db_path"
 PODUP_ENV="dev" \
 PODUP_STATE_DIR="$state_dir" \
 PODUP_DB_URL="sqlite://$db_path" \
-PODUP_WEB_DIST="$repo_root/web/dist" \
 target/debug/pod-upgrade-trigger seed-demo
 
 if [ -f "$pid_file" ]; then
@@ -54,7 +53,6 @@ echo "[demo] starting http-server on 127.0.0.1:25311"
 PODUP_ENV="$PODUP_ENV" \
 PODUP_STATE_DIR="$state_dir" \
 PODUP_DB_URL="sqlite://$db_path" \
-PODUP_WEB_DIST="$repo_root/web/dist" \
 PODUP_TOKEN="${PODUP_TOKEN:-demo-token}" \
 PODUP_MANUAL_TOKEN="${PODUP_MANUAL_TOKEN:-demo-token}" \
 PODUP_GH_WEBHOOK_SECRET="${PODUP_GH_WEBHOOK_SECRET:-demo-secret}" \

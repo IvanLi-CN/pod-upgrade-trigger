@@ -27,6 +27,7 @@ use url::Url;
 const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
 const DEFAULT_WEB_DIST_DIR: &str = "web/dist";
+const DEFAULT_WEB_DIST_FALLBACK: &str = "/srv/app/web";
 const DEFAULT_CONTAINER_DIR: &str = "/home/<user>/.config/containers/systemd";
 const GITHUB_ROUTE_PREFIX: &str = "github-package-update";
 const DEFAULT_LIMIT1_COUNT: u64 = 2;
@@ -47,7 +48,6 @@ const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
 // Environment variable names (external interface). All variables use the
 // PODUP_ prefix to avoid ambiguity with legacy naming.
 const ENV_STATE_DIR: &str = "PODUP_STATE_DIR";
-const ENV_WEB_DIST: &str = "PODUP_WEB_DIST";
 const ENV_DB_URL: &str = "PODUP_DB_URL";
 const ENV_TOKEN: &str = "PODUP_TOKEN";
 const ENV_MANUAL_TOKEN: &str = "PODUP_MANUAL_TOKEN";
@@ -364,23 +364,6 @@ fn apply_env_profile_defaults() {
         if env::var(ENV_STATE_DIR).is_err() {
             if let Ok(cwd) = env::current_dir() {
                 ensure(ENV_STATE_DIR, cwd.to_string_lossy().into_owned());
-            }
-        }
-
-        // For dev/demo, default PODUP_WEB_DIST to ./web/dist when present so
-        // a typical local build works out of the box.
-        if profile == "dev" || profile == "demo" || profile.is_empty() {
-            if env::var(ENV_WEB_DIST)
-                .ok()
-                .map(|v| v.trim().is_empty())
-                .unwrap_or(true)
-            {
-                if let Ok(cwd) = env::current_dir() {
-                    let candidate = cwd.join("web").join("dist");
-                    if candidate.is_dir() {
-                        ensure(ENV_WEB_DIST, candidate.to_string_lossy().into_owned());
-                    }
-                }
             }
         }
     } else {
@@ -898,7 +881,6 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
 
     let state_dir = env::var(ENV_STATE_DIR).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
     let web_dist = frontend_dist_dir();
-    let web_dist_str = web_dist.to_string_lossy().to_string();
 
     let webhook_token_configured = env::var(ENV_TOKEN)
         .ok()
@@ -960,7 +942,6 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
     let response = json!({
         "env": {
             "PODUP_STATE_DIR": state_dir,
-            "PODUP_WEB_DIST": web_dist_str,
             "PODUP_TOKEN_configured": webhook_token_configured,
             "PODUP_MANUAL_TOKEN_configured": manual_token_configured,
             "PODUP_GH_WEBHOOK_SECRET_configured": github_secret_configured,
@@ -2500,11 +2481,40 @@ fn handle_config_api(ctx: &RequestContext) -> Result<(), String> {
 }
 
 fn frontend_dist_dir() -> PathBuf {
-    env::var(ENV_WEB_DIST)
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(DEFAULT_STATE_DIR).join(DEFAULT_WEB_DIST_DIR))
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    let mut push_unique = |path: PathBuf| {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        if !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    };
+
+    if let Ok(state_dir) = env::var(ENV_STATE_DIR) {
+        if !state_dir.trim().is_empty() {
+            push_unique(PathBuf::from(state_dir).join(DEFAULT_WEB_DIST_DIR));
+        }
+    }
+
+    if let Ok(cwd) = env::current_dir() {
+        push_unique(cwd.join(DEFAULT_WEB_DIST_DIR));
+    }
+
+    push_unique(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_WEB_DIST_DIR));
+    push_unique(PathBuf::from(DEFAULT_WEB_DIST_FALLBACK));
+
+    candidates
+        .iter()
+        .find(|path| path.is_dir())
+        .cloned()
+        .unwrap_or_else(|| {
+            candidates
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_WEB_DIST_FALLBACK))
+        })
 }
 
 fn sanitize_frontend_path(path: &str) -> Option<PathBuf> {
@@ -3457,9 +3467,7 @@ mod tests {
     fn init_test_db() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            unsafe {
-                env::set_var(ENV_DB_URL, "sqlite::memory:?cache=shared");
-            }
+            set_env(ENV_DB_URL, "sqlite::memory:?cache=shared");
             let _ = super::db_pool();
         });
 
@@ -3472,6 +3480,20 @@ mod tests {
                 .await?;
             Ok::<(), sqlx::Error>(())
         });
+    }
+
+    #[allow(unused_unsafe)]
+    fn set_env(key: &str, value: &str) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    fn remove_env(key: &str) {
+        unsafe {
+            env::remove_var(key);
+        }
     }
 
     #[test]
@@ -3540,12 +3562,10 @@ mod tests {
     #[test]
     fn rate_limit_enforces_limits() {
         init_test_db();
-        unsafe {
-            env::set_var("PODUP_LIMIT1_COUNT", "1");
-            env::set_var("PODUP_LIMIT1_WINDOW", "3600");
-            env::set_var("PODUP_LIMIT2_COUNT", "5");
-            env::set_var("PODUP_LIMIT2_WINDOW", "3600");
-        }
+        set_env("PODUP_LIMIT1_COUNT", "1");
+        set_env("PODUP_LIMIT1_WINDOW", "3600");
+        set_env("PODUP_LIMIT2_COUNT", "5");
+        set_env("PODUP_LIMIT2_WINDOW", "3600");
 
         let first = rate_limit_check();
         assert!(first.is_ok(), "first rate limit check failed: {:?}", first);
@@ -3556,12 +3576,10 @@ mod tests {
             second
         );
 
-        unsafe {
-            env::remove_var("PODUP_LIMIT1_COUNT");
-            env::remove_var("PODUP_LIMIT1_WINDOW");
-            env::remove_var("PODUP_LIMIT2_COUNT");
-            env::remove_var("PODUP_LIMIT2_WINDOW");
-        }
+        remove_env("PODUP_LIMIT1_COUNT");
+        remove_env("PODUP_LIMIT1_WINDOW");
+        remove_env("PODUP_LIMIT2_COUNT");
+        remove_env("PODUP_LIMIT2_WINDOW");
     }
 
     #[test]

@@ -31,7 +31,7 @@
    - 提供 `--prune-state` 命令清理旧令牌、过期锁，以及历史遗留的目录文件。
 
 6. **静态资源托管**
-   - `try_serve_frontend` 将 `PODUP_WEB_DIST`（默认 `state_dir/web/dist`）中的编译产物暴露在 `/`、`/assets/*`、`/favicon.ico` 等路径下，便于嵌入可视化界面。
+   - `try_serve_frontend` 会在 `PODUP_STATE_DIR/web/dist`、当前工作目录下的 `web/dist`、编译产物内置的 `/srv/app/web` 等固定位置查找 UI 资源并托管到 `/`、`/assets/*`、`/favicon.ico` 路径，不再允许通过环境变量指向其他前端构建。
 
 7. **安全与鉴权**
    - GitHub Webhook 依赖 `PODUP_GH_WEBHOOK_SECRET` 进行 HMAC 校验；

@@ -515,7 +515,6 @@ struct TestEnv {
     temp: TempDir,
     state_dir: PathBuf,
     db_path: PathBuf,
-    web_dist: PathBuf,
     debug_payload: PathBuf,
     manual_token: String,
     github_secret: String,
@@ -535,7 +534,7 @@ impl TestEnv {
             fs::create_dir_all(parent)?;
         }
         File::create(&db_path)?;
-        let web_dist = root.join("web/dist");
+        let web_dist = state_dir.join("web/dist");
         fs::create_dir_all(web_dist.join("assets"))?;
         fs::write(
             web_dist.join("index.html"),
@@ -559,7 +558,6 @@ impl TestEnv {
             temp,
             state_dir,
             db_path,
-            web_dist,
             debug_payload,
             manual_token,
             github_secret,
@@ -598,7 +596,6 @@ impl TestEnv {
         let mut cmd = Command::new(&self.bin_path);
         cmd.env("PODUP_STATE_DIR", &self.state_dir);
         cmd.env("PODUP_DB_URL", self.db_url());
-        cmd.env("PODUP_WEB_DIST", &self.web_dist);
         cmd.env("PODUP_TOKEN", &self.manual_token);
         cmd.env("PODUP_GH_WEBHOOK_SECRET", &self.github_secret);
         cmd.env("PODUP_MANUAL_UNITS", "svc-alpha.service,svc-beta.service");

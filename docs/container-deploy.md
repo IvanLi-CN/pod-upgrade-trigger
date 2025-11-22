@@ -18,7 +18,7 @@
    - 容器内需要 `podman-remote`（或完整 podman）并挂载宿主 Podman socket，设置 `PODMAN_HOST=unix:///run/podman/podman.sock`（或 rootless 路径 `/run/user/$UID/podman/podman.sock`）。
 3) **权限与状态目录**：
    - 状态/锁文件路径可通过 `PODUP_STATE_DIR` 自定义并挂载到容器；需确保 UID/GID 与宿主一致，避免权限问题。
-   - 访问前端静态资源时，`PODUP_WEB_DIST` 需要指向镜像内或挂载的 dist 目录。
+   - 前端静态资源已随镜像打包到 `/srv/app/web`，无需额外挂载或配置环境变量。
 
 ## 镜像侧的改造建议
 
@@ -40,10 +40,8 @@ podman run -d --name pod-upgrade-trigger \
   --network host \
   -e PODUP_HTTP_ADDR=0.0.0.0:8080 \
   -e PODUP_STATE_DIR=/srv/webhook/data \
-  -e PODUP_WEB_DIST=/srv/webhook/web \
   -e PODMAN_HOST=unix:///run/podman/podman.sock \
   -v /srv/webhook/data:/srv/webhook/data:Z \
-  -v /srv/webhook/web:/srv/webhook/web:Z \
   -v /run/podman/podman.sock:/run/podman/podman.sock:Z \
   ghcr.io/ivanli-cn/pod-upgrade-trigger:latest \
   /usr/local/bin/pod-upgrade-trigger http-server

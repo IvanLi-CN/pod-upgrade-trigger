@@ -1,6 +1,6 @@
 # Web 界面设计
 
-为 `pod-upgrade-trigger` 的内置前端拟定页面路由、模块组成与跳转关系。该设计默认通过 `PODUP_WEB_DIST`（默认 `state_dir/web/dist`）托管静态资源。
+为 `pod-upgrade-trigger` 的内置前端拟定页面路由、模块组成与跳转关系。静态资源固定在内置 dist（优先 `PODUP_STATE_DIR/web/dist`，缺失时回退到打包目录），不再允许通过环境变量指向其他前端。
 
 ## 导航结构
 
@@ -52,7 +52,7 @@
 
 ### `/settings` 配置总览
 
-- 环境变量展示（只读值/布尔）：`PODUP_STATE_DIR`、`PODUP_WEB_DIST`、`PODUP_TOKEN/PODUP_MANUAL_TOKEN` 已配置与否、`PODUP_GH_WEBHOOK_SECRET` 配置状态、调度器 interval/max-iterations。
+- 环境变量展示（只读值/布尔）：`PODUP_STATE_DIR`、`PODUP_TOKEN/PODUP_MANUAL_TOKEN` 已配置与否、`PODUP_GH_WEBHOOK_SECRET` 配置状态、调度器 interval/max-iterations。
 - systemd 单元表：列出 `podman-auto-update.service` 与各业务 unit 名称，标记是否在 `trigger_unints`（sic）可见列表；跳转到 `/manual` 的对应单元操作。
 - API 基础信息：显示后端版本、构建时间、当前数据库连接串；链接到 `/events`。
 - ForwardAuth 信息：显示 `FORWARD_AUTH_HEADER`、`FORWARD_AUTH_ADMIN_VALUE`、`FORWARD_AUTH_NICKNAME_HEADER`、`ADMIN_MODE_NAME` 是否配置，便于排查登录问题；仅在生产模式展示。

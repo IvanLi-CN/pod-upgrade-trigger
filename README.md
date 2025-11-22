@@ -51,7 +51,6 @@ To try the built-in web UI locally:
 3. Start the HTTP server with a local state dir and dev-friendly auth:
    ```bash
    PODUP_STATE_DIR="$PWD" \
-   PODUP_WEB_DIST="$PWD/web/dist" \
    PODUP_TOKEN="dev-token" \
    PODUP_MANUAL_TOKEN="dev-token" \
    PODUP_DEV_OPEN_ADMIN="1" \
@@ -61,6 +60,7 @@ To try the built-in web UI locally:
 
 Then open `http://127.0.0.1:25111/` in your browser. In the top status bar,
 enter `dev-token` as the manual token to access admin-only APIs via the UI.
+The binary automatically serves `./web/dist` (or the built-in `/srv/app/web` bundle when packaged), and no Web UI override environment variable is supported.
 
 ## ForwardAuth and dev mode
 

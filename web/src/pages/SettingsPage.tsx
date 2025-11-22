@@ -6,7 +6,6 @@ import { useApi } from '../hooks/useApi'
 type SettingsResponse = {
   env: {
     PODUP_STATE_DIR?: string
-    PODUP_WEB_DIST?: string
     PODUP_TOKEN_configured?: boolean
     PODUP_MANUAL_TOKEN_configured?: boolean
     PODUP_GH_WEBHOOK_SECRET_configured?: boolean
@@ -80,11 +79,6 @@ export default function SettingsPage() {
                 <EnvRow
                   name="PODUP_STATE_DIR"
                   value={settings?.env.PODUP_STATE_DIR}
-                  secret={false}
-                />
-                <EnvRow
-                  name="PODUP_WEB_DIST"
-                  value={settings?.env.PODUP_WEB_DIST}
                   secret={false}
                 />
                 <EnvRow

@@ -8,10 +8,6 @@ test.describe('Settings page', () => {
     await expect(stateRow.getByText('configured')).toBeVisible()
     await expect(stateRow.getByRole('cell').nth(2)).not.toHaveText('(empty)')
 
-    const webDistRow = page.getByRole('row', { name: /PODUP_WEB_DIST/ })
-    await expect(webDistRow.getByText('configured')).toBeVisible()
-    await expect(webDistRow.getByRole('cell').nth(2)).toContainText('web/dist')
-
     const manualTokenRow = page.getByRole('row', { name: /PODUP_MANUAL_TOKEN/ })
     await expect(manualTokenRow.getByText('configured')).toBeVisible()
     await expect(manualTokenRow.getByText('***')).toBeVisible()
