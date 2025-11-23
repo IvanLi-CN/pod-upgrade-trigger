@@ -3284,16 +3284,28 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         }
     };
 
-    let valid_signature = verify_github_signature(signature, &secret, &ctx.body)?;
-    if !valid_signature {
-        log_message("401 github invalid signature");
+    let sig = verify_github_signature(signature, &secret, &ctx.body)?;
+    if !sig.valid {
+        log_message(&format!(
+            "401 github signature-mismatch provided={} expected={} body-sha256={} dump={}",
+            sig.provided,
+            sig.expected,
+            sig.body_sha256,
+            sig.payload_dump.as_deref().unwrap_or("")
+        ));
         respond_text(
             ctx,
             401,
             "Unauthorized",
             "unauthorized",
             "github-webhook",
-            Some(json!({ "reason": "signature" })),
+            Some(json!({
+                "reason": "signature",
+                "provided": sig.provided,
+                "expected": sig.expected,
+                "body_sha256": sig.body_sha256,
+                "dump": sig.payload_dump,
+            })),
         )?;
         return Ok(());
     }
@@ -4209,25 +4221,81 @@ fn exit_code_string(status: &ExitStatus) -> String {
         .map_or_else(|| "signal".into(), |code| code.to_string())
 }
 
-fn verify_github_signature(signature: &str, secret: &str, body: &[u8]) -> Result<bool, String> {
+struct SignatureCheck {
+    valid: bool,
+    provided: String,
+    expected: String,
+    body_sha256: String,
+    payload_dump: Option<String>,
+}
+
+fn verify_github_signature(
+    signature: &str,
+    secret: &str,
+    body: &[u8],
+) -> Result<SignatureCheck, String> {
+    use hex::ToHex;
+    use sha2::Digest;
+
+    let body_sha256 = sha2::Sha256::digest(body).encode_hex::<String>();
+
     let Some(hex_part) = signature.strip_prefix("sha256=") else {
-        return Ok(false);
+        return Ok(SignatureCheck {
+            valid: false,
+            provided: signature.to_string(),
+            expected: String::new(),
+            body_sha256,
+            payload_dump: None,
+        });
     };
 
-    let provided = decode(hex_part).map_err(|_| "invalid signature hex".to_string())?;
+    let provided = match decode(hex_part) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let expected = compute_expected_hmac(secret, body)?;
+            return Ok(SignatureCheck {
+                valid: false,
+                provided: hex_part.to_string(),
+                expected,
+                body_sha256,
+                payload_dump: dump_payload(body),
+            });
+        }
+    };
+
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
     mac.update(body);
 
     let verifier = mac.clone();
     if verifier.verify_slice(&provided).is_ok() {
-        return Ok(true);
+        return Ok(SignatureCheck {
+            valid: true,
+            provided: hex_part.to_string(),
+            expected: mac.finalize().into_bytes().encode_hex::<String>(),
+            body_sha256,
+            payload_dump: None,
+        });
     }
 
-    use hex::ToHex;
-    use sha2::Digest;
-    let expected = mac.finalize().into_bytes();
-    let body_hash = sha2::Sha256::digest(body);
+    let expected = mac.finalize().into_bytes().encode_hex::<String>();
 
+    Ok(SignatureCheck {
+        valid: false,
+        provided: hex_part.to_string(),
+        expected,
+        body_sha256,
+        payload_dump: dump_payload(body),
+    })
+}
+
+fn compute_expected_hmac(secret: &str, body: &[u8]) -> Result<String, String> {
+    use hex::ToHex;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
+    mac.update(body);
+    Ok(mac.finalize().into_bytes().encode_hex::<String>())
+}
+
+fn dump_payload(body: &[u8]) -> Option<String> {
     let debug_path = env::var(ENV_DEBUG_PAYLOAD_PATH)
         .ok()
         .filter(|p| !p.trim().is_empty())
@@ -4237,24 +4305,11 @@ fn verify_github_signature(signature: &str, secret: &str, body: &[u8]) -> Result
         });
 
     if let Ok(mut file) = File::create(&debug_path) {
-        if let Err(err) = file.write_all(body) {
-            log_message(&format!(
-                "debug payload-write-failed path={} err={}",
-                debug_path, err
-            ));
+        if file.write_all(body).is_ok() {
+            return Some(debug_path);
         }
     }
-
-    log_message(&format!(
-        "signature-mismatch provided={} expected={} body-len={} body-sha256={} payload-dump={}",
-        hex_part,
-        expected.encode_hex::<String>(),
-        body.len(),
-        body_hash.encode_hex::<String>(),
-        debug_path
-    ));
-
-    Ok(false)
+    None
 }
 
 fn github_event_allowed(event: &str) -> bool {
