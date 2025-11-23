@@ -3288,12 +3288,14 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
     let sig = verify_github_signature(signature, &secret, &ctx.body)?;
     if !sig.valid {
         log_message(&format!(
-            "401 github signature-mismatch provided={} expected={} body-sha256={} dump={} secret-len={} body-len={}",
+            "401 github signature-mismatch provided={} expected={} body-sha256={} dump={} dump-error={} secret-len={} secret-sha256={} body-len={}",
             sig.provided,
             sig.expected,
             sig.body_sha256,
             sig.payload_dump.as_deref().unwrap_or(""),
+            sig.dump_error.as_deref().unwrap_or(""),
             secret.len(),
+            sig.secret_sha256,
             ctx.body.len()
         ));
         respond_text(
@@ -3308,6 +3310,8 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
                 "expected": sig.expected,
                 "body_sha256": sig.body_sha256,
                 "dump": sig.payload_dump,
+                "dump_error": sig.dump_error,
+                "secret_sha256": sig.secret_sha256,
             })),
         )?;
         return Ok(());
@@ -4287,6 +4291,8 @@ struct SignatureCheck {
     expected: String,
     body_sha256: String,
     payload_dump: Option<String>,
+    secret_sha256: String,
+    dump_error: Option<String>,
 }
 
 fn verify_github_signature(
@@ -4299,6 +4305,7 @@ fn verify_github_signature(
 
     let body_sha256 = sha2::Sha256::digest(body).encode_hex::<String>();
     let secret_len = secret.len();
+    let secret_sha256 = sha2::Sha256::digest(secret.as_bytes()).encode_hex::<String>();
 
     let Some(hex_part) = signature.strip_prefix("sha256=") else {
         return Ok(SignatureCheck {
@@ -4307,6 +4314,8 @@ fn verify_github_signature(
             expected: String::new(),
             body_sha256,
             payload_dump: None,
+            secret_sha256,
+            dump_error: None,
         });
     };
 
@@ -4314,12 +4323,15 @@ fn verify_github_signature(
         Ok(bytes) => bytes,
         Err(_) => {
             let expected = compute_expected_hmac(secret, body)?;
+            let (dump, dump_err) = dump_payload(body, secret_len);
             return Ok(SignatureCheck {
                 valid: false,
                 provided: hex_part.to_string(),
                 expected,
                 body_sha256,
-                payload_dump: dump_payload(body, secret_len),
+                payload_dump: dump,
+                secret_sha256,
+                dump_error: dump_err,
             });
         }
     };
@@ -4330,16 +4342,20 @@ fn verify_github_signature(
 
     let valid = provided.ct_eq(&expected_bytes).into();
 
+    let (dump, dump_err) = if valid {
+        (None, None)
+    } else {
+        dump_payload(body, secret_len)
+    };
+
     Ok(SignatureCheck {
         valid,
         provided: hex_part.to_string(),
         expected: expected_hex,
         body_sha256,
-        payload_dump: if valid {
-            None
-        } else {
-            dump_payload(body, secret_len)
-        },
+        payload_dump: dump,
+        secret_sha256,
+        dump_error: dump_err,
     })
 }
 
@@ -4355,7 +4371,7 @@ fn compute_expected_hmac_bytes(secret: &str, body: &[u8]) -> Result<Vec<u8>, Str
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
-fn dump_payload(body: &[u8], _secret_len: usize) -> Option<String> {
+fn dump_payload(body: &[u8], _secret_len: usize) -> (Option<String>, Option<String>) {
     let debug_path = env::var(ENV_DEBUG_PAYLOAD_PATH)
         .ok()
         .filter(|p| !p.trim().is_empty())
@@ -4365,15 +4381,18 @@ fn dump_payload(body: &[u8], _secret_len: usize) -> Option<String> {
         });
 
     if let Some(parent) = Path::new(&debug_path).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    if let Ok(mut file) = File::create(&debug_path) {
-        if file.write_all(body).is_ok() {
-            return Some(debug_path);
+        if let Err(err) = fs::create_dir_all(parent) {
+            return (None, Some(format!("create_dir_failed: {err}")));
         }
     }
-    None
+
+    match File::create(&debug_path) {
+        Ok(mut file) => match file.write_all(body) {
+            Ok(_) => (Some(debug_path), None),
+            Err(err) => (None, Some(format!("write_failed: {err}"))),
+        },
+        Err(err) => (None, Some(format!("create_failed: {err}"))),
+    }
 }
 
 fn github_event_allowed(event: &str) -> bool {
