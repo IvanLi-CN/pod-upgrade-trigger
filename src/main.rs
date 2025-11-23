@@ -55,7 +55,6 @@ const ENV_GH_WEBHOOK_SECRET: &str = "PODUP_GH_WEBHOOK_SECRET";
 const ENV_HTTP_ADDR: &str = "PODUP_HTTP_ADDR";
 const ENV_PUBLIC_BASE_URL: &str = "PODUP_PUBLIC_BASE_URL";
 const ENV_DEBUG_PAYLOAD_PATH: &str = "PODUP_DEBUG_PAYLOAD_PATH";
-const ENV_AUDIT_SYNC: &str = "PODUP_AUDIT_SYNC";
 const ENV_SCHEDULER_INTERVAL_SECS: &str = "PODUP_SCHEDULER_INTERVAL_SECS";
 const ENV_SCHEDULER_MIN_INTERVAL_SECS: &str = "PODUP_SCHEDULER_MIN_INTERVAL_SECS";
 const ENV_SCHEDULER_MAX_TICKS: &str = "PODUP_SCHEDULER_MAX_TICKS";
@@ -535,7 +534,9 @@ fn spawn_server_for_stream(stream: TcpStream) -> Result<(), String> {
         cmd.stdin(Stdio::from(File::from_raw_fd(stdin_fd)));
         cmd.stdout(Stdio::from(File::from_raw_fd(stdout_fd)));
     }
-    cmd.stderr(Stdio::null());
+    // Inherit stderr so request-level logs from the child reach container logs
+    // instead of being swallowed by /dev/null.
+    cmd.stderr(Stdio::inherit());
 
     cmd.spawn()
         .map_err(|e| format!("failed to spawn server child: {e}"))?;
@@ -3415,7 +3416,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             "InternalServerError",
             "failed to dispatch",
             "github-webhook",
-            Some(json!({ "unit": unit, "image": image })),
+            Some(json!({ "unit": unit, "image": image, "error": err })),
         )?;
         return Ok(());
     }
@@ -3779,15 +3780,43 @@ fn spawn_background_task(
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| e.to_string())?;
+        .stderr(Stdio::inherit())
+        .status();
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(exit_code_string(&status))
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(exit_code_string(&status)),
+        Err(err) => {
+            log_message(&format!(
+                "warn github-dispatch-fallback no-systemd-run err={err} running-inline"
+            ));
+            spawn_inline_task(exe_str, unit, image, event, delivery, path)
+        }
     }
+}
+
+fn spawn_inline_task(
+    exe: &str,
+    unit: &str,
+    image: &str,
+    event: &str,
+    delivery: &str,
+    path: &str,
+) -> Result<(), String> {
+    // Best-effort fallback when systemd-run is unavailable (dev/test containers).
+    Command::new(exe)
+        .arg("--run-task")
+        .arg(unit)
+        .arg(image)
+        .arg(event)
+        .arg(delivery)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn build_systemd_run_args(
@@ -4706,26 +4735,10 @@ fn persist_event_record(
         }
     };
 
-    // Discovery and audit-critical actions run synchronously to avoid being dropped;
-    // other actions can be spawned.
-    if audit_sync_mode() || action == "discovery" {
-        runtime.block_on(fut);
-    } else {
-        runtime.spawn(fut);
-    }
-}
-
-fn audit_sync_mode() -> bool {
-    static SYNC_MODE: OnceLock<bool> = OnceLock::new();
-    *SYNC_MODE.get_or_init(|| {
-        env::var(ENV_AUDIT_SYNC)
-            .ok()
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                matches!(normalized.as_str(), "1" | "true" | "yes")
-            })
-            .unwrap_or(false)
-    })
+    // The HTTP server forks a short-lived process per request; if we spawn the
+    // insert task, the child may exit before the future runs. Write
+    // synchronously to ensure audit logs are persisted.
+    runtime.block_on(fut);
 }
 
 fn record_system_event(action: &str, status: u16, meta: Value) {
