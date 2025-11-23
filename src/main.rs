@@ -2116,11 +2116,19 @@ fn discover_and_persist_units() -> Result<DiscoveryStats, String> {
     }
 
     let units = discover_podman_units()?;
-    if units.is_empty() {
-        return Ok(DiscoveryStats::default());
-    }
 
     let mut stats = DiscoveryStats::default();
+    for unit in &units {
+        match unit.source {
+            "dir" => stats.dir = stats.dir.saturating_add(1),
+            "ps" => stats.ps = stats.ps.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    if units.is_empty() {
+        return Ok(stats);
+    }
 
     let ts = current_unix_secs() as i64;
     with_db(|pool| async move {
@@ -2136,12 +2144,6 @@ fn discover_and_persist_units() -> Result<DiscoveryStats, String> {
             .await?;
             if res.rows_affected() > 0 {
                 inserted += 1;
-            }
-
-            match unit.source {
-                "dir" => stats.dir = stats.dir.saturating_add(1),
-                "ps" => stats.ps = stats.ps.saturating_add(1),
-                _ => {}
             }
         }
         Ok::<usize, sqlx::Error>(inserted)
@@ -2180,17 +2182,17 @@ fn ensure_discovery(force: bool) {
 
     match discover_and_persist_units() {
         Ok(stats) => {
-            log_message(&format!(
+            let total = stats.dir.saturating_add(stats.ps);
+            let msg = format!(
                 "info discovery-ok dir={} ps={} total={}",
-                stats.dir,
-                stats.ps,
-                stats.dir.saturating_add(stats.ps)
-            ));
+                stats.dir, stats.ps, total
+            );
+            log_message(&msg);
             record_system_event(
                 "discovery",
                 200,
                 json!({
-                    "status": if stats.dir + stats.ps > 0 { "ok" } else { "empty" },
+                    "status": if total > 0 { "ok" } else { "empty" },
                     "sources": { "dir": stats.dir, "ps": stats.ps },
                 }),
             );
