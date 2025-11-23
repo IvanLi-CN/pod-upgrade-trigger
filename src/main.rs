@@ -3248,7 +3248,13 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
-    let secret = env::var(ENV_GH_WEBHOOK_SECRET).unwrap_or_default();
+    let secret = env::var(ENV_GH_WEBHOOK_SECRET)
+        .unwrap_or_default()
+        // Trim common whitespace so secrets sourced from files or env lists
+        // don't fail HMAC due to stray newlines/spaces.
+        .trim()
+        .to_string();
+
     if secret.is_empty() {
         log_message("500 github-misconfigured missing secret");
         respond_text(
