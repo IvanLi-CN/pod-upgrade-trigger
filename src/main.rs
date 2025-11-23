@@ -4159,6 +4159,63 @@ mod tests {
         assert_eq!(args[9], "delivery123");
         assert_eq!(args[10], "/github-package-update/demo");
     }
+
+    #[test]
+    fn github_signature_validates() {
+        let body = br#"{"action":"published"}"#;
+        let secret = "topsecret";
+
+        // Compute a correct signature for the given body/secret.
+        use hmac::{Hmac, Mac};
+        type HmacSha256 = Hmac<sha2::Sha256>;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let sig = format!("sha256={:x}", mac.finalize().into_bytes());
+
+        let result = super::verify_github_signature(&sig, secret, body).unwrap();
+        assert!(result.valid, "expected signature to be valid");
+        assert_eq!(
+            result.provided,
+            sig.trim_start_matches("sha256=").to_string()
+        );
+        assert_eq!(result.expected.len(), 64);
+        assert!(result.payload_dump.is_none());
+    }
+
+    #[test]
+    fn github_signature_mismatch_dumps_payload() {
+        let body = br#"{"hello":"world"}"#;
+        let secret = "another-secret";
+
+        // Deliberately use an incorrect signature (all zeros)
+        let bad_sig = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
+
+        // Point payload dump to a temp file so tests don't touch real paths.
+        let dir = tempfile::tempdir().unwrap();
+        let dump_path = dir.path().join("dump.bin");
+        set_env(ENV_DEBUG_PAYLOAD_PATH, dump_path.to_string_lossy().as_ref());
+
+        let result = super::verify_github_signature(bad_sig, secret, body).unwrap();
+        assert!(!result.valid);
+        assert_eq!(
+            result.provided,
+            bad_sig.trim_start_matches("sha256=").to_string()
+        );
+        assert_eq!(
+            result.expected.len(),
+            64,
+            "expected HMAC should be 32 bytes hex"
+        );
+        let dump = result.payload_dump.expect("payload dump path expected");
+        assert!(
+            std::path::Path::new(&dump).exists(),
+            "dump file should exist"
+        );
+        let dumped = std::fs::read(&dump).unwrap();
+        assert_eq!(dumped, body);
+
+        remove_env(ENV_DEBUG_PAYLOAD_PATH);
+    }
 }
 
 fn pointer_as_str<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
