@@ -34,10 +34,18 @@ async fn scenario_auto_discovery() -> AnyResult<()> {
     let env = TestEnv::new()?;
     env.clear_mock_log()?;
 
-    let discovery_json = r#"[{"Unit":"svc-gamma.service"},{"unit":"svc-delta.service"}]"#;
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-gamma.container"),
+        b"[Container]\nImage=example\nAutoupdate=registry",
+    )?;
+    fs::write(
+        container_dir.join("svc-delta.service"),
+        b"[Unit]\nDescription=dummy",
+    )?;
 
     let services = env.send_request_with_env(HttpRequest::get("/api/manual/services"), |cmd| {
-        cmd.env("MOCK_PODMAN_DISCOVERY_JSON", discovery_json);
         cmd.env(
             "PODUP_CONTAINER_DIR",
             env.state_dir.join("containers/systemd"),
@@ -235,7 +243,11 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let non_discovery: Vec<_> = env
         .read_mock_log()?
         .into_iter()
-        .filter(|line| !line.contains("podman auto-update --dry-run"))
+        .filter(|line| {
+            !line.contains("podman auto-update --dry-run")
+                && !line.contains("podman ps --filter label=io.containers.autoupdate")
+                && !line.contains("podman ps -a --filter label=io.containers.autoupdate")
+        })
         .collect();
     assert!(non_discovery.is_empty());
 
@@ -460,7 +472,11 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
     let non_discovery: Vec<_> = env
         .read_mock_log()?
         .into_iter()
-        .filter(|line| !line.contains("podman auto-update --dry-run"))
+        .filter(|line| {
+            !line.contains("podman auto-update --dry-run")
+                && !line.contains("podman ps --filter label=io.containers.autoupdate")
+                && !line.contains("podman ps -a --filter label=io.containers.autoupdate")
+        })
         .collect();
     assert!(non_discovery.is_empty());
 

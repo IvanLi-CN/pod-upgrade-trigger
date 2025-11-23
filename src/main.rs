@@ -1561,6 +1561,7 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
 
     let discovered = discovered_unit_list();
     let discovered_set: HashSet<String> = discovered.iter().cloned().collect();
+    let discovered_detail = discovered_unit_detail();
 
     let mut services = Vec::new();
     for unit in manual_unit_list() {
@@ -1593,6 +1594,13 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
         "discovered": {
             "count": discovered.len(),
             "units": discovered,
+            "detail": discovered_detail
+                .iter()
+                .map(|(unit, source)| json!({
+                    "unit": unit,
+                    "source": source,
+                }))
+                .collect::<Vec<_>>(),
         },
     });
     respond_json(ctx, 200, "OK", &response, "manual-services", None)
@@ -1820,6 +1828,12 @@ struct ManualTriggerRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct DiscoveredUnit {
+    unit: String,
+    source: &'static str,
+}
+
 #[derive(Debug, Deserialize)]
 struct ServiceTriggerRequest {
     token: Option<String>,
@@ -1879,7 +1893,37 @@ fn container_systemd_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTAINER_DIR))
 }
 
-fn discover_units_from_dir() -> Result<Vec<String>, String> {
+fn autoupdate_enabled(contents: &str) -> bool {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with(';') || !trimmed.contains('=') {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let value = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        if key == "autoupdate" {
+            return !matches!(value.as_str(), "" | "false" | "no" | "none" | "off" | "0");
+        }
+    }
+    false
+}
+
+fn quadlet_unit_name(path: &Path) -> Option<String> {
+    let filename = path.file_name()?.to_str()?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "service" => Some(filename.to_string()),
+        // Quadlet files (.container/.kube/.image) generate a matching .service unit.
+        "container" | "kube" | "image" => path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| format!("{stem}.service")),
+        _ => None,
+    }
+}
+
+fn discover_units_from_dir() -> Result<Vec<DiscoveredUnit>, String> {
     let dir = container_systemd_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -1889,47 +1933,47 @@ fn discover_units_from_dir() -> Result<Vec<String>, String> {
     for entry in fs::read_dir(&dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("service") {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                units.push(name.to_string());
+        let Some(unit) = quadlet_unit_name(&path) else {
+            continue;
+        };
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if matches!(ext, "container" | "kube" | "image") {
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if !autoupdate_enabled(&content) {
+                continue;
             }
         }
+
+        units.push(DiscoveredUnit {
+            unit,
+            source: "dir",
+        });
     }
 
-    units.sort();
-    units.dedup();
+    units.sort_by(|a, b| a.unit.cmp(&b.unit));
+    units.dedup_by(|a, b| a.unit == b.unit);
     Ok(units)
 }
 
-fn discover_podman_units() -> Result<Vec<String>, String> {
+fn discover_units_from_podman_ps() -> Result<Vec<DiscoveredUnit>, String> {
     let output = Command::new("podman")
-        .arg("auto-update")
-        .arg("--dry-run")
+        .arg("ps")
+        .arg("-a")
+        .arg("--filter")
+        .arg("label=io.containers.autoupdate")
         .arg("--format")
         .arg("json")
         .output()
-        .map_err(|e| format!("podman auto-update exec failed: {e}"));
-
-    let output = match output {
-        Ok(ok) => ok,
-        Err(err) => {
-            let fallback = discover_units_from_dir()?;
-            if fallback.is_empty() {
-                return Err(err);
-            }
-            return Ok(fallback);
-        }
-    };
+        .map_err(|e| format!("podman ps exec failed: {e}"))?;
 
     if !output.status.success() {
-        let fallback = discover_units_from_dir()?;
-        if fallback.is_empty() {
-            return Err(format!(
-                "podman auto-update exited {}",
-                exit_code_string(&output.status)
-            ));
-        }
-        return Ok(fallback);
+        return Err(format!(
+            "podman ps exited {}",
+            exit_code_string(&output.status)
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1938,26 +1982,100 @@ fn discover_podman_units() -> Result<Vec<String>, String> {
     }
 
     let parsed: Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("invalid podman auto-update output: {e}"))?;
+        .map_err(|e| format!("invalid podman ps output: {e}"))?;
 
     let mut units = Vec::new();
     if let Some(items) = parsed.as_array() {
         for item in items {
-            if let Some(unit) = item.get("Unit").or_else(|| item.get("unit")) {
-                if let Some(name) = unit.as_str() {
-                    units.push(name.to_string());
+            // Prefer explicit unit label if present (commonly set by generate systemd/quadlet).
+            if let Some(labels) = item.get("Labels").or_else(|| item.get("labels")) {
+                let autoupdate_label = labels
+                    .get("io.containers.autoupdate")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(
+                    autoupdate_label.as_str(),
+                    "" | "false" | "no" | "none" | "off" | "0"
+                ) {
+                    continue;
+                }
+
+                if let Some(unit) = labels
+                    .get("io.podman.systemd.unit")
+                    .or_else(|| labels.get("io.containers.autoupdate.unit"))
+                    .and_then(|v| v.as_str())
+                {
+                    units.push(DiscoveredUnit {
+                        unit: unit.to_string(),
+                        source: "ps",
+                    });
+                    continue;
+                }
+            }
+
+            // Fall back to container name -> <name>.service mapping.
+            if let Some(name) = item
+                .get("Name")
+                .or_else(|| item.get("name"))
+                .and_then(|v| v.as_str())
+            {
+                units.push(DiscoveredUnit {
+                    unit: format!("{name}.service"),
+                    source: "ps",
+                });
+                continue;
+            }
+            if let Some(names) = item.get("Names").or_else(|| item.get("names")) {
+                if let Some(first) = names
+                    .as_array()
+                    .and_then(|arr| arr.get(0))
+                    .and_then(|v| v.as_str())
+                {
+                    units.push(DiscoveredUnit {
+                        unit: format!("{first}.service"),
+                        source: "ps",
+                    });
+                    continue;
+                }
+                if let Some(name) = names.as_str() {
+                    units.push(DiscoveredUnit {
+                        unit: format!("{name}.service"),
+                        source: "ps",
+                    });
+                    continue;
                 }
             }
         }
     }
 
-    units.sort();
-    units.dedup();
+    units.sort_by(|a, b| a.unit.cmp(&b.unit));
+    units.dedup_by(|a, b| a.unit == b.unit);
+    Ok(units)
+}
 
-    if units.is_empty() {
-        discover_units_from_dir()
+fn discover_podman_units() -> Result<Vec<DiscoveredUnit>, String> {
+    let mut errors = Vec::new();
+
+    match discover_units_from_dir() {
+        Ok(units) if !units.is_empty() => return Ok(units),
+        Ok(_) => {}
+        Err(err) => errors.push(format!("dir: {err}")),
+    }
+
+    match discover_units_from_podman_ps() {
+        Ok(units) => {
+            if !units.is_empty() {
+                return Ok(units);
+            }
+        }
+        Err(err) => errors.push(format!("podman-ps: {err}")),
+    }
+
+    if errors.is_empty() {
+        Ok(Vec::new())
     } else {
-        Ok(units)
+        Err(errors.join("; "))
     }
 }
 
@@ -1976,9 +2094,10 @@ fn discover_and_persist_units() -> Result<usize, String> {
         let mut inserted = 0usize;
         for unit in &units {
             let res = sqlx::query(
-                "INSERT OR REPLACE INTO discovered_units (unit, source, discovered_at) VALUES (?, 'podman', ?)",
+                "INSERT OR REPLACE INTO discovered_units (unit, source, discovered_at) VALUES (?, ?, ?)",
             )
-            .bind(unit)
+            .bind(&unit.unit)
+            .bind(unit.source)
             .bind(ts)
             .execute(&pool)
             .await?;
@@ -1995,6 +2114,14 @@ fn discovered_unit_list() -> Vec<String> {
     if !DISCOVERY_ATTEMPTED.swap(true, Ordering::SeqCst) {
         if let Err(err) = discover_and_persist_units() {
             log_message(&format!("warn discovery-failed err={err}"));
+            record_system_event(
+                "discovery",
+                500,
+                json!({
+                    "status": "failed",
+                    "error": err,
+                }),
+            );
         }
     }
 
@@ -2012,6 +2139,28 @@ fn discovered_unit_list() -> Vec<String> {
         Ok(units) => units,
         Err(err) => {
             log_message(&format!("warn discovery-list-failed err={err}"));
+            Vec::new()
+        }
+    }
+}
+
+fn discovered_unit_detail() -> Vec<(String, String)> {
+    match with_db(|pool| async move {
+        let rows: Vec<SqliteRow> =
+            sqlx::query("SELECT unit, source FROM discovered_units ORDER BY unit")
+                .fetch_all(&pool)
+                .await?;
+        let mut units = Vec::with_capacity(rows.len());
+        for row in rows {
+            let unit: String = row.get("unit");
+            let source: String = row.get("source");
+            units.push((unit, source));
+        }
+        Ok::<Vec<(String, String)>, sqlx::Error>(units)
+    }) {
+        Ok(units) => units,
+        Err(err) => {
+            log_message(&format!("warn discovery-detail-failed err={err}"));
             Vec::new()
         }
     }
