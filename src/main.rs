@@ -3288,9 +3288,11 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
     let sig = verify_github_signature(signature, &secret, &ctx.body)?;
     if !sig.valid {
         log_message(&format!(
-            "401 github signature-mismatch provided={} expected={} body-sha256={} dump={} dump-error={} secret-len={} secret-sha256={} body-len={}",
+            "401 github signature-mismatch provided={} expected={} expected-len={} expected-error={} body-sha256={} dump={} dump-error={} secret-len={} secret-sha256={} body-len={}",
             sig.provided,
             sig.expected,
+            sig.expected_len,
+            sig.expected_error.as_deref().unwrap_or(""),
             sig.body_sha256,
             sig.payload_dump.as_deref().unwrap_or(""),
             sig.dump_error.as_deref().unwrap_or(""),
@@ -3308,6 +3310,8 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
                 "reason": "signature",
                 "provided": sig.provided,
                 "expected": sig.expected,
+                "expected_error": sig.expected_error,
+                "expected_len": sig.expected_len,
                 "body_sha256": sig.body_sha256,
                 "dump": sig.payload_dump,
                 "dump_error": sig.dump_error,
@@ -4289,6 +4293,8 @@ struct SignatureCheck {
     valid: bool,
     provided: String,
     expected: String,
+    expected_error: Option<String>,
+    expected_len: usize,
     body_sha256: String,
     payload_dump: Option<String>,
     secret_sha256: String,
@@ -4312,6 +4318,8 @@ fn verify_github_signature(
             valid: false,
             provided: signature.to_string(),
             expected: String::new(),
+            expected_error: None,
+            expected_len: 0,
             body_sha256,
             payload_dump: None,
             secret_sha256,
@@ -4322,12 +4330,14 @@ fn verify_github_signature(
     let provided = match decode(hex_part) {
         Ok(bytes) => bytes,
         Err(_) => {
-            let expected = compute_expected_hmac(secret, body)?;
+            let expected = compute_expected_hmac(secret, body).map_err(|e| e.to_string())?;
             let (dump, dump_err) = dump_payload(body, secret_len);
             return Ok(SignatureCheck {
                 valid: false,
                 provided: hex_part.to_string(),
-                expected,
+                expected: expected.clone(),
+                expected_error: None,
+                expected_len: expected.len() / 2,
                 body_sha256,
                 payload_dump: dump,
                 secret_sha256,
@@ -4337,10 +4347,23 @@ fn verify_github_signature(
     };
 
     // Compute expected once to avoid any ambiguity with clone/finalize order.
-    let expected_bytes = compute_expected_hmac_bytes(secret, body)?;
-    let expected_hex = expected_bytes.encode_hex::<String>();
+    let (expected_hex, expected_err, expected_len) = match compute_expected_hmac_bytes(secret, body)
+    {
+        Ok(bytes) => {
+            let len = bytes.len();
+            (bytes.encode_hex::<String>(), None, len)
+        }
+        Err(err) => (String::new(), Some(err), 0),
+    };
 
-    let valid = provided.ct_eq(&expected_bytes).into();
+    let valid = if expected_len > 0 {
+        match hex::decode(&expected_hex) {
+            Ok(expected_bytes) => provided.ct_eq(&expected_bytes).into(),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
 
     let (dump, dump_err) = if valid {
         (None, None)
@@ -4352,6 +4375,8 @@ fn verify_github_signature(
         valid,
         provided: hex_part.to_string(),
         expected: expected_hex,
+        expected_error: expected_err,
+        expected_len,
         body_sha256,
         payload_dump: dump,
         secret_sha256,
