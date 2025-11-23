@@ -5,6 +5,13 @@ mkdir -p "$(dirname "$log")"
 
 echo "podman $*" >> "$log"
 
+if [[ "$*" =~ auto-update ]]; then
+  if [[ -n "${MOCK_PODMAN_DISCOVERY_JSON:-}" ]]; then
+    echo -n "${MOCK_PODMAN_DISCOVERY_JSON}"
+  fi
+  exit 0
+fi
+
 if [[ "$*" =~ ^pull ]] && [[ "${MOCK_PODMAN_FAIL:-0}" == "1" ]]; then
   echo "simulated podman pull failure" >&2
   exit 42

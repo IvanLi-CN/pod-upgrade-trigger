@@ -27,7 +27,7 @@
 
 ## Operational Hardening (2025-11)
 
-- [ ] Persist auto-discovered Podman auto-update units (expected ~53) into the state store and expose them via `/api/manual/services`, running discovery only after DB init and logging failures.
-- [ ] Add startup/self-check paths so `/api/webhooks/status` and `/api/image-locks` return structured errors (not 502) and emit logs when DB or Podman connectivity fails.
-- [ ] Auto-create/migrate the state DB when missing or unwritable; when impossible, surface actionable guidance on the health page (path + env hints).
-- [ ] Settings page should show the discovered auto-update unit count plus a summary list, distinct from env-provided manual units, to aid ops reconciliation.
+- [x] Persist auto-discovered Podman auto-update units (expected ~53) into the state store and expose them via `/api/manual/services`, running discovery only after DB init and logging failures.
+- [x] Add startup/self-check paths so `/api/webhooks/status` and `/api/image-locks` return structured errors (not 502) and emit logs when DB or Podman connectivity fails.
+- [x] Auto-create/migrate the state DB when missing or unwritable; when impossible, surface actionable guidance on the health page (path + env hints).
+- [x] Settings page should show the discovered auto-update unit count plus a summary list, distinct from env-provided manual units, to aid ops reconciliation.

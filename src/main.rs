@@ -17,8 +17,8 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
@@ -61,13 +61,13 @@ const ENV_SCHEDULER_MIN_INTERVAL_SECS: &str = "PODUP_SCHEDULER_MIN_INTERVAL_SECS
 const ENV_SCHEDULER_MAX_TICKS: &str = "PODUP_SCHEDULER_MAX_TICKS";
 const ENV_MANUAL_UNITS: &str = "PODUP_MANUAL_UNITS";
 const ENV_MANUAL_AUTO_UPDATE_UNIT: &str = "PODUP_MANUAL_AUTO_UPDATE_UNIT";
+const ENV_CONTAINER_DIR: &str = "PODUP_CONTAINER_DIR";
 const ENV_FWD_AUTH_HEADER: &str = "PODUP_FWD_AUTH_HEADER";
 const ENV_FWD_AUTH_ADMIN_VALUE: &str = "PODUP_FWD_AUTH_ADMIN_VALUE";
 const ENV_FWD_AUTH_NICKNAME_HEADER: &str = "PODUP_FWD_AUTH_NICKNAME_HEADER";
 const ENV_ADMIN_MODE_NAME: &str = "PODUP_ADMIN_MODE_NAME";
 const ENV_DEV_OPEN_ADMIN: &str = "PODUP_DEV_OPEN_ADMIN";
 const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
-const ENV_GH_ALLOWED_EVENTS: &str = "PODUP_GH_ALLOWED_EVENTS";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -76,7 +76,10 @@ const WEBHOOK_STATUS_LOOKBACK: u64 = 500;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DB_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
+static DB_INIT_STATUS: OnceLock<RwLock<DbInitStatus>> = OnceLock::new();
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+static PODMAN_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
+static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -90,6 +93,12 @@ struct RequestContext {
     request_id: String,
     started_at: Instant,
     received_at: SystemTime,
+}
+
+#[derive(Clone)]
+struct DbInitStatus {
+    url: String,
+    error: Option<String>,
 }
 
 struct ForwardAuthConfig {
@@ -200,19 +209,41 @@ fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
     Ok(false)
 }
 
-fn dev_mode_open_admin() -> bool {
-    // Manual/admin APIs use this to decide whether to bypass token checks. We
-    // treat PODUP_DEV_OPEN_ADMIN as an explicit override; otherwise dev/demo
-    // profiles default to open-admin.
-    if let Ok(raw) = env::var(ENV_DEV_OPEN_ADMIN) {
-        let normalized = raw.trim().to_ascii_lowercase();
-        return matches!(normalized.as_str(), "1" | "true" | "yes");
+fn ensure_infra_ready(ctx: &RequestContext, action: &str) -> Result<bool, String> {
+    if let Some(err) = db_init_error() {
+        log_message(&format!("503 {action} db-unavailable err={err}"));
+        respond_json(
+            ctx,
+            503,
+            "ServiceUnavailable",
+            &json!({
+                "error": "db-unavailable",
+                "message": err,
+                "db_url": db_status().url,
+            }),
+            action,
+            None,
+        )?;
+        return Ok(false);
     }
 
-    let profile = env::var("PODUP_ENV")
-        .unwrap_or_else(|_| "dev".to_string())
-        .to_ascii_lowercase();
-    matches!(profile.as_str(), "dev" | "development" | "demo")
+    if let Err(err) = podman_health() {
+        log_message(&format!("503 {action} podman-unavailable err={err}"));
+        respond_json(
+            ctx,
+            503,
+            "ServiceUnavailable",
+            &json!({
+                "error": "podman-unavailable",
+                "message": err,
+            }),
+            action,
+            None,
+        )?;
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 fn public_base_url() -> Option<String> {
@@ -801,8 +832,45 @@ fn handle_connection() -> Result<(), String> {
     };
 
     if ctx.method == "GET" && ctx.path == "/health" {
-        log_message("health ok");
-        respond_text(&ctx, 200, "OK", "ok", "health-check", None)?;
+        // Force DB init so health can surface migration/permission issues.
+        let _ = db_pool();
+
+        let db = db_status();
+        let podman = podman_health();
+
+        let mut issues = Vec::new();
+        if let Some(err) = &db.error {
+            issues.push(json!({
+                "component": "database",
+                "message": err,
+                "hint": format!("Set {ENV_DB_URL} or {ENV_STATE_DIR} to a writable path"),
+            }));
+        }
+        if let Err(err) = &podman {
+            issues.push(json!({
+                "component": "podman",
+                "message": err,
+                "hint": "Ensure podman is installed and available on PATH",
+            }));
+        }
+
+        let status = if issues.is_empty() { 200 } else { 503 };
+        let payload = json!({
+            "status": if issues.is_empty() { "ok" } else { "degraded" },
+            "db": { "url": db.url, "error": db.error },
+            "podman": {
+                "ok": podman.is_ok(),
+                "error": podman.err(),
+            },
+            "issues": issues,
+        });
+
+        let reason = if status == 200 {
+            "OK"
+        } else {
+            "ServiceUnavailable"
+        };
+        respond_json(&ctx, status, reason, &payload, "health-check", None)?;
     } else if ctx.method == "GET" && ctx.path == "/sse/hello" {
         handle_hello_sse(&ctx)?;
     } else if ctx.path == "/api/config" {
@@ -909,6 +977,22 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
 
     let auto_update_unit = manual_auto_update_unit();
     let trigger_units = manual_unit_list();
+    let discovered_units = discovered_unit_list();
+
+    let mut manual_units_env = Vec::new();
+    let mut seen_manual_env: HashSet<String> = HashSet::new();
+    if seen_manual_env.insert(auto_update_unit.clone()) {
+        manual_units_env.push(auto_update_unit.clone());
+    }
+    if let Ok(raw) = env::var(ENV_MANUAL_UNITS) {
+        for entry in raw.split(|ch| ch == ',' || ch == '\n') {
+            if let Some(unit) = resolve_unit_identifier(entry) {
+                if seen_manual_env.insert(unit.clone()) {
+                    manual_units_env.push(unit);
+                }
+            }
+        }
+    }
 
     let db_url = env::var(ENV_DB_URL)
         .ok()
@@ -918,6 +1002,8 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
     let db_path = db_url
         .strip_prefix("sqlite://")
         .map(|p| Path::new(p).to_path_buf());
+
+    let db_health = db_status();
 
     let cfg = forward_auth_config();
     let forward_mode = if cfg.open_mode() { "open" } else { "protected" };
@@ -954,9 +1040,15 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
         "systemd": {
             "auto_update_unit": auto_update_unit,
             "trigger_units": trigger_units,
+            "manual_units": manual_units_env,
+            "discovered_units": {
+                "count": discovered_units.len(),
+                "units": discovered_units,
+            },
         },
         "database": {
             "url": db_url,
+            "error": db_health.error,
         },
         "resources": {
             "state_dir": {
@@ -1467,6 +1559,9 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
+    let discovered = discovered_unit_list();
+    let discovered_set: HashSet<String> = discovered.iter().cloned().collect();
+
     let mut services = Vec::new();
     for unit in manual_unit_list() {
         let slug = unit
@@ -1477,6 +1572,11 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
         let display_name = unit.clone();
         let default_image = unit_configured_image(&unit);
         let github_path = format!("/{}/{}", GITHUB_ROUTE_PREFIX, slug);
+        let source = if discovered_set.contains(&unit) {
+            "discovered"
+        } else {
+            "manual"
+        };
 
         services.push(json!({
             "slug": slug,
@@ -1484,10 +1584,17 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
             "display_name": display_name,
             "default_image": default_image,
             "github_path": github_path,
+            "source": source,
         }));
     }
 
-    let response = json!({ "services": services });
+    let response = json!({
+        "services": services,
+        "discovered": {
+            "count": discovered.len(),
+            "units": discovered,
+        },
+    });
     respond_json(ctx, 200, "OK", &response, "manual-services", None)
 }
 
@@ -1764,6 +1871,152 @@ fn manual_api_token() -> String {
         .unwrap_or_else(|| env::var(ENV_TOKEN).unwrap_or_default())
 }
 
+fn container_systemd_dir() -> PathBuf {
+    env::var(ENV_CONTAINER_DIR)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTAINER_DIR))
+}
+
+fn discover_units_from_dir() -> Result<Vec<String>, String> {
+    let dir = container_systemd_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut units = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("service") {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                units.push(name.to_string());
+            }
+        }
+    }
+
+    units.sort();
+    units.dedup();
+    Ok(units)
+}
+
+fn discover_podman_units() -> Result<Vec<String>, String> {
+    let output = Command::new("podman")
+        .arg("auto-update")
+        .arg("--dry-run")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .map_err(|e| format!("podman auto-update exec failed: {e}"));
+
+    let output = match output {
+        Ok(ok) => ok,
+        Err(err) => {
+            let fallback = discover_units_from_dir()?;
+            if fallback.is_empty() {
+                return Err(err);
+            }
+            return Ok(fallback);
+        }
+    };
+
+    if !output.status.success() {
+        let fallback = discover_units_from_dir()?;
+        if fallback.is_empty() {
+            return Err(format!(
+                "podman auto-update exited {}",
+                exit_code_string(&output.status)
+            ));
+        }
+        return Ok(fallback);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("invalid podman auto-update output: {e}"))?;
+
+    let mut units = Vec::new();
+    if let Some(items) = parsed.as_array() {
+        for item in items {
+            if let Some(unit) = item.get("Unit").or_else(|| item.get("unit")) {
+                if let Some(name) = unit.as_str() {
+                    units.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    units.sort();
+    units.dedup();
+
+    if units.is_empty() {
+        discover_units_from_dir()
+    } else {
+        Ok(units)
+    }
+}
+
+fn discover_and_persist_units() -> Result<usize, String> {
+    if db_init_error().is_some() {
+        return Err("db-unavailable".into());
+    }
+
+    let units = discover_podman_units()?;
+    if units.is_empty() {
+        return Ok(0);
+    }
+
+    let ts = current_unix_secs() as i64;
+    with_db(|pool| async move {
+        let mut inserted = 0usize;
+        for unit in &units {
+            let res = sqlx::query(
+                "INSERT OR REPLACE INTO discovered_units (unit, source, discovered_at) VALUES (?, 'podman', ?)",
+            )
+            .bind(unit)
+            .bind(ts)
+            .execute(&pool)
+            .await?;
+            if res.rows_affected() > 0 {
+                inserted += 1;
+            }
+        }
+        Ok::<usize, sqlx::Error>(inserted)
+    })
+}
+
+fn discovered_unit_list() -> Vec<String> {
+    // Run discovery lazily once per process, only after the DB is initialized.
+    if !DISCOVERY_ATTEMPTED.swap(true, Ordering::SeqCst) {
+        if let Err(err) = discover_and_persist_units() {
+            log_message(&format!("warn discovery-failed err={err}"));
+        }
+    }
+
+    match with_db(|pool| async move {
+        let rows: Vec<SqliteRow> = sqlx::query("SELECT unit FROM discovered_units ORDER BY unit")
+            .fetch_all(&pool)
+            .await?;
+        let mut units = Vec::with_capacity(rows.len());
+        for row in rows {
+            let unit: String = row.get("unit");
+            units.push(unit);
+        }
+        Ok::<Vec<String>, sqlx::Error>(units)
+    }) {
+        Ok(units) => units,
+        Err(err) => {
+            log_message(&format!("warn discovery-list-failed err={err}"));
+            Vec::new()
+        }
+    }
+}
+
 fn manual_unit_list() -> Vec<String> {
     let mut units = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -1779,6 +2032,12 @@ fn manual_unit_list() -> Vec<String> {
                     units.push(unit);
                 }
             }
+        }
+    }
+
+    for unit in discovered_unit_list() {
+        if seen.insert(unit.clone()) {
+            units.push(unit);
         }
     }
 
@@ -2039,6 +2298,10 @@ fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneRepor
 
 fn handle_image_locks_api(ctx: &RequestContext) -> Result<(), String> {
     if !ensure_admin(ctx, "image-locks-api")? {
+        return Ok(());
+    }
+
+    if !ensure_infra_ready(ctx, "image-locks-api")? {
         return Ok(());
     }
 
@@ -2574,6 +2837,10 @@ fn handle_webhooks_status(ctx: &RequestContext) -> Result<(), String> {
     }
 
     if !ensure_admin(ctx, "webhooks-status")? {
+        return Ok(());
+    }
+
+    if !ensure_infra_ready(ctx, "webhooks-status")? {
         return Ok(());
     }
 
@@ -3180,6 +3447,26 @@ fn run_quiet_command(mut command: Command) -> Result<CommandExecResult, String> 
         status: output.status,
         stderr,
     })
+}
+
+fn podman_health() -> Result<(), String> {
+    PODMAN_HEALTH
+        .get_or_init(|| {
+            let result = run_quiet_command({
+                let mut cmd = Command::new("podman");
+                cmd.arg("--version");
+                cmd
+            });
+            match result {
+                Ok(res) if res.success() => Ok(()),
+                Ok(res) => Err(format!(
+                    "podman unavailable: {}",
+                    exit_code_string(&res.status)
+                )),
+                Err(err) => Err(format!("podman unavailable: {err}")),
+            }
+        })
+        .clone()
 }
 
 fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
@@ -3852,35 +4139,78 @@ fn init_db_pool() -> SqlitePool {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("sqlite://{DEFAULT_DB_PATH}"));
-
-    ensure_sqlite_storage(&url);
-    let trimmed = url.trim();
+    let trimmed = url.trim().to_string();
+    let state_dir_hint = env::var(ENV_STATE_DIR).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
 
     let runtime = DB_RUNTIME.get_or_init(|| Runtime::new().expect("failed to create db runtime"));
 
-    match runtime.block_on(async {
+    if !trimmed.starts_with("sqlite://") && !trimmed.starts_with("sqlite::") {
+        let message = format!("unsupported database url: {url} (only sqlite:// is supported)");
+        log_message(&format!("warn db-init-unsupported {message}"));
+        set_db_status(&url, Some(message.clone()));
+        return runtime
+            .block_on(async {
+                let pool = SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect("sqlite::memory:")
+                    .await?;
+                MIGRATOR.run(&pool).await?;
+                Ok::<SqlitePool, sqlx::Error>(pool)
+            })
+            .unwrap_or_else(|_| panic!("{message}"));
+    }
+
+    let storage_ready = ensure_sqlite_storage(&trimmed).err();
+    let pool_result = runtime.block_on(async {
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(trimmed)
+            .connect(&trimmed)
             .await?;
         MIGRATOR.run(&pool).await?;
         Ok::<SqlitePool, sqlx::Error>(pool)
-    }) {
-        Ok(pool) => pool,
-        Err(err) => panic!("failed to initialize database: {err}"),
+    });
+
+    match pool_result {
+        Ok(pool) => {
+            set_db_status(&url, None);
+            pool
+        }
+        Err(err) => {
+            let mut message = format!("failed to initialize database at {url}: {err}");
+            if let Some(storage_err) = storage_ready {
+                message.push_str(&format!("; {storage_err}"));
+            }
+            message.push_str(&format!(
+                "; adjust {ENV_DB_URL} or {ENV_STATE_DIR} (current {state_dir_hint})"
+            ));
+
+            log_message(&format!("warn db-init-fallback {message}"));
+            set_db_status(&url, Some(message.clone()));
+
+            let fallback = runtime
+                .block_on(async {
+                    let pool = SqlitePoolOptions::new()
+                        .max_connections(1)
+                        .connect("sqlite::memory:")
+                        .await?;
+                    MIGRATOR.run(&pool).await?;
+                    Ok::<SqlitePool, sqlx::Error>(pool)
+                })
+                .unwrap_or_else(|_| panic!("{message}"));
+
+            fallback
+        }
     }
 }
 
-fn ensure_sqlite_storage(conn: &str) {
+fn ensure_sqlite_storage(conn: &str) -> Result<(), String> {
     if let Some(path) = conn.strip_prefix("sqlite://") {
         let path = Path::new(path);
         if let Some(parent) = path.parent() {
             if let Err(err) = fs::create_dir_all(parent) {
-                log_message(&format!(
-                    "warn db-dir-create-failed path={} err={}",
-                    parent.display(),
-                    err
-                ));
+                let message = format!("db-dir-create-failed path={} err={}", parent.display(), err);
+                log_message(&format!("warn {message}"));
+                return Err(message);
             }
         }
 
@@ -3889,14 +4219,47 @@ fn ensure_sqlite_storage(conn: &str) {
         // fail with `code: 14` instead of creating the file implicitly.
         if !path.exists() {
             if let Err(err) = File::create(path) {
-                log_message(&format!(
-                    "warn db-file-create-failed path={} err={}",
-                    path.display(),
-                    err
-                ));
+                let message = format!("db-file-create-failed path={} err={}", path.display(), err);
+                log_message(&format!("warn {message}"));
+                return Err(message);
             }
         }
     }
+
+    Ok(())
+}
+
+fn set_db_status(url: &str, error: Option<String>) {
+    let lock = DB_INIT_STATUS.get_or_init(|| {
+        RwLock::new(DbInitStatus {
+            url: url.to_string(),
+            error: None,
+        })
+    });
+    if let Ok(mut status) = lock.write() {
+        status.url = url.to_string();
+        status.error = error;
+    }
+}
+
+fn db_status() -> DbInitStatus {
+    DB_INIT_STATUS
+        .get_or_init(|| {
+            RwLock::new(DbInitStatus {
+                url: "unknown".into(),
+                error: None,
+            })
+        })
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or(DbInitStatus {
+            url: "unknown".into(),
+            error: None,
+        })
+}
+
+fn db_init_error() -> Option<String> {
+    db_status().error
 }
 
 fn with_db<F, Fut, T>(f: F) -> Result<T, String>
@@ -3905,6 +4268,10 @@ where
     Fut: Future<Output = Result<T, sqlx::Error>> + Send + 'static,
     T: Send + 'static,
 {
+    if let Some(err) = db_init_error() {
+        return Err(err);
+    }
+
     let pool = db_pool();
     let runtime = DB_RUNTIME
         .get()

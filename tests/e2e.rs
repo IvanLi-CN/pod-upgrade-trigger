@@ -17,6 +17,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_full_suite() -> AnyResult<()> {
+    scenario_auto_discovery().await?;
+    scenario_health_db_error().await?;
     scenario_github_webhook().await?;
     scenario_rate_limit_and_prune().await?;
     scenario_manual_api().await?;
@@ -25,6 +27,54 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_static_assets().await?;
     scenario_cli_maintenance().await?;
     scenario_http_server().await?;
+    Ok(())
+}
+
+async fn scenario_auto_discovery() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    let discovery_json = r#"[{"Unit":"svc-gamma.service"},{"unit":"svc-delta.service"}]"#;
+
+    let services = env.send_request_with_env(HttpRequest::get("/api/manual/services"), |cmd| {
+        cmd.env("MOCK_PODMAN_DISCOVERY_JSON", discovery_json);
+        cmd.env(
+            "PODUP_CONTAINER_DIR",
+            env.state_dir.join("containers/systemd"),
+        );
+    })?;
+
+    assert_eq!(services.status, 200);
+    let body = services.json_body()?;
+    let discovered = body["discovered"]["units"].as_array().unwrap();
+    assert_eq!(discovered.len(), 2);
+    let sources: Vec<_> = body["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|svc| svc["source"] == Value::from("discovered"))
+        .collect();
+    assert_eq!(sources.len(), 2);
+
+    Ok(())
+}
+
+async fn scenario_health_db_error() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    let response = env.send_request_with_env(HttpRequest::get("/health"), |cmd| {
+        cmd.env("PODUP_DB_URL", "postgres://forbidden/uri");
+    })?;
+
+    assert_eq!(response.status, 503);
+    let json = response.json_body()?;
+    assert_eq!(json["status"], Value::from("degraded"));
+    let issues = json["issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|issue| issue["component"] == Value::from("database"))
+    );
+
     Ok(())
 }
 
@@ -163,6 +213,9 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
 async fn scenario_manual_api() -> AnyResult<()> {
     let env = TestEnv::new()?;
     env.clear_mock_log()?;
+    // Warm discovery so subsequent checks are not polluted by podman logs.
+    let _ = env.send_request(HttpRequest::get("/api/manual/services"))?;
+    env.clear_mock_log()?;
     let trigger_body = json!({
         "token": env.manual_token(),
         "all": true,
@@ -179,7 +232,12 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let trigger_json = trigger.json_body()?;
     assert_eq!(trigger_json["dry_run"], Value::from(true));
     assert_eq!(trigger_json["triggered"].as_array().unwrap().len(), 3);
-    assert!(env.read_mock_log()?.is_empty());
+    let non_discovery: Vec<_> = env
+        .read_mock_log()?
+        .into_iter()
+        .filter(|line| !line.contains("podman auto-update --dry-run"))
+        .collect();
+    assert!(non_discovery.is_empty());
 
     env.clear_mock_log()?;
     let service_body = json!({
@@ -399,7 +457,12 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
         trigger_all_output.stdout,
         trigger_all_output.stderr
     );
-    assert!(env.read_mock_log()?.is_empty());
+    let non_discovery: Vec<_> = env
+        .read_mock_log()?
+        .into_iter()
+        .filter(|line| !line.contains("podman auto-update --dry-run"))
+        .collect();
+    assert!(non_discovery.is_empty());
 
     let mut prune_cmd = env.command();
     prune_cmd
