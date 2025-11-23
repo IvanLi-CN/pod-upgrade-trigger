@@ -4704,7 +4704,9 @@ fn persist_event_record(
         }
     };
 
-    if audit_sync_mode() {
+    // Discovery and audit-critical actions run synchronously to avoid being dropped;
+    // other actions can be spawned.
+    if audit_sync_mode() || action == "discovery" {
         runtime.block_on(fut);
     } else {
         runtime.spawn(fut);
