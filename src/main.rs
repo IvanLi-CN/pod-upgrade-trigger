@@ -2181,8 +2181,10 @@ fn ensure_discovery(force: bool) {
     match discover_and_persist_units() {
         Ok(stats) => {
             log_message(&format!(
-                "info discovery-ok dir={} ps={}",
-                stats.dir, stats.ps
+                "info discovery-ok dir={} ps={} total={}",
+                stats.dir,
+                stats.ps,
+                stats.dir.saturating_add(stats.ps)
             ));
             record_system_event(
                 "discovery",
@@ -4975,11 +4977,13 @@ enum RateLimitError {
 }
 
 fn log_message(message: &str) {
+    // Try system logger first; fall back to stderr so container logs capture it.
     let _ = Command::new("logger")
         .arg("-t")
         .arg(LOG_TAG)
         .arg(message)
         .status();
+    eprintln!("{message}");
 }
 
 fn redact_token(input: &str) -> String {
