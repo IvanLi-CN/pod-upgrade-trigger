@@ -24,7 +24,7 @@ export default function UnauthorizedPage() {
         <div className="max-w-md space-y-4">
           <Icon icon="mdi:lock-alert" className="mx-auto text-5xl text-warning" />
           <h1 className="text-2xl font-semibold">未授权 · 401</h1>
-          <p className="text-sm text-base-content/70">
+          <p className="text-lg text-base-content/70">
             未登录或无权限访问该界面。请检查 ForwardAuth 或登录状态，刷新后重试。
           </p>
           <p className="text-xs text-base-content/60">

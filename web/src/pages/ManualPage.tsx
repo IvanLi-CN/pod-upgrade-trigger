@@ -162,7 +162,7 @@ export default function ManualPage() {
       <section className="card bg-base-100 shadow">
         <form className="card-body gap-4" onSubmit={handleTriggerAll}>
           <div className="flex items-center justify-between gap-4">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               触发全部单元
             </h2>
             <label className="flex cursor-pointer items-center gap-2 text-xs">
@@ -210,7 +210,7 @@ export default function ManualPage() {
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               按单元触发
             </h2>
             <span className="text-[11px] text-base-content/60">
@@ -235,7 +235,7 @@ export default function ManualPage() {
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-3">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               历史记录
             </h2>
             <span className="text-[11px] text-base-content/60">
@@ -260,7 +260,7 @@ export default function ManualPage() {
                     {entry.requestId ? ` · req ${entry.requestId}` : null}
                   </span>
                 </div>
-                <Icon icon="mdi:open-in-new" className="text-base text-base-content/70" />
+                <Icon icon="mdi:open-in-new" className="text-lg text-base-content/70" />
               </button>
             ))}
           </div>
@@ -352,7 +352,7 @@ function ServiceRow({ service, onTrigger }: ServiceRowProps) {
           className="btn btn-primary btn-xs"
           disabled={pending}
         >
-          <Icon icon="mdi:play" className="text-sm" />
+          <Icon icon="mdi:play" className="text-lg" />
           触发
         </button>
       </div>

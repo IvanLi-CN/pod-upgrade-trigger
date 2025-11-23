@@ -101,7 +101,7 @@ export default function DashboardPage() {
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+              <span className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
                 Health
               </span>
               <Icon icon="mdi:heart-pulse" className="text-xl text-primary" />
@@ -121,7 +121,7 @@ export default function DashboardPage() {
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+              <span className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
                 Scheduler
               </span>
               <Icon icon="mdi:autorenew" className="text-xl text-secondary" />
@@ -137,7 +137,7 @@ export default function DashboardPage() {
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+              <span className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
                 Activity
               </span>
               <Icon icon="mdi:history" className="text-xl text-accent" />
@@ -163,7 +163,7 @@ export default function DashboardPage() {
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+              <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
                 最近事件
               </h2>
               <Link to="/events" className="btn btn-ghost btn-xs gap-1">
@@ -213,7 +213,7 @@ export default function DashboardPage() {
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+              <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
                 速率限制
               </h2>
               <Link to="/maintenance#ratelimit" className="btn btn-ghost btn-xs gap-1">

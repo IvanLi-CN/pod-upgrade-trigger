@@ -63,7 +63,7 @@ export default function SettingsPage() {
     <div className="space-y-6">
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+          <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
             环境变量
           </h2>
           <div className="overflow-x-auto">
@@ -105,7 +105,7 @@ export default function SettingsPage() {
       <section className="grid gap-4 md:grid-cols-2">
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               Scheduler
             </h2>
             <ul className="space-y-1 text-xs text-base-content/80">
@@ -130,7 +130,7 @@ export default function SettingsPage() {
 
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               systemd 单元
             </h2>
             <p className="text-xs text-base-content/70">
@@ -154,7 +154,7 @@ export default function SettingsPage() {
                       to="/manual"
                       className="btn btn-ghost btn-xs gap-1"
                     >
-                      <Icon icon="mdi:play-circle-outline" className="text-sm" />
+                      <Icon icon="mdi:play-circle-outline" className="text-lg" />
                       手动触发
                     </Link>
                   </div>
@@ -168,7 +168,7 @@ export default function SettingsPage() {
       <section className="grid gap-4 md:grid-cols-2">
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               API & Version
             </h2>
             <ul className="space-y-1 text-xs text-base-content/80">
@@ -184,7 +184,7 @@ export default function SettingsPage() {
               </li>
             </ul>
             <Link to="/events" className="btn btn-xs btn-outline gap-1">
-              <Icon icon="mdi:file-document-outline" className="text-sm" />
+              <Icon icon="mdi:file-document-outline" className="text-lg" />
               查看事件
             </Link>
           </div>
@@ -192,7 +192,7 @@ export default function SettingsPage() {
 
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               ForwardAuth
             </h2>
             <ul className="space-y-1 text-xs text-base-content/80">

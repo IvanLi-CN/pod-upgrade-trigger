@@ -102,7 +102,7 @@ export default function MaintenancePage() {
     <div className="space-y-6">
       <section id="status" className="card bg-base-100 shadow">
         <div className="card-body gap-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+          <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
             状态目录检查
           </h2>
           <div className="overflow-x-auto">
@@ -167,7 +167,7 @@ export default function MaintenancePage() {
       <section id="ratelimit" className="card bg-base-100 shadow">
         <div className="card-body gap-3">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               速率限制清理
             </h2>
             <span className="text-[11px] text-base-content/60">
@@ -189,7 +189,7 @@ export default function MaintenancePage() {
               onClick={triggerPrune}
               disabled={prunePending}
             >
-              <Icon icon="mdi:broom" className="text-base" />
+              <Icon icon="mdi:broom" className="text-lg" />
               清理
             </button>
           </div>
@@ -202,7 +202,7 @@ export default function MaintenancePage() {
 
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+          <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
             下载调试包
           </h2>
           <p className="text-xs text-base-content/70">
@@ -213,7 +213,7 @@ export default function MaintenancePage() {
             className="btn btn-sm btn-outline gap-1"
             onClick={downloadDebugPayload}
           >
-            <Icon icon="mdi:download" className="text-base" />
+            <Icon icon="mdi:download" className="text-lg" />
             下载 last_payload.bin
           </button>
         </div>

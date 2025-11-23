@@ -141,7 +141,7 @@ export default function EventsPage() {
           onClick={downloadCsv}
           disabled={!events.length}
         >
-          <Icon icon="mdi:download" className="text-base" />
+          <Icon icon="mdi:download" className="text-lg" />
           导出当前页 CSV
         </button>
       </section>
@@ -265,7 +265,7 @@ export default function EventsPage() {
 
         <div className="card bg-base-100 shadow">
           <div className="card-body gap-3">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               详情
             </h2>
             {selected ? (

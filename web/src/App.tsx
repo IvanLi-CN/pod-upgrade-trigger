@@ -29,15 +29,15 @@ function TopStatusBar() {
       <div className="navbar-center hidden md:flex">
         <div className="join">
           <span className="join-item badge badge-ghost gap-1">
-            <Icon icon="mdi:timer-sand" className="text-base" />
+            <Icon icon="mdi:timer-sand" className="text-lg" />
             {scheduler.intervalSecs}s
           </span>
           <span className="join-item badge badge-ghost gap-1">
-            <Icon icon="mdi:autorenew" className="text-base" />
+            <Icon icon="mdi:autorenew" className="text-lg" />
             tick #{scheduler.lastIteration ?? '-'}
           </span>
           <span className="join-item badge badge-ghost gap-1">
-            <Icon icon="mdi:access-point" className="text-base" />
+            <Icon icon="mdi:access-point" className="text-lg" />
             {sseStatus === 'open' ? 'SSE ok' : sseStatus === 'error' ? 'SSE error' : 'SSE…'}
           </span>
         </div>
@@ -50,16 +50,16 @@ function TopStatusBar() {
           }}
         >
           <label className="input input-sm input-bordered flex items-center gap-2 w-44">
-            <Icon icon="mdi:key-variant" className="text-base text-base-content/60" />
+            <Icon icon="mdi:key-variant" className="text-lg text-base-content/60" />
             <input
-              className="min-w-0 flex-1 bg-transparent text-xs"
+              className="min-w-0 flex-1 bg-transparent text-base"
               placeholder="Manual token"
               value={token ?? ''}
               onChange={(event) => setToken(event.target.value || null)}
             />
           </label>
         </form>
-        <span className="hidden text-xs text-base-content/70 sm:inline">
+        <span className="hidden text-base text-base-content/70 sm:inline">
           {now.toLocaleTimeString()}
         </span>
       </div>
@@ -101,7 +101,7 @@ function SideNav() {
             )
           })}
         </ul>
-        <div className="mt-auto flex flex-col gap-1 text-[10px] text-base-content/60">
+        <div className="mt-auto flex flex-col gap-1 text-[11px] text-base-content/60">
           <span>Webhook auto-update UI</span>
         </div>
       </nav>
@@ -147,7 +147,7 @@ function NotFoundFallback() {
       <div className="hero-content text-center">
         <div className="max-w-md space-y-4">
           <h1 className="text-3xl font-bold">404 · 页面不存在</h1>
-          <p className="text-sm text-base-content/70">
+          <p className="text-lg text-base-content/70">
             所请求的路由不存在，可能是链接已失效或路径输入有误。
           </p>
           <button

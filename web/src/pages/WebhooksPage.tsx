@@ -192,7 +192,7 @@ export default function WebhooksPage() {
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-3">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               GitHub Webhooks
             </h2>
             <span
@@ -262,7 +262,7 @@ export default function WebhooksPage() {
                       onClick={() => handleCopy(fullWebhookUrl)}
                       disabled={disabled}
                     >
-                      <Icon icon="mdi:content-copy" className="text-sm" />
+                      <Icon icon="mdi:content-copy" className="text-lg" />
                       复制 URL
                     </button>
                     <button
@@ -271,7 +271,7 @@ export default function WebhooksPage() {
                       onClick={() => openEventsForUnit(unit)}
                       disabled={disabled}
                     >
-                      <Icon icon="mdi:open-in-new" className="text-sm" />
+                      <Icon icon="mdi:open-in-new" className="text-lg" />
                       查看事件
                     </button>
                   </div>
@@ -291,7 +291,7 @@ export default function WebhooksPage() {
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-3">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               镜像锁
             </h2>
             <span className="text-[11px] text-base-content/60">
