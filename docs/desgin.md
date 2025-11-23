@@ -73,3 +73,14 @@ Persistence & Rate limits
 - 需要新的限流策略时，可在 `rate_limit_check` / `check_github_image_limit` 基础上扩展更多 db 文件。
 - 通过在 `systemd` 目录追加 `.timer`、`.service` 可快速部署其它自动刷新任务。
 - SQL 迁移方案确保对 schema 的新增字段/索引可以演进更新。
+
+## 近期运维改进（2025-11）
+
+1. 自动发现结果持久化与暴露
+   - 自动发现的 Podman auto-update 单元需要在 DB 初始化后落库并被 `/api/manual/services` 返回，且与 `PODUP_MANUAL_UNITS` 的手工列表区分存储/展示。
+2. 状态 API 与自检
+   - `/api/webhooks/status`、`/api/image-locks` 要在启动自检或查询失败时返回结构化错误（如 DB 不存在/不可写、Podman 连接异常），同时写入日志，避免 502 静默。
+3. 状态库自愈与健康页提示
+   - SQLite 状态库缺失或无写权限时应自动创建/迁移；无法自愈时在 `/health` 给出路径和环境变量指引，便于运维修复。
+4. Settings 可视化
+   - Settings 页新增“发现的 auto-update 单元数量 + 摘要列表”，并与环境变量配置的手工单元并排展示供核对。
