@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tokio::runtime::Runtime;
 use url::Url;
 
@@ -4266,44 +4267,35 @@ fn verify_github_signature(
         }
     };
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
-    mac.update(body);
+    // Compute expected once to avoid any ambiguity with clone/finalize order.
+    let expected_bytes = compute_expected_hmac_bytes(secret, body)?;
+    let expected_hex = expected_bytes.encode_hex::<String>();
 
-    let verifier = mac.clone();
-    if verifier.verify_slice(&provided).is_ok() {
-        return Ok(SignatureCheck {
-            valid: true,
-            provided: hex_part.to_string(),
-            expected: mac.finalize().into_bytes().encode_hex::<String>(),
-            body_sha256,
-            payload_dump: None,
-        });
-    }
-
-    let expected = mac.finalize().into_bytes().encode_hex::<String>();
-
-    // Safety net: if expected somehow ends up empty, recompute directly and
-    // include secret length for debugging.
-    let expected_nonempty = if expected.is_empty() {
-        compute_expected_hmac(secret, body).unwrap_or_default()
-    } else {
-        expected
-    };
+    let valid = provided.ct_eq(&expected_bytes).into();
 
     Ok(SignatureCheck {
-        valid: false,
+        valid,
         provided: hex_part.to_string(),
-        expected: expected_nonempty,
+        expected: expected_hex,
         body_sha256,
-        payload_dump: dump_payload(body, secret_len),
+        payload_dump: if valid {
+            None
+        } else {
+            dump_payload(body, secret_len)
+        },
     })
 }
 
 fn compute_expected_hmac(secret: &str, body: &[u8]) -> Result<String, String> {
     use hex::ToHex;
+    let bytes = compute_expected_hmac_bytes(secret, body)?;
+    Ok(bytes.encode_hex::<String>())
+}
+
+fn compute_expected_hmac_bytes(secret: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
     mac.update(body);
-    Ok(mac.finalize().into_bytes().encode_hex::<String>())
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 fn dump_payload(body: &[u8], _secret_len: usize) -> Option<String> {
