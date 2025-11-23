@@ -3287,11 +3287,13 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
     let sig = verify_github_signature(signature, &secret, &ctx.body)?;
     if !sig.valid {
         log_message(&format!(
-            "401 github signature-mismatch provided={} expected={} body-sha256={} dump={}",
+            "401 github signature-mismatch provided={} expected={} body-sha256={} dump={} secret-len={} body-len={}",
             sig.provided,
             sig.expected,
             sig.body_sha256,
-            sig.payload_dump.as_deref().unwrap_or("")
+            sig.payload_dump.as_deref().unwrap_or(""),
+            secret.len(),
+            ctx.body.len()
         ));
         respond_text(
             ctx,
@@ -4238,6 +4240,7 @@ fn verify_github_signature(
     use sha2::Digest;
 
     let body_sha256 = sha2::Sha256::digest(body).encode_hex::<String>();
+    let secret_len = secret.len();
 
     let Some(hex_part) = signature.strip_prefix("sha256=") else {
         return Ok(SignatureCheck {
@@ -4258,7 +4261,7 @@ fn verify_github_signature(
                 provided: hex_part.to_string(),
                 expected,
                 body_sha256,
-                payload_dump: dump_payload(body),
+                payload_dump: dump_payload(body, secret_len),
             });
         }
     };
@@ -4279,12 +4282,20 @@ fn verify_github_signature(
 
     let expected = mac.finalize().into_bytes().encode_hex::<String>();
 
+    // Safety net: if expected somehow ends up empty, recompute directly and
+    // include secret length for debugging.
+    let expected_nonempty = if expected.is_empty() {
+        compute_expected_hmac(secret, body).unwrap_or_default()
+    } else {
+        expected
+    };
+
     Ok(SignatureCheck {
         valid: false,
         provided: hex_part.to_string(),
-        expected,
+        expected: expected_nonempty,
         body_sha256,
-        payload_dump: dump_payload(body),
+        payload_dump: dump_payload(body, secret_len),
     })
 }
 
@@ -4295,7 +4306,7 @@ fn compute_expected_hmac(secret: &str, body: &[u8]) -> Result<String, String> {
     Ok(mac.finalize().into_bytes().encode_hex::<String>())
 }
 
-fn dump_payload(body: &[u8]) -> Option<String> {
+fn dump_payload(body: &[u8], _secret_len: usize) -> Option<String> {
     let debug_path = env::var(ENV_DEBUG_PAYLOAD_PATH)
         .ok()
         .filter(|p| !p.trim().is_empty())
@@ -4303,6 +4314,10 @@ fn dump_payload(body: &[u8]) -> Option<String> {
             let default = Path::new(DEFAULT_STATE_DIR).join("last_payload.bin");
             default.to_string_lossy().into_owned()
         });
+
+    if let Some(parent) = Path::new(&debug_path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
 
     if let Ok(mut file) = File::create(&debug_path) {
         if file.write_all(body).is_ok() {
