@@ -1559,6 +1559,11 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
+    if query_flag(ctx, &["discover", "refresh"]) {
+        DISCOVERY_ATTEMPTED.store(false, Ordering::SeqCst);
+        ensure_discovery(true);
+    }
+
     let discovered = discovered_unit_list();
     let discovered_set: HashSet<String> = discovered.iter().cloned().collect();
     let discovered_detail = discovered_unit_detail();
@@ -1834,6 +1839,12 @@ struct DiscoveredUnit {
     source: &'static str,
 }
 
+#[derive(Default)]
+struct DiscoveryStats {
+    dir: usize,
+    ps: usize,
+}
+
 #[derive(Debug, Deserialize)]
 struct ServiceTriggerRequest {
     token: Option<String>,
@@ -1893,6 +1904,22 @@ fn container_systemd_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTAINER_DIR))
 }
 
+fn query_flag(ctx: &RequestContext, names: &[&str]) -> bool {
+    let Some(qs) = &ctx.query else { return false };
+    for pair in qs.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or("").to_ascii_lowercase();
+        if !names.iter().any(|n| *n == key) {
+            continue;
+        }
+        let value = parts.next().unwrap_or("1").to_ascii_lowercase();
+        if matches!(value.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+    }
+    false
+}
+
 fn autoupdate_enabled(contents: &str) -> bool {
     for line in contents.lines() {
         let trimmed = line.trim();
@@ -1906,7 +1933,8 @@ fn autoupdate_enabled(contents: &str) -> bool {
             return !matches!(value.as_str(), "" | "false" | "no" | "none" | "off" | "0");
         }
     }
-    false
+    // Default to enabled when key is absent to avoid missing autoupdate units; podman ps path filters by label anyway.
+    true
 }
 
 fn quadlet_unit_name(path: &Path) -> Option<String> {
@@ -2057,19 +2085,22 @@ fn discover_units_from_podman_ps() -> Result<Vec<DiscoveredUnit>, String> {
 fn discover_podman_units() -> Result<Vec<DiscoveredUnit>, String> {
     let mut errors = Vec::new();
 
+    let mut results = Vec::new();
+
     match discover_units_from_dir() {
-        Ok(units) if !units.is_empty() => return Ok(units),
-        Ok(_) => {}
+        Ok(units) => results.extend(units),
         Err(err) => errors.push(format!("dir: {err}")),
     }
 
     match discover_units_from_podman_ps() {
-        Ok(units) => {
-            if !units.is_empty() {
-                return Ok(units);
-            }
-        }
+        Ok(units) => results.extend(units),
         Err(err) => errors.push(format!("podman-ps: {err}")),
+    }
+
+    if !results.is_empty() {
+        results.sort_by(|a, b| a.unit.cmp(&b.unit));
+        results.dedup_by(|a, b| a.unit == b.unit);
+        return Ok(results);
     }
 
     if errors.is_empty() {
@@ -2079,15 +2110,17 @@ fn discover_podman_units() -> Result<Vec<DiscoveredUnit>, String> {
     }
 }
 
-fn discover_and_persist_units() -> Result<usize, String> {
+fn discover_and_persist_units() -> Result<DiscoveryStats, String> {
     if db_init_error().is_some() {
         return Err("db-unavailable".into());
     }
 
     let units = discover_podman_units()?;
     if units.is_empty() {
-        return Ok(0);
+        return Ok(DiscoveryStats::default());
     }
+
+    let mut stats = DiscoveryStats::default();
 
     let ts = current_unix_secs() as i64;
     with_db(|pool| async move {
@@ -2104,26 +2137,21 @@ fn discover_and_persist_units() -> Result<usize, String> {
             if res.rows_affected() > 0 {
                 inserted += 1;
             }
+
+            match unit.source {
+                "dir" => stats.dir = stats.dir.saturating_add(1),
+                "ps" => stats.ps = stats.ps.saturating_add(1),
+                _ => {}
+            }
         }
         Ok::<usize, sqlx::Error>(inserted)
-    })
+    })?;
+
+    Ok(stats)
 }
 
 fn discovered_unit_list() -> Vec<String> {
-    // Run discovery lazily once per process, only after the DB is initialized.
-    if !DISCOVERY_ATTEMPTED.swap(true, Ordering::SeqCst) {
-        if let Err(err) = discover_and_persist_units() {
-            log_message(&format!("warn discovery-failed err={err}"));
-            record_system_event(
-                "discovery",
-                500,
-                json!({
-                    "status": "failed",
-                    "error": err,
-                }),
-            );
-        }
-    }
+    ensure_discovery(false);
 
     match with_db(|pool| async move {
         let rows: Vec<SqliteRow> = sqlx::query("SELECT unit FROM discovered_units ORDER BY unit")
@@ -2140,6 +2168,41 @@ fn discovered_unit_list() -> Vec<String> {
         Err(err) => {
             log_message(&format!("warn discovery-list-failed err={err}"));
             Vec::new()
+        }
+    }
+}
+
+fn ensure_discovery(force: bool) {
+    let should_run = force || !DISCOVERY_ATTEMPTED.swap(true, Ordering::SeqCst);
+    if !should_run {
+        return;
+    }
+
+    match discover_and_persist_units() {
+        Ok(stats) => {
+            log_message(&format!(
+                "info discovery-ok dir={} ps={}",
+                stats.dir, stats.ps
+            ));
+            record_system_event(
+                "discovery",
+                200,
+                json!({
+                    "status": if stats.dir + stats.ps > 0 { "ok" } else { "empty" },
+                    "sources": { "dir": stats.dir, "ps": stats.ps },
+                }),
+            );
+        }
+        Err(err) => {
+            log_message(&format!("warn discovery-failed err={err}"));
+            record_system_event(
+                "discovery",
+                500,
+                json!({
+                    "status": "failed",
+                    "error": err,
+                }),
+            );
         }
     }
 }
