@@ -25,10 +25,7 @@ test.describe('Maintenance page', () => {
     await expect(page.getByText('清理完成')).toBeVisible()
   })
 
-  test('shows and downloads debug payload after signature mismatch', async ({
-    page,
-    request,
-  }) => {
+  test('shows and downloads debug payload after signature mismatch', async ({ page }) => {
     const body = {
       package: {
         package_type: 'container',
@@ -47,14 +44,19 @@ test.describe('Maintenance page', () => {
       },
     }
 
-    await request.post('/github-package-update/svc-alpha', {
-      headers: {
-        'content-type': 'application/json',
-        'x-hub-signature-256': 'sha256=00',
-        'x-github-event': 'package',
-      },
-      data: body,
-    })
+    await page.goto('/')
+
+    await page.evaluate(async (payload) => {
+      await fetch('/github-package-update/svc-alpha', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-hub-signature-256': 'sha256=00',
+          'x-github-event': 'package',
+        },
+        body: JSON.stringify(payload),
+      })
+    }, body)
 
     await page.goto('/maintenance')
 
@@ -62,9 +64,12 @@ test.describe('Maintenance page', () => {
     const payloadStatusCell = payloadRow.getByRole('cell').nth(1)
     await expect(payloadStatusCell.getByText('存在')).toBeVisible()
 
-    const downloadResponse = await request.get('/last_payload.bin')
-    await expect(downloadResponse.status()).toBe(200)
-    const downloaded = await downloadResponse.body()
-    expect(downloaded.byteLength).toBeGreaterThan(0)
+    const downloadResponse = await page.evaluate(async () => {
+      const res = await fetch('/last_payload.bin')
+      const buffer = await res.arrayBuffer()
+      return { status: res.status, length: buffer.byteLength }
+    })
+    expect(downloadResponse.status).toBe(200)
+    expect(downloadResponse.length).toBeGreaterThan(0)
   })
 })

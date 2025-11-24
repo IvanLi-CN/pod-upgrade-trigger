@@ -186,6 +186,9 @@ jobs:
       - name: Run UI E2E tests
         run: ./scripts/test-ui-e2e.sh
 
+      - name: Run UI E2E tests (mock mode)
+        run: ./scripts/test-ui-e2e-mock.sh
+
   build:
     name: Build Artifacts
     runs-on: ubuntu-latest

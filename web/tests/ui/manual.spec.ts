@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 
 async function openManualPage(page: Parameters<typeof test>[0]['page']) {
-  await page.goto('/manual')
+  await page.goto('/manual?mock=enabled&mock=profile=happy-path')
   await expect(page.getByText('触发全部单元')).toBeVisible()
   await expect(page.getByText('按单元触发')).toBeVisible()
   await expect(page.getByText('历史记录')).toBeVisible()
@@ -44,6 +44,11 @@ test.describe('Manual triggers', () => {
   })
 
   test('shows error toast when trigger-all fails', async ({ page }) => {
+    await page.addInitScript(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(window as any).__MOCK_FORCE_MANUAL_FAILURE__ = true
+    })
+
     await page.route('**/api/manual/trigger', async (route) => {
       await route.fulfill({
         status: 500,

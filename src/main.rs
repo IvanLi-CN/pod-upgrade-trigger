@@ -2862,6 +2862,7 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
             Some(p) => p,
             None => return Ok(false),
         },
+        "/mockServiceWorker.js" => PathBuf::from("mockServiceWorker.js"),
         "/vite.svg" => PathBuf::from("vite.svg"),
         "/favicon.ico" => PathBuf::from("favicon.ico"),
         _ => return Ok(false),
@@ -3701,6 +3702,15 @@ fn run_quiet_command(mut command: Command) -> Result<CommandExecResult, String> 
 fn podman_health() -> Result<(), String> {
     PODMAN_HEALTH
         .get_or_init(|| {
+            if env::var("PODUP_SKIP_PODMAN")
+                .ok()
+                .as_deref()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+
             let result = run_quiet_command({
                 let mut cmd = Command::new("podman");
                 cmd.arg("--version");

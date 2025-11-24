@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
@@ -12,6 +13,12 @@ import { useToken } from './useToken'
 import { useToast } from '../components/Toast'
 
 type StreamStatus = 'idle' | 'connecting' | 'open' | 'error'
+
+declare global {
+  interface Window {
+    __MOCK_ENABLED__?: boolean
+  }
+}
 
 export type ApiError = {
   status: number
@@ -29,6 +36,10 @@ export type AppStatus = {
   scheduler: SchedulerStatus
   now: Date
 }
+
+const mockEnabled =
+  import.meta.env.VITE_ENABLE_MOCKS === 'true' ||
+  (typeof window !== 'undefined' && Boolean(window.__MOCK_ENABLED__))
 
 type ApiContextValue = {
   status: AppStatus
@@ -54,6 +65,24 @@ export function ApiProvider({ children }: PropsWithChildren) {
   const location = useLocation()
   const { pushToast } = useToast()
   const { token } = useToken()
+  const originalPathRef = useRef<string | null>(null)
+
+  const handle401 = useCallback(() => {
+    if (!originalPathRef.current) {
+      originalPathRef.current = `${location.pathname}${location.search}`
+    }
+
+    const originalPath = originalPathRef.current
+    if (import.meta.env.MODE === 'production' || mockEnabled) {
+      navigate('/401', { replace: true, state: { originalPath } })
+    } else {
+      pushToast({
+        variant: 'error',
+        title: 'Unauthorized',
+        message: 'Received 401 from backend. Check ForwardAuth configuration.',
+      })
+    }
+  }, [location.pathname, location.search, navigate, pushToast])
 
   useEffect(() => {
     let cancelled = false
@@ -61,6 +90,10 @@ export function ApiProvider({ children }: PropsWithChildren) {
     const probe = async () => {
       try {
         const res = await fetch('/health')
+        if (res.status === 401) {
+          handle401()
+          return
+        }
         if (cancelled) return
         setHealth(res.ok ? 'ok' : 'error')
       } catch {
@@ -81,6 +114,10 @@ export function ApiProvider({ children }: PropsWithChildren) {
 
       try {
         const res = await fetch('/api/settings')
+        if (res.status === 401) {
+          handle401()
+          return
+        }
         if (!res.ok) return
         const data = (await res.json()) as SettingsSnapshot
         if (cancelled) return
@@ -114,11 +151,22 @@ export function ApiProvider({ children }: PropsWithChildren) {
       cancelled = true
       clearInterval(timer)
     }
-  }, [])
+  }, [handle401])
 
   useEffect(() => {
     let cancelled = false
     setSseStatus('connecting')
+
+    if (mockEnabled) {
+      const timer = setTimeout(() => {
+        if (!cancelled) setSseStatus('open')
+      }, 200)
+      return () => {
+        cancelled = true
+        clearTimeout(timer)
+      }
+    }
+
     const source = new EventSource('/sse/hello')
 
     const onMessage = () => {
@@ -141,24 +189,6 @@ export function ApiProvider({ children }: PropsWithChildren) {
       source.close()
     }
   }, [])
-
-  const handle401 = useCallback(() => {
-    const originalPath = `${location.pathname}${location.search}`
-    if (import.meta.env.MODE === 'production') {
-      navigate('/401', { replace: true, state: { originalPath } })
-      try {
-        window.history.replaceState(window.history.state, '', originalPath)
-      } catch {
-        // ignore history failures
-      }
-    } else {
-      pushToast({
-        variant: 'error',
-        title: 'Unauthorized',
-        message: 'Received 401 from backend. Check ForwardAuth configuration.',
-      })
-    }
-  }, [location.pathname, location.search, navigate, pushToast])
 
   const getJson = useCallback(
     async <T,>(input: RequestInfo | URL, init?: RequestInit): Promise<T> => {

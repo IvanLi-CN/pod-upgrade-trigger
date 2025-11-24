@@ -50,14 +50,23 @@ export default function WebhooksPage() {
   const [locks, setLocks] = useState<LockEntry[]>([])
   const [config, setConfig] = useState<ConfigResponse | null>(null)
   const [configLoaded, setConfigLoaded] = useState(false)
+  const [loading, setLoading] = useState(true)
   const navigate = useNavigate()
 
   useEffect(() => {
+    const timer = setTimeout(() => setLoading(false), 350)
+    return () => clearTimeout(timer)
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
+    const pause = () => new Promise((resolve) => setTimeout(resolve, 120))
+
     ;(async () => {
       try {
         const data = await getJson<WebhooksStatusResponse>('/api/webhooks/status')
         if (!cancelled) {
+          await pause()
           setStatus(data)
         }
       } catch (err) {
@@ -80,6 +89,7 @@ export default function WebhooksPage() {
       try {
         const cfg = await getJson<ConfigResponse>('/api/config')
         if (!cancelled) {
+          await pause()
           setConfig(cfg)
           setConfigLoaded(true)
         }
@@ -185,7 +195,7 @@ export default function WebhooksPage() {
     }
   }
 
-  const isReady = Boolean(status && configLoaded)
+  const isReady = Boolean(status && configLoaded && !loading)
 
   return (
     <div className="space-y-6">
