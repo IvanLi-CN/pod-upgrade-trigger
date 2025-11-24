@@ -4184,10 +4184,7 @@ mod tests {
 
         let result = super::verify_github_signature(&sig, secret, body).unwrap();
         assert!(result.valid, "expected signature to be valid");
-        assert_eq!(
-            result.provided,
-            sig.trim_start_matches("sha256=").to_string()
-        );
+        assert_eq!(result.provided, sig.to_string());
         assert_eq!(result.expected.len(), 64);
         assert!(result.payload_dump.is_none());
     }
@@ -4207,10 +4204,7 @@ mod tests {
 
         let result = super::verify_github_signature(bad_sig, secret, body).unwrap();
         assert!(!result.valid);
-        assert_eq!(
-            result.provided,
-            bad_sig.trim_start_matches("sha256=").to_string()
-        );
+        assert_eq!(result.provided, bad_sig.to_string());
         assert_eq!(
             result.expected.len(),
             64,
@@ -4318,39 +4312,23 @@ fn verify_github_signature(
     let secret_sha256 = sha2::Sha256::digest(secret.as_bytes()).encode_hex::<String>();
 
     let header_raw = signature.to_string();
-    let Some(hex_part) = signature.strip_prefix("sha256=") else {
-        return Ok(SignatureCheck {
-            valid: false,
-            provided: signature.to_string(),
-            expected: String::new(),
-            expected_error: None,
-            expected_len: 0,
-            body_sha256,
-            payload_dump: None,
-            secret_sha256,
-            dump_error: None,
-            header_raw,
-            prefix_ok: false,
-        });
-    };
-
-    let provided = match decode(hex_part) {
-        Ok(bytes) => bytes,
-        Err(_) => {
+    let (provided, prefix_ok) = match parse_signature_bytes(signature) {
+        Ok((bytes, ok)) => (bytes, ok),
+        Err(err) => {
             let expected = compute_expected_hmac(secret, body).map_err(|e| e.to_string())?;
             let (dump, dump_err) = dump_payload(body, secret_len);
             return Ok(SignatureCheck {
                 valid: false,
-                provided: hex_part.to_string(),
+                provided: signature.to_string(),
                 expected: expected.clone(),
-                expected_error: None,
+                expected_error: Some(format!("sig-parse: {err}")),
                 expected_len: expected.len() / 2,
                 body_sha256,
                 payload_dump: dump,
                 secret_sha256,
                 dump_error: dump_err,
                 header_raw,
-                prefix_ok: true,
+                prefix_ok: false,
             });
         }
     };
@@ -4397,7 +4375,7 @@ fn verify_github_signature(
 
     Ok(SignatureCheck {
         valid,
-        provided: hex_part.to_string(),
+        provided: signature.to_string(),
         expected: expected_hex,
         expected_error: expected_err,
         expected_len,
@@ -4406,8 +4384,21 @@ fn verify_github_signature(
         secret_sha256,
         dump_error: dump_err,
         header_raw,
-        prefix_ok: true,
+        prefix_ok,
     })
+}
+
+// Accept signatures of the form "sha256=<hex>" (case-insensitive) or raw hex.
+fn parse_signature_bytes(sig: &str) -> Result<(Vec<u8>, bool), String> {
+    let lower = sig.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("sha256=") {
+        let bytes = decode(rest).map_err(|e| format!("invalid hex: {e}"))?;
+        return Ok((bytes, true));
+    }
+
+    // Fallback: treat entire header as hex without prefix.
+    let bytes = decode(sig).map_err(|e| format!("missing-prefix invalid hex: {e}"))?;
+    Ok((bytes, false))
 }
 
 fn compute_expected_hmac(secret: &str, body: &[u8]) -> Result<String, String> {
