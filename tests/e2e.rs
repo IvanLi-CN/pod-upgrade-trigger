@@ -679,6 +679,7 @@ impl TestEnv {
         cmd.env("PODUP_GH_WEBHOOK_SECRET", &self.github_secret);
         cmd.env("PODUP_MANUAL_UNITS", "svc-alpha.service,svc-beta.service");
         cmd.env("PODUP_DEBUG_PAYLOAD_PATH", &self.debug_payload);
+        cmd.env("PODUP_ENV", "test");
         cmd.env("PODUP_AUDIT_SYNC", "1");
         cmd.env("PODUP_SCHEDULER_MIN_INTERVAL_SECS", "0");
         cmd.env("PATH", &self.path_override);

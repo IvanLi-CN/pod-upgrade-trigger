@@ -3288,7 +3288,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
     let sig = verify_github_signature(signature, &secret, &ctx.body)?;
     if !sig.valid {
         log_message(&format!(
-            "401 github signature-mismatch provided={} expected={} expected-len={} expected-error={} body-sha256={} dump={} dump-error={} secret-len={} secret-sha256={} body-len={}",
+            "401 github signature-mismatch provided={} expected={} expected-len={} expected-error={} body-sha256={} dump={} dump-error={} secret-len={} secret-sha256={} body-len={} header-raw={} prefix-ok={}",
             sig.provided,
             sig.expected,
             sig.expected_len,
@@ -3298,7 +3298,9 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             sig.dump_error.as_deref().unwrap_or(""),
             secret.len(),
             sig.secret_sha256,
-            ctx.body.len()
+            ctx.body.len(),
+            sig.header_raw,
+            sig.prefix_ok,
         ));
         respond_text(
             ctx,
@@ -4299,6 +4301,8 @@ struct SignatureCheck {
     payload_dump: Option<String>,
     secret_sha256: String,
     dump_error: Option<String>,
+    header_raw: String,
+    prefix_ok: bool,
 }
 
 fn verify_github_signature(
@@ -4313,6 +4317,7 @@ fn verify_github_signature(
     let secret_len = secret.len();
     let secret_sha256 = sha2::Sha256::digest(secret.as_bytes()).encode_hex::<String>();
 
+    let header_raw = signature.to_string();
     let Some(hex_part) = signature.strip_prefix("sha256=") else {
         return Ok(SignatureCheck {
             valid: false,
@@ -4324,6 +4329,8 @@ fn verify_github_signature(
             payload_dump: None,
             secret_sha256,
             dump_error: None,
+            header_raw,
+            prefix_ok: false,
         });
     };
 
@@ -4342,6 +4349,8 @@ fn verify_github_signature(
                 payload_dump: dump,
                 secret_sha256,
                 dump_error: dump_err,
+                header_raw,
+                prefix_ok: true,
             });
         }
     };
@@ -4396,6 +4405,8 @@ fn verify_github_signature(
         payload_dump: dump,
         secret_sha256,
         dump_error: dump_err,
+        header_raw,
+        prefix_ok: true,
     })
 }
 
