@@ -3318,6 +3318,9 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
                 "dump": sig.payload_dump,
                 "dump_error": sig.dump_error,
                 "secret_sha256": sig.secret_sha256,
+                "header_raw": sig.header_raw,
+                "headers": ctx.headers,
+                "prefix_ok": sig.prefix_ok,
             })),
         )?;
         return Ok(());
