@@ -4347,14 +4347,29 @@ fn verify_github_signature(
     };
 
     // Compute expected once to avoid any ambiguity with clone/finalize order.
-    let (expected_hex, expected_err, expected_len) = match compute_expected_hmac_bytes(secret, body)
-    {
-        Ok(bytes) => {
-            let len = bytes.len();
-            (bytes.encode_hex::<String>(), None, len)
+    let (mut expected_hex, mut expected_err, mut expected_len) =
+        match compute_expected_hmac_bytes(secret, body) {
+            Ok(bytes) => {
+                let len = bytes.len();
+                (bytes.encode_hex::<String>(), None, len)
+            }
+            Err(err) => (String::new(), Some(err), 0),
+        };
+
+    if expected_len == 0 || expected_hex.is_empty() {
+        match compute_hmac_fallback(secret.as_bytes(), body) {
+            Ok(bytes) => {
+                expected_len = bytes.len();
+                expected_hex = bytes.encode_hex::<String>();
+                if expected_err.is_none() {
+                    expected_err = Some("empty-hmac-primary".into());
+                }
+            }
+            Err(err) => {
+                expected_err = Some(format!("primary-empty fallback-error: {err}"));
+            }
         }
-        Err(err) => (String::new(), Some(err), 0),
-    };
+    }
 
     let valid = if expected_len > 0 {
         match hex::decode(&expected_hex) {
@@ -4394,6 +4409,39 @@ fn compute_expected_hmac_bytes(secret: &str, body: &[u8]) -> Result<Vec<u8>, Str
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
     mac.update(body);
     Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn compute_hmac_fallback(key: &[u8], body: &[u8]) -> Result<Vec<u8>, String> {
+    use sha2::Digest;
+    // Minimal, allocation-light SHA-256 HMAC for debugging fallback.
+    const BLOCK: usize = 64;
+    let mut key_block = [0u8; BLOCK];
+
+    if key.len() > BLOCK {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(key);
+        let hashed = hasher.finalize();
+        key_block[..hashed.len()].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0u8; BLOCK];
+    let mut opad = [0u8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] = key_block[i] ^ 0x36;
+        opad[i] = key_block[i] ^ 0x5c;
+    }
+
+    let mut inner = sha2::Sha256::new();
+    inner.update(&ipad);
+    inner.update(body);
+    let inner_hash = inner.finalize();
+
+    let mut outer = sha2::Sha256::new();
+    outer.update(&opad);
+    outer.update(inner_hash);
+    Ok(outer.finalize().to_vec())
 }
 
 fn dump_payload(body: &[u8], _secret_len: usize) -> (Option<String>, Option<String>) {
