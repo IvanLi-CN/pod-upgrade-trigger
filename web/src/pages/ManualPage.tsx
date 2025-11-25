@@ -28,6 +28,7 @@ type ManualTriggerResponse = {
   dry_run: boolean
   caller?: string | null
   reason?: string | null
+  task_id?: string | null
 }
 
 type ManualHistoryEntry = {
@@ -103,6 +104,34 @@ export default function ManualPage() {
         message: `触发 ${response.triggered.length} 个单元（dry_run=${response.dry_run}）。`,
       })
       pushHistory(response, `trigger-all (${response.triggered.length})`)
+
+      if (!response.dry_run) {
+        try {
+          type CreateTaskResponse = {
+            task_id: string
+            is_long_running?: boolean
+          }
+          const task = await postJson<CreateTaskResponse>('/api/tasks', {
+            kind: 'manual',
+            source: 'manual',
+            units: services.map((svc) => svc.unit),
+            caller: body.caller ?? null,
+            reason: body.reason ?? null,
+            path: '/api/manual/trigger',
+            is_long_running: true,
+          })
+          if (task?.task_id) {
+            pushToast({
+              variant: 'info',
+              title: '已创建任务',
+              message: '正在 /tasks 中跟踪本次触发。',
+            })
+            navigate(`/tasks?task_id=${encodeURIComponent(task.task_id)}`)
+          }
+        } catch {
+          // 忽略任务创建失败，只保留原有触发结果
+        }
+      }
     } catch (error) {
       const message =
         error && typeof error === 'object' && 'message' in error && error.message
@@ -138,6 +167,34 @@ export default function ManualPage() {
         message: `${service.unit} · status=${response?.status ?? 'unknown'}`,
       })
       pushHistory(response, `trigger-unit ${service.unit}`)
+
+      if (!params.dryRun) {
+        try {
+          type CreateTaskResponse = {
+            task_id: string
+            is_long_running?: boolean
+          }
+          const task = await postJson<CreateTaskResponse>('/api/tasks', {
+            kind: 'manual',
+            source: 'manual',
+            units: [service.unit],
+            caller: params.caller?.trim() || undefined,
+            reason: params.reason?.trim() || undefined,
+            path: `/api/manual/services/${service.slug}`,
+            is_long_running: true,
+          })
+          if (task?.task_id) {
+            pushToast({
+              variant: 'info',
+              title: '已创建任务',
+              message: '正在 /tasks 中跟踪本次触发。',
+            })
+            navigate(`/tasks?task_id=${encodeURIComponent(task.task_id)}`)
+          }
+        } catch {
+          // 忽略任务创建失败，只保留原有触发结果
+        }
+      }
     } catch (error) {
       const message =
         error && typeof error === 'object' && 'message' in error && error.message

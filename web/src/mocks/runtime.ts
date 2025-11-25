@@ -1,6 +1,13 @@
 /// <reference lib="dom" />
 import { faker } from '@faker-js/faker'
 import cloneDeep from 'lodash-es/cloneDeep'
+import type {
+  Task,
+  TaskLogEntry,
+  TaskSummaryCounts,
+  TaskTriggerMeta,
+  TaskUnitSummary,
+} from '../domain/tasks'
 
 export type MockProfile =
   | 'happy-path'
@@ -121,6 +128,8 @@ export type RuntimeData = {
   settings: SettingsSnapshot
   config: ConfigSnapshot
   lastPayload: Uint8Array
+  tasks: Task[]
+  taskLogs: Record<string, TaskLogEntry[]>
 }
 
 export type RuntimeSnapshot = {
@@ -140,6 +149,43 @@ const STORAGE_KEYS = {
 
 function makeRequestId() {
   return faker.string.alphanumeric(12).toLowerCase()
+}
+
+function summarizeUnits(units: TaskUnitSummary[]): TaskSummaryCounts {
+  const summary: TaskSummaryCounts = {
+    total_units: units.length,
+    succeeded: 0,
+    failed: 0,
+    cancelled: 0,
+    running: 0,
+    pending: 0,
+    skipped: 0,
+  }
+  for (const unit of units) {
+    switch (unit.status) {
+      case 'succeeded':
+        summary.succeeded += 1
+        break
+      case 'failed':
+        summary.failed += 1
+        break
+      case 'cancelled':
+        summary.cancelled += 1
+        break
+      case 'running':
+        summary.running += 1
+        break
+      case 'pending':
+        summary.pending += 1
+        break
+      case 'skipped':
+        summary.skipped += 1
+        break
+      default:
+        break
+    }
+  }
+  return summary
 }
 
 function buildEvents(now: number, profile: MockProfile): MockEvent[] {
@@ -342,8 +388,375 @@ function buildConfig(): ConfigSnapshot {
   }
 }
 
+function buildTasks(
+  now: number,
+  profile: MockProfile,
+): { tasks: Task[]; taskLogs: Record<string, TaskLogEntry[]> } {
+  if (profile === 'empty-state') {
+    return { tasks: [], taskLogs: {} }
+  }
+
+  const baseTs = now - 3600
+  let nextId = 1
+
+  const tasks: Task[] = []
+  const taskLogs: Record<string, TaskLogEntry[]> = {}
+
+  const makeTaskId = () => `tsk_${faker.string.alphanumeric(10).toLowerCase()}`
+
+  const addTask = (
+    partial: Omit<Task, 'id' | 'task_id' | 'unit_counts'> & { task_id?: string },
+    logs: Omit<TaskLogEntry, 'id'>[] = [],
+  ) => {
+    const task_id = partial.task_id ?? makeTaskId()
+    const units = partial.units ?? []
+    const unit_counts = summarizeUnits(units)
+    const task: Task = {
+      ...partial,
+      id: nextId++,
+      task_id,
+      units,
+      unit_counts,
+    }
+    tasks.push(task)
+    taskLogs[task_id] = logs.map((entry, index) => ({
+      id: index + 1,
+      ...entry,
+    }))
+  }
+
+  // Manual multi-unit task that finished successfully.
+  addTask(
+    {
+      kind: 'manual',
+      status: 'succeeded',
+      created_at: baseTs + 600,
+      started_at: baseTs + 602,
+      finished_at: baseTs + 630,
+      updated_at: baseTs + 630,
+      summary: '2/2 units succeeded · nightly manual upgrade',
+      trigger: {
+        source: 'manual',
+        path: '/api/manual/trigger',
+        caller: 'ops-nightly',
+        reason: 'nightly rollout',
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: true,
+      is_long_running: true,
+      retry_of: null,
+      units: [
+        {
+          unit: 'svc-alpha.service',
+          slug: 'svc-alpha',
+          display_name: 'Alpha Deploy',
+          status: 'succeeded',
+          phase: 'done',
+          started_at: baseTs + 605,
+          finished_at: baseTs + 620,
+          duration_ms: 15_000,
+          message: 'pulled image and restarted successfully',
+        },
+        {
+          unit: 'svc-beta.service',
+          slug: 'svc-beta',
+          display_name: 'Beta Deploy',
+          status: 'succeeded',
+          phase: 'done',
+          started_at: baseTs + 607,
+          finished_at: baseTs + 625,
+          duration_ms: 18_000,
+          message: 'restart completed',
+        },
+      ],
+    },
+    [
+      {
+        ts: baseTs + 602,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Manual task accepted from UI',
+        unit: null,
+        meta: { caller: 'ops-nightly', reason: 'nightly rollout' },
+      },
+      {
+        ts: baseTs + 608,
+        level: 'info',
+        action: 'image-pull',
+        status: 'running',
+        summary: 'Pulling latest images for svc-alpha, svc-beta',
+        unit: null,
+        meta: { units: ['svc-alpha.service', 'svc-beta.service'] },
+      },
+      {
+        ts: baseTs + 620,
+        level: 'info',
+        action: 'restart-unit',
+        status: 'succeeded',
+        summary: 'Restarted svc-alpha.service, svc-beta.service',
+        unit: null,
+        meta: { ok: ['svc-alpha.service', 'svc-beta.service'] },
+      },
+    ],
+  )
+
+  // Webhook-triggered task with a failed unit.
+  addTask(
+    {
+      kind: 'github-webhook',
+      status: 'failed',
+      created_at: baseTs + 1200,
+      started_at: baseTs + 1201,
+      finished_at: baseTs + 1220,
+      updated_at: baseTs + 1220,
+      summary: '0/1 units succeeded · image mismatch for svc-beta',
+      trigger: {
+        source: 'webhook',
+        path: '/github-package-update/svc-beta',
+        request_id: makeRequestId(),
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: true,
+      is_long_running: false,
+      retry_of: null,
+      units: [
+        {
+          unit: 'svc-beta.service',
+          slug: 'svc-beta',
+          display_name: 'Beta Deploy',
+          status: 'failed',
+          phase: 'verifying',
+          started_at: baseTs + 1201,
+          finished_at: baseTs + 1218,
+          duration_ms: 17_000,
+          message: 'image tag mismatch, refused restart',
+          error: 'expected ghcr.io/example/svc-beta:stable, got :pr-123',
+        },
+      ],
+    },
+    [
+      {
+        ts: baseTs + 1201,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Github webhook accepted for svc-beta',
+        unit: 'svc-beta.service',
+        meta: { slug: 'svc-beta' },
+      },
+      {
+        ts: baseTs + 1210,
+        level: 'warning',
+        action: 'image-verify',
+        status: 'running',
+        summary: 'Verifying incoming image tag',
+        unit: 'svc-beta.service',
+        meta: { expected: 'stable', got: 'pr-123' },
+      },
+      {
+        ts: baseTs + 1218,
+        level: 'error',
+        action: 'policy-check',
+        status: 'failed',
+        summary: 'Refused restart due to image mismatch',
+        unit: 'svc-beta.service',
+        meta: { policy: 'allow-stable-only' },
+      },
+    ],
+  )
+
+  // Scheduler-driven podman auto-update currently running.
+  addTask(
+    {
+      kind: 'scheduler',
+      status: 'running',
+      created_at: now - 300,
+      started_at: now - 295,
+      finished_at: null,
+      updated_at: now - 60,
+      summary: 'Auto-update in progress for podman-auto-update.service',
+      trigger: {
+        source: 'scheduler',
+        path: '/api/scheduler/tick',
+        scheduler_iteration: 84,
+      },
+      can_stop: true,
+      can_force_stop: true,
+      can_retry: false,
+      is_long_running: true,
+      retry_of: null,
+      units: [
+        {
+          unit: 'podman-auto-update.service',
+          status: 'running',
+          phase: 'pulling-image',
+          started_at: now - 295,
+          finished_at: null,
+          duration_ms: null,
+          message: 'Checking images and applying updates',
+        },
+      ],
+    },
+    [
+      {
+        ts: now - 295,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Scheduler iteration #84 started',
+        unit: null,
+        meta: { iteration: 84 },
+      },
+      {
+        ts: now - 200,
+        level: 'info',
+        action: 'scan-units',
+        status: 'running',
+        summary: 'Scanning auto-update units',
+        unit: null,
+        meta: { units: ['podman-auto-update.service'] },
+      },
+    ],
+  )
+
+  // Maintenance-style long-running task that was cancelled.
+  addTask(
+    {
+      kind: 'maintenance',
+      status: 'cancelled',
+      created_at: baseTs + 1800,
+      started_at: baseTs + 1802,
+      finished_at: baseTs + 1830,
+      updated_at: baseTs + 1830,
+      summary: 'State prune cancelled by admin after 1/3 phases',
+      trigger: {
+        source: 'manual',
+        path: '/api/prune-state',
+        caller: 'admin',
+        reason: 'free disk space',
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: true,
+      is_long_running: true,
+      retry_of: null,
+      units: [
+        {
+          unit: 'state-prune.phase-1',
+          status: 'succeeded',
+          phase: 'done',
+          started_at: baseTs + 1803,
+          finished_at: baseTs + 1810,
+          duration_ms: 7_000,
+          message: 'Cleaned old image locks',
+        },
+        {
+          unit: 'state-prune.phase-2',
+          status: 'cancelled',
+          phase: 'waiting',
+          started_at: baseTs + 1811,
+          finished_at: baseTs + 1820,
+          duration_ms: 9_000,
+          message: 'Cancelled while pruning event logs',
+          error: 'cancelled-by-user',
+        },
+      ],
+    },
+    [
+      {
+        ts: baseTs + 1802,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Maintenance prune started',
+        unit: null,
+        meta: { caller: 'admin' },
+      },
+      {
+        ts: baseTs + 1810,
+        level: 'info',
+        action: 'phase-complete',
+        status: 'succeeded',
+        summary: 'Phase 1 completed (locks pruned)',
+        unit: 'state-prune.phase-1',
+        meta: { removed_locks: 3 },
+      },
+      {
+        ts: baseTs + 1820,
+        level: 'warning',
+        action: 'task-cancelled',
+        status: 'cancelled',
+        summary: 'Task cancelled by admin',
+        unit: null,
+        meta: { reason: 'cancelled-by-user' },
+      },
+    ],
+  )
+
+  // Small internal background task that already succeeded.
+  addTask(
+    {
+      kind: 'internal',
+      status: 'succeeded',
+      created_at: baseTs + 2000,
+      started_at: baseTs + 2001,
+      finished_at: baseTs + 2005,
+      updated_at: baseTs + 2005,
+      summary: 'Internal consistency check completed',
+      trigger: {
+        source: 'system',
+        path: 'internal:consistency-check',
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: false,
+      is_long_running: false,
+      retry_of: null,
+      units: [
+        {
+          unit: 'internal.consistency-check',
+          status: 'succeeded',
+          phase: 'done',
+          started_at: baseTs + 2001,
+          finished_at: baseTs + 2005,
+          duration_ms: 4_000,
+          message: 'No inconsistencies found',
+        },
+      ],
+    },
+    [
+      {
+        ts: baseTs + 2001,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Consistency check scheduled',
+        unit: null,
+        meta: {},
+      },
+      {
+        ts: baseTs + 2005,
+        level: 'info',
+        action: 'task-completed',
+        status: 'succeeded',
+        summary: 'Consistency check finished',
+        unit: null,
+        meta: {},
+      },
+    ],
+  )
+
+  tasks.sort((a, b) => b.created_at - a.created_at)
+
+  return { tasks, taskLogs }
+}
+
 function buildInitialData(profile: MockProfile): RuntimeData {
   const now = Math.floor(Date.now() / 1000)
+  const taskSeed = buildTasks(now, profile)
   return {
     now,
     events: buildEvents(now, profile),
@@ -353,6 +766,8 @@ function buildInitialData(profile: MockProfile): RuntimeData {
     settings: buildSettings(now, profile),
     config: buildConfig(),
     lastPayload: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+    tasks: taskSeed.tasks,
+    taskLogs: taskSeed.taskLogs,
   }
 }
 
@@ -506,6 +921,165 @@ class RuntimeStore {
   mutate(fn: (data: RuntimeData) => void) {
     fn(this.#data)
     this.#notify()
+  }
+
+  updateTask(taskId: string, patch: Partial<Task>) {
+    const updatedAt = Math.floor(Date.now() / 1000)
+    this.#data.tasks = this.#data.tasks.map((task) =>
+      task.task_id === taskId ? { ...task, ...patch, updated_at: updatedAt } : task,
+    )
+    this.#notify()
+  }
+
+  appendTaskLog(taskId: string, entry: Omit<TaskLogEntry, 'id'>) {
+    const current = this.#data.taskLogs[taskId] ?? []
+    const maxId = current.reduce((max, log) => Math.max(max, log.id), 0)
+    const record: TaskLogEntry = { id: maxId + 1, ...entry }
+    this.#data.taskLogs[taskId] = [...current, record]
+    this.#notify()
+  }
+
+  getTaskLogs(taskId: string): TaskLogEntry[] {
+    return this.#data.taskLogs[taskId] ?? []
+  }
+
+  getTask(taskId: string): Task | undefined {
+    return this.#data.tasks.find((task) => task.task_id === taskId)
+  }
+
+  createRetryTask(originalTaskId: string): Task | null {
+    const original = this.#data.tasks.find((task) => task.task_id === originalTaskId)
+    if (!original) return null
+
+    const now = Math.floor(Date.now() / 1000)
+    const maxId = this.#data.tasks.reduce((max, task) => Math.max(max, task.id), 0)
+    const newId = maxId + 1
+    const task_id = `retry_${faker.string.alphanumeric(10).toLowerCase()}`
+
+    const units: TaskUnitSummary[] = original.units.map((unit) => ({
+      ...unit,
+      status: 'pending',
+      phase: 'queued',
+      started_at: null,
+      finished_at: null,
+      duration_ms: null,
+      error: null,
+    }))
+    const unit_counts = summarizeUnits(units)
+
+    const retryTask: Task = {
+      ...original,
+      id: newId,
+      task_id,
+      status: 'pending',
+      created_at: now,
+      started_at: null,
+      finished_at: null,
+      updated_at: now,
+      summary: original.summary
+        ? `${original.summary} · retry`
+        : 'Retry of previous task',
+      can_stop: true,
+      can_force_stop: true,
+      can_retry: false,
+      retry_of: original.task_id,
+      units,
+      unit_counts,
+    }
+
+    this.#data.tasks = [retryTask, ...this.#data.tasks]
+    this.#data.taskLogs[task_id] = [
+      {
+        id: 1,
+        ts: now,
+        level: 'info',
+        action: 'task-created',
+        status: 'pending',
+        summary: 'Retry task created from existing task',
+        unit: null,
+        meta: { retry_of: original.task_id },
+      },
+    ]
+
+    this.#notify()
+    return retryTask
+  }
+
+  createAdHocTask(input: {
+    kind: Task['kind']
+    source: TaskTriggerMeta['source']
+    units: string[]
+    caller?: string | null
+    reason?: string | null
+    path?: string | null
+    is_long_running?: boolean
+  }): Task {
+    const now = Math.floor(Date.now() / 1000)
+    const maxId = this.#data.tasks.reduce((max, task) => Math.max(max, task.id), 0)
+    const id = maxId + 1
+    const task_id = `tsk_${faker.string.alphanumeric(10).toLowerCase()}`
+
+    const units: TaskUnitSummary[] = input.units.map((unitName) => ({
+      unit: unitName,
+      status: 'running',
+      phase: 'queued',
+      started_at: now,
+      finished_at: null,
+      duration_ms: null,
+      message: 'Task started from UI',
+    }))
+
+    const unit_counts = summarizeUnits(units)
+
+    const task: Task = {
+      id,
+      task_id,
+      kind: input.kind,
+      status: 'running',
+      created_at: now,
+      started_at: now,
+      finished_at: null,
+      updated_at: now,
+      summary:
+        input.kind === 'maintenance'
+          ? 'Maintenance task started from UI'
+          : 'Manual task started from UI',
+      trigger: {
+        source: input.source,
+        caller: input.caller ?? null,
+        reason: input.reason ?? null,
+        path: input.path ?? null,
+      },
+      units,
+      unit_counts,
+      can_stop: true,
+      can_force_stop: true,
+      can_retry: false,
+      is_long_running: Boolean(input.is_long_running),
+      retry_of: null,
+    }
+
+    this.#data.tasks = [task, ...this.#data.tasks]
+    this.#data.taskLogs[task_id] = [
+      {
+        id: 1,
+        ts: now,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Task created from UI request',
+        unit: null,
+        meta: {
+          source: input.source,
+          caller: input.caller ?? null,
+          reason: input.reason ?? null,
+          kind: input.kind,
+        },
+      },
+    ]
+
+    this.#notify()
+    return task
   }
 
   cloneData(): RuntimeData {

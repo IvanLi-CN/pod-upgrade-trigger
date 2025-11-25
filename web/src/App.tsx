@@ -6,6 +6,7 @@ import ManualPage from './pages/ManualPage'
 import MaintenancePage from './pages/MaintenancePage'
 import SettingsPage from './pages/SettingsPage'
 import WebhooksPage from './pages/WebhooksPage'
+import TasksPage from './pages/TasksPage'
 import UnauthorizedPage from './pages/UnauthorizedPage'
 import { ApiProvider, useApi } from './hooks/useApi'
 import { ToastProvider, ToastViewport } from './components/Toast'
@@ -74,6 +75,7 @@ function SideNav() {
     { to: '/', label: 'Dashboard', icon: 'mdi:view-dashboard' },
     { to: '/manual', label: 'Manual', icon: 'mdi:play-circle-outline' },
     { to: '/webhooks', label: 'Webhooks', icon: 'mdi:webhook' },
+    { to: '/tasks', label: 'Tasks', icon: 'mdi:clipboard-text-clock-outline' },
     { to: '/events', label: 'Events', icon: 'mdi:file-document-multiple-outline' },
     { to: '/maintenance', label: 'Maintenance', icon: 'mdi:toolbox-outline' },
     { to: '/settings', label: 'Settings', icon: 'mdi:cog-outline' },
@@ -127,6 +129,7 @@ function Layout() {
               <Route path="/" element={<DashboardPage />} />
               <Route path="/manual" element={<ManualPage />} />
               <Route path="/webhooks" element={<WebhooksPage />} />
+              <Route path="/tasks" element={<TasksPage />} />
               <Route path="/events" element={<EventsPage />} />
               <Route path="/maintenance" element={<MaintenancePage />} />
               <Route path="/settings" element={<SettingsPage />} />

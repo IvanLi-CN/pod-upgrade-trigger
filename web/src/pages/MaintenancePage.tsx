@@ -1,5 +1,6 @@
 import { Icon } from '@iconify/react'
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
 
@@ -23,6 +24,7 @@ type FileStats = {
 export default function MaintenancePage() {
   const { getJson, postJson } = useApi()
   const { pushToast } = useToast()
+  const navigate = useNavigate()
   const [resources, setResources] = useState<SettingsResources['resources'] | null>(null)
   const [maxAgeHours, setMaxAgeHours] = useState('24')
   const [prunePending, setPrunePending] = useState(false)
@@ -64,6 +66,32 @@ export default function MaintenancePage() {
         title: '清理完成',
         message: `tokens=${result.tokens_removed ?? 0}, locks=${result.locks_removed ?? 0}`,
       })
+
+      try {
+        type CreateTaskResponse = {
+          task_id: string
+          is_long_running?: boolean
+        }
+        const task = await postJson<CreateTaskResponse>('/api/tasks', {
+          kind: 'maintenance',
+          source: 'manual',
+          units: ['state-prune'],
+          caller: null,
+          reason: `prune state <= ${maxAge}h`,
+          path: '/api/prune-state',
+          is_long_running: true,
+        })
+        if (task?.task_id) {
+          pushToast({
+            variant: 'info',
+            title: '已创建维护任务',
+            message: '正在 /tasks 中跟踪清理进度。',
+          })
+          navigate(`/tasks?task_id=${encodeURIComponent(task.task_id)}`)
+        }
+      } catch {
+        // 忽略任务创建失败，只保留原有清理结果
+      }
     } catch (err) {
       const message =
         err && typeof err === 'object' && 'message' in err && err.message
