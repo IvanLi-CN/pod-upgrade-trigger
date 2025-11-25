@@ -31,3 +31,33 @@
 - [x] Add startup/self-check paths so `/api/webhooks/status` and `/api/image-locks` return structured errors (not 502) and emit logs when DB or Podman connectivity fails.
 - [x] Auto-create/migrate the state DB when missing or unwritable; when impossible, surface actionable guidance on the health page (path + env hints).
 - [x] Settings page should show the discovered auto-update unit count plus a summary list, distinct from env-provided manual units, to aid ops reconciliation.
+
+## Task Management Panel – Frontend-First Phase
+
+- [ ] Task domain modeling & mock infrastructure (frontend only)
+  - Define Task-related TypeScript types in `web` (Task, TaskStatus, TaskKind, TaskUnitSummary, TaskLogEntry, etc.).
+  - Add MSW handlers for `/api/tasks` list, `/api/tasks/:id` detail, and actions (`/api/tasks/:id/stop`, `/force-stop`, `/retry`), with rich fake data.
+  - Cover core scenarios in mock data: manual/webhook/scheduler/maintenance/other automatic tasks, running/failed/succeeded/cancelled.
+
+- [ ] Tasks list page (page mode) UI & interactions (frontend + mock)
+  - Introduce `/tasks` route and sidebar navigation entry, wired to `useApi` over mocked endpoints.
+  - Implement tasks table with pagination, status/type/unit filters, and unit text search.
+  - Implement quick category switcher (e.g. All / Manual / Webhook / Automatic / Maintenance) synced with type filters.
+  - Add list polling (e.g. every 5–10 seconds) with proper loading/empty/error states.
+
+- [ ] Task detail view & drawer mode (frontend + mock)
+  - Implement task detail layout: summary card, per-unit status list, and log timeline backed by mock detail API.
+  - Implement right-side drawer component that hosts the full-detail view in a compact layout.
+  - Wire `/tasks` list rows to open the drawer on click; support closing without losing list filters/scroll position.
+  - Add detail polling for running tasks only, stopping automatically once a terminal state is reached.
+  - Implement stop/force-stop/retry flows purely against mocks, updating local state and surfacing toast feedback.
+
+- [ ] Integration with existing pages for long-running flows (frontend + mock)
+  - For Manual/Maintenance-style actions that may launch long-running work, mock a “create task” API that returns `task_id` and long-running hints.
+  - On successful creation, automatically open the corresponding task drawer and start polling its detail.
+  - Adjust existing UI flows (where appropriate) to guide users from Events/Webhooks/Maintenance into the Tasks view when they need task-centric insights.
+
+- [ ] Backend contract shaping based on frontend experience
+  - From the stabilized frontend + mock behavior, extract a concrete Task entity and API contract proposal.
+  - Document expected fields, status transitions, and relationships to `event_log` (including how logs are queried per task).
+  - Capture any additional fields discovered during UX trials (e.g. richer summaries, counters, or hints for graceful vs force stop).
