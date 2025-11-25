@@ -25,6 +25,7 @@ cargo build --bin pod-upgrade-trigger
 echo "[ui-e2e] installing front-end dependencies with Bun"
 cd "$repo_root/web"
 if command -v bun >/dev/null 2>&1; then
+  export VITE_ENABLE_MOCKS="true"
   bun install --frozen-lockfile || bun install
   echo "[ui-e2e] building front-end dist with Bun"
   bun run build
@@ -36,6 +37,8 @@ fi
 cd "$repo_root"
 echo "[ui-e2e] starting http-server on 127.0.0.1:25211"
 : >"$http_log"
+PODUP_SKIP_PODMAN="1" \
+PODUP_ENV="test" \
 PODUP_STATE_DIR="$state_dir" \
 PODUP_DB_URL="sqlite://$state_dir/pod-upgrade-trigger.db" \
 PODUP_TOKEN="e2e-token" \
@@ -52,6 +55,8 @@ server_pid_main=$!
 
 echo "[ui-e2e] starting auth http-server on 127.0.0.1:25212"
 : >"$auth_http_log"
+PODUP_SKIP_PODMAN="1" \
+PODUP_ENV="test" \
 PODUP_STATE_DIR="$auth_state_dir" \
 PODUP_DB_URL="sqlite://$auth_state_dir/pod-upgrade-trigger.db" \
 PODUP_TOKEN="e2e-token" \
@@ -112,7 +117,9 @@ fi
 echo "[ui-e2e] running Playwright tests"
 cd "$repo_root/web"
 if command -v bun >/dev/null 2>&1; then
-  UI_E2E_BASE_URL="http://127.0.0.1:25211" UI_E2E_AUTH_BASE_URL="http://127.0.0.1:25212" bunx playwright test "$@"
+  base_url="http://127.0.0.1:25211"
+  auth_url="http://127.0.0.1:25212"
+  UI_E2E_BASE_URL="$base_url" UI_E2E_AUTH_BASE_URL="$auth_url" bunx playwright test "$@"
 else
   echo "[ui-e2e] bun is not available for Playwright; please install Bun." >&2
   exit 1

@@ -9,8 +9,21 @@ if (!rootElement) {
   throw new Error('Failed to locate root element')
 }
 
-createRoot(rootElement).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+async function bootstrap() {
+  const enableMocks =
+    import.meta.env.VITE_ENABLE_MOCKS === 'true' ||
+    window.location.search.includes('mock')
+
+  if (enableMocks) {
+    const { startMocks } = await import('./mocks/browser')
+    await startMocks()
+  }
+
+  createRoot(rootElement!).render(
+    <StrictMode>
+      <App mockEnabled={enableMocks} />
+    </StrictMode>,
+  )
+}
+
+bootstrap()

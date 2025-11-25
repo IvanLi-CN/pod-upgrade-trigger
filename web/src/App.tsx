@@ -10,6 +10,7 @@ import UnauthorizedPage from './pages/UnauthorizedPage'
 import { ApiProvider, useApi } from './hooks/useApi'
 import { ToastProvider, ToastViewport } from './components/Toast'
 import { TokenProvider, useToken } from './hooks/useToken'
+import MockConsole from './mocks/MockConsole'
 
 function TopStatusBar() {
   const { health, scheduler, sseStatus, now } = useAppStatus()
@@ -163,7 +164,11 @@ function NotFoundFallback() {
   )
 }
 
-export default function App() {
+type AppProps = {
+  mockEnabled?: boolean
+}
+
+export default function App({ mockEnabled = false }: AppProps) {
   return (
     <BrowserRouter>
       <ToastProvider>
@@ -173,6 +178,7 @@ export default function App() {
           </ApiProvider>
         </TokenProvider>
       </ToastProvider>
+      {mockEnabled ? <MockConsole /> : null}
     </BrowserRouter>
   )
 }
