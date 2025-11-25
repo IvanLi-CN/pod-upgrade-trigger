@@ -3288,7 +3288,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
     let sig = verify_github_signature(signature, &secret, &ctx.body)?;
     if !sig.valid {
         log_message(&format!(
-            "401 github signature-mismatch provided={} expected={} expected-len={} expected-error={} body-sha256={} dump={} dump-error={} secret-len={} secret-sha256={} body-len={} header-raw={} prefix-ok={}",
+            "401 github signature-mismatch provided={} expected={} expected-len={} expected-error={} body-sha256={} dump={} dump-error={} secret-len={} body-len={} header-raw={} prefix-ok={}",
             sig.provided,
             sig.expected,
             sig.expected_len,
@@ -3297,7 +3297,6 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             sig.payload_dump.as_deref().unwrap_or(""),
             sig.dump_error.as_deref().unwrap_or(""),
             secret.len(),
-            sig.secret_sha256,
             ctx.body.len(),
             sig.header_raw,
             sig.prefix_ok,
@@ -3317,7 +3316,6 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
                 "body_sha256": sig.body_sha256,
                 "dump": sig.payload_dump,
                 "dump_error": sig.dump_error,
-                "secret_sha256": sig.secret_sha256,
                 "header_raw": sig.header_raw,
                 "headers": ctx.headers,
                 "prefix_ok": sig.prefix_ok,
@@ -4296,7 +4294,6 @@ struct SignatureCheck {
     expected_len: usize,
     body_sha256: String,
     payload_dump: Option<String>,
-    secret_sha256: String,
     dump_error: Option<String>,
     header_raw: String,
     prefix_ok: bool,
@@ -4312,7 +4309,6 @@ fn verify_github_signature(
 
     let body_sha256 = sha2::Sha256::digest(body).encode_hex::<String>();
     let secret_len = secret.len();
-    let secret_sha256 = sha2::Sha256::digest(secret.as_bytes()).encode_hex::<String>();
 
     let header_raw = signature.to_string();
     let (provided, prefix_ok) = match parse_signature_bytes(signature) {
@@ -4328,7 +4324,6 @@ fn verify_github_signature(
                 expected_len: expected.len() / 2,
                 body_sha256,
                 payload_dump: dump,
-                secret_sha256,
                 dump_error: dump_err,
                 header_raw,
                 prefix_ok: false,
@@ -4337,29 +4332,14 @@ fn verify_github_signature(
     };
 
     // Compute expected once to avoid any ambiguity with clone/finalize order.
-    let (mut expected_hex, mut expected_err, mut expected_len) =
-        match compute_expected_hmac_bytes(secret, body) {
-            Ok(bytes) => {
-                let len = bytes.len();
-                (bytes.encode_hex::<String>(), None, len)
-            }
-            Err(err) => (String::new(), Some(err), 0),
-        };
-
-    if expected_len == 0 || expected_hex.is_empty() {
-        match compute_hmac_fallback(secret.as_bytes(), body) {
-            Ok(bytes) => {
-                expected_len = bytes.len();
-                expected_hex = bytes.encode_hex::<String>();
-                if expected_err.is_none() {
-                    expected_err = Some("empty-hmac-primary".into());
-                }
-            }
-            Err(err) => {
-                expected_err = Some(format!("primary-empty fallback-error: {err}"));
-            }
+    let (expected_hex, expected_err, expected_len) = match compute_expected_hmac_bytes(secret, body)
+    {
+        Ok(bytes) => {
+            let len = bytes.len();
+            (bytes.encode_hex::<String>(), None, len)
         }
-    }
+        Err(err) => (String::new(), Some(err), 0),
+    };
 
     let valid = if expected_len > 0 {
         match hex::decode(&expected_hex) {
@@ -4384,7 +4364,6 @@ fn verify_github_signature(
         expected_len,
         body_sha256,
         payload_dump: dump,
-        secret_sha256,
         dump_error: dump_err,
         header_raw,
         prefix_ok,
@@ -4414,39 +4393,6 @@ fn compute_expected_hmac_bytes(secret: &str, body: &[u8]) -> Result<Vec<u8>, Str
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|e| e.to_string())?;
     mac.update(body);
     Ok(mac.finalize().into_bytes().to_vec())
-}
-
-fn compute_hmac_fallback(key: &[u8], body: &[u8]) -> Result<Vec<u8>, String> {
-    use sha2::Digest;
-    // Minimal, allocation-light SHA-256 HMAC for debugging fallback.
-    const BLOCK: usize = 64;
-    let mut key_block = [0u8; BLOCK];
-
-    if key.len() > BLOCK {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(key);
-        let hashed = hasher.finalize();
-        key_block[..hashed.len()].copy_from_slice(&hashed);
-    } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0u8; BLOCK];
-    let mut opad = [0u8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] = key_block[i] ^ 0x36;
-        opad[i] = key_block[i] ^ 0x5c;
-    }
-
-    let mut inner = sha2::Sha256::new();
-    inner.update(&ipad);
-    inner.update(body);
-    let inner_hash = inner.finalize();
-
-    let mut outer = sha2::Sha256::new();
-    outer.update(&opad);
-    outer.update(inner_hash);
-    Ok(outer.finalize().to_vec())
 }
 
 fn dump_payload(body: &[u8], _secret_len: usize) -> (Option<String>, Option<String>) {
