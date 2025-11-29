@@ -1,6 +1,13 @@
 import { http, HttpResponse } from 'msw'
 import type { TaskDetailResponse, TasksListResponse } from '../domain/tasks'
 import { runtime } from './runtime'
+import {
+  settingsSchema,
+  webhooksStatusSchema,
+  tasksListResponseSchema,
+  taskDetailResponseSchema,
+  validateMockResponse,
+} from './schema'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
@@ -91,7 +98,9 @@ const handlers = [
     const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
     if (failure) return failure
     await withLatency()
-    return HttpResponse.json(runtime.cloneData().settings, { headers: JSON_HEADERS })
+    const payload = runtime.cloneData().settings
+    validateMockResponse(settingsSchema, payload, { path: '/api/settings' })
+    return HttpResponse.json(payload, { headers: JSON_HEADERS })
   }),
 
   http.get('/api/events', async ({ request }) => {
@@ -178,6 +187,8 @@ const handlers = [
       has_next: hasNext,
     }
 
+    validateMockResponse(tasksListResponseSchema, response, { path: '/api/tasks' })
+
     return HttpResponse.json(response, { headers: JSON_HEADERS })
   }),
 
@@ -198,6 +209,10 @@ const handlers = [
       ...task,
       logs,
     }
+
+    validateMockResponse(taskDetailResponseSchema, response, {
+      path: `/api/tasks/${taskId}`,
+    })
 
     return HttpResponse.json(response, { headers: JSON_HEADERS })
   }),
@@ -488,7 +503,12 @@ const handlers = [
     await withLatency()
 
     const data = runtime.cloneData().webhooks
-    return HttpResponse.json({ ...data, now: Math.floor(Date.now() / 1000) }, { headers: JSON_HEADERS })
+    const now = Math.floor(Date.now() / 1000)
+    const payload = { ...data, now }
+    validateMockResponse(webhooksStatusSchema, payload, {
+      path: '/api/webhooks/status',
+    })
+    return HttpResponse.json(payload, { headers: JSON_HEADERS })
   }),
 
   http.get('/api/image-locks', async ({ request }) => {
