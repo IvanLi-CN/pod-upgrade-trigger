@@ -12,6 +12,10 @@ tests/mock-bin/log.txt
 /last_payload.bin
 /tmp-events-*.txt
 
+# Local agent state and mock UI logs
+/.serena/memories/task_plan_frontend_mock_zod_msw.md
+/ui-e2e-mock.log
+
 # Playwright / UI test artifacts (future)
 /web/playwright-report/
 /web/test-results/
