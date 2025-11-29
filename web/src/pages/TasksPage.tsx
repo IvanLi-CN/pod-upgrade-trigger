@@ -394,11 +394,14 @@ export default function TasksPage() {
             </div>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,2fr)]">
-            <label className="form-control">
-              <span className="label-text text-xs">状态</span>
+          {/* 任务筛选：桌面端一行，label 与控件同一行；移动端整组换行但 label 不换行 */}
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <div className="flex items-center gap-2">
+              <span className="whitespace-nowrap text-xs text-base-content/70">
+                状态
+              </span>
               <select
-                className="select select-xs select-bordered"
+                className="select select-xs select-bordered w-28"
                 value={statusFilter}
                 onChange={(event) => handleChangeStatus(event.target.value)}
               >
@@ -410,11 +413,14 @@ export default function TasksPage() {
                 <option value="cancelled">cancelled</option>
                 <option value="skipped">skipped</option>
               </select>
-            </label>
-            <label className="form-control">
-              <span className="label-text text-xs">类型</span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="whitespace-nowrap text-xs text-base-content/70">
+                类型
+              </span>
               <select
-                className="select select-xs select-bordered"
+                className="select select-xs select-bordered w-36"
                 value={kindFilter}
                 onChange={(event) => handleChangeKind(event.target.value)}
               >
@@ -426,16 +432,19 @@ export default function TasksPage() {
                 <option value="internal">internal</option>
                 <option value="other">other</option>
               </select>
-            </label>
-            <label className="form-control">
-              <span className="label-text text-xs">Unit / 服务搜索</span>
+            </div>
+
+            <div className="flex min-w-[18rem] flex-1 items-center gap-2">
+              <span className="whitespace-nowrap text-xs text-base-content/70">
+                Unit / 服务搜索
+              </span>
               <input
-                className="input input-xs input-bordered"
+                className="input input-xs input-bordered flex-1 min-w-0"
                 placeholder="按 unit / slug / 名称搜索"
                 value={unitQuery}
                 onChange={(event) => handleChangeUnitQuery(event.target.value)}
               />
-            </label>
+            </div>
           </div>
         </div>
       </section>
