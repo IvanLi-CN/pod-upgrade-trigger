@@ -156,14 +156,20 @@ export function ApiProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     let cancelled = false
     setSseStatus('connecting')
-
+    // In mock mode, rely on a one-shot fetch to /sse/hello so degraded profile
+    // still surfaces as error even if real EventSource is not available.
     if (mockEnabled) {
-      const timer = setTimeout(() => {
-        if (!cancelled) setSseStatus('open')
-      }, 200)
+      ;(async () => {
+        try {
+          const res = await fetch('/sse/hello')
+          if (cancelled) return
+          setSseStatus(res.ok ? 'open' : 'error')
+        } catch {
+          if (!cancelled) setSseStatus('error')
+        }
+      })()
       return () => {
         cancelled = true
-        clearTimeout(timer)
       }
     }
 

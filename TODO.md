@@ -65,3 +65,9 @@
 - [x] Complete MSW mocks for task APIs
   - Implement `/api/tasks` list, `/api/tasks/:id` detail, and `/api/tasks/:id/{stop,force-stop,retry}` handlers with realistic fixture data.
   - Ensure `/tasks` 页面在 mock 模式下有可用的列表数据与抽屉详情，便于前端自测。
+
+## Frontend Mock – Follow-ups
+
+- [x] Add Playwright E2E coverage for `/tasks` in mock mode (list + detail drawer + stop/force-stop/retry flows) to match `docs/frontend-mock.md` verification checklist.
+- [x] Strengthen mock profile coverage with UI/E2E tests for `empty-state`, `rate-limit-hot`, and `degraded` (including Mock 控制台场景切换与空态/异常态表现) per `docs/frontend-mock.md`.
+- [ ] Adjust MSW worker startup to surface unhandled mock routes (e.g. `onUnhandledRequest: 'warn'`) instead of fully bypassing, and consider introducing `zod.safeParse` schemas for core mock responses (`/api/settings`, `/api/webhooks/status`, `/api/tasks`) as an optional validation layer.
