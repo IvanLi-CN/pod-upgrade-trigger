@@ -237,25 +237,25 @@ export default function ManualPage() {
               />
             </label>
           </div>
-          <div className="grid gap-3 md:grid-cols-3">
-            <label className="form-control">
-              <span className="label-text text-xs">Caller</span>
+          <div className="grid gap-3 md:grid-cols-2 text-xs">
+            <div className="flex flex-col gap-1">
+              <span className="text-xs">Caller</span>
               <input
                 className="input input-sm input-bordered"
                 value={allCaller}
                 onChange={(event) => setAllCaller(event.target.value)}
                 placeholder="who is triggering"
               />
-            </label>
-            <label className="form-control md:col-span-2">
-              <span className="label-text text-xs">Reason</span>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-xs">Reason</span>
               <input
                 className="input input-sm input-bordered"
                 value={allReason}
                 onChange={(event) => setAllReason(event.target.value)}
                 placeholder="short free-form reason"
               />
-            </label>
+            </div>
           </div>
           <div className="flex items-center justify-between gap-3">
             <button type="submit" className="btn btn-primary btn-sm">
