@@ -146,7 +146,7 @@ export default function EventsPage() {
         </button>
       </section>
 
-      <section className="card bg-base-100 shadow">
+      <section className="card bg-base-100 shadow-sm">
         <div className="card-body gap-3">
           <div className="grid gap-2 md:grid-cols-4">
             <label className="form-control">
@@ -212,8 +212,8 @@ export default function EventsPage() {
         </div>
       </section>
 
-      <section className="grid gap-4 md:grid-cols-[3fr,2fr]">
-        <div className="card bg-base-100 shadow">
+      <section className="grid gap-4 md:grid-cols-[3fr_2fr]">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-2">
             <div className="overflow-x-auto">
               <table className="table table-xs">
@@ -263,7 +263,7 @@ export default function EventsPage() {
           </div>
         </div>
 
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               详情
@@ -286,7 +286,7 @@ export default function EventsPage() {
                   </div>
                 </div>
                 <div className="divider my-1" />
-                <pre className="max-h-64 overflow-auto rounded bg-base-200 p-2 text-[11px] leading-snug">
+                <pre className="max-h-64 overflow-auto rounded-sm bg-base-200 p-2 text-[11px] leading-snug">
                   {JSON.stringify(selected.meta, null, 2)}
                 </pre>
               </>

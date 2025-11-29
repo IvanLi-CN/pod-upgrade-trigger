@@ -98,7 +98,7 @@ export default function DashboardPage() {
   return (
     <div className="space-y-6">
       <section className="grid gap-4 md:grid-cols-3">
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
               <span className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
@@ -118,7 +118,7 @@ export default function DashboardPage() {
             </p>
           </div>
         </div>
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
               <span className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
@@ -134,7 +134,7 @@ export default function DashboardPage() {
             </p>
           </div>
         </div>
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
               <span className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
@@ -159,8 +159,8 @@ export default function DashboardPage() {
         </div>
       </section>
 
-      <section className="grid gap-4 md:grid-cols-[2fr,1fr]">
-        <div className="card bg-base-100 shadow">
+      <section className="grid gap-4 md:grid-cols-[2fr_1fr]">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
@@ -210,7 +210,7 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">

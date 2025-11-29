@@ -61,7 +61,7 @@ export default function SettingsPage() {
 
   return (
     <div className="space-y-6">
-      <section className="card bg-base-100 shadow">
+      <section className="card bg-base-100 shadow-sm">
         <div className="card-body gap-3">
           <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
             环境变量
@@ -103,7 +103,7 @@ export default function SettingsPage() {
       </section>
 
       <section className="grid gap-4 md:grid-cols-2">
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               Scheduler
@@ -128,7 +128,7 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               systemd 单元
@@ -147,7 +147,7 @@ export default function SettingsPage() {
                 {(systemd?.trigger_units ?? []).map((unit) => (
                   <div
                     key={unit}
-                    className="flex items-center justify-between gap-2 rounded border border-base-200 px-2 py-1"
+                    className="flex items-center justify-between gap-2 rounded-sm border border-base-200 px-2 py-1"
                   >
                     <span className="font-mono text-[11px]">{unit}</span>
                     <Link
@@ -166,7 +166,7 @@ export default function SettingsPage() {
       </section>
 
       <section className="grid gap-4 md:grid-cols-2">
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               API & Version
@@ -190,7 +190,7 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="card bg-base-100 shadow">
+        <div className="card bg-base-100 shadow-sm">
           <div className="card-body gap-3">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               ForwardAuth
