@@ -18,6 +18,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_full_suite() -> AnyResult<()> {
     scenario_auto_discovery().await?;
+    scenario_webhook_auto_discovery_toggle().await?;
     scenario_health_db_error().await?;
     scenario_github_webhook().await?;
     scenario_rate_limit_and_prune().await?;
@@ -63,6 +64,70 @@ async fn scenario_auto_discovery() -> AnyResult<()> {
         .filter(|svc| svc["source"] == Value::from("discovered"))
         .collect();
     assert_eq!(sources.len(), 2);
+
+    Ok(())
+}
+
+async fn scenario_webhook_auto_discovery_toggle() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-gamma.container"),
+        b"[Container]\nImage=example\nAutoupdate=registry",
+    )?;
+    fs::write(
+        container_dir.join("svc-delta.service"),
+        b"[Unit]\nDescription=dummy",
+    )?;
+
+    // Auto-discovery disabled (default): webhooks list should only include manual/env units.
+    let disabled = env.send_request_with_env(
+        HttpRequest::get("/api/webhooks/status"),
+        |cmd| {
+            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        },
+    )?;
+    assert_eq!(disabled.status, 200);
+    let body = disabled.json_body()?;
+    let units = body["units"].as_array().unwrap();
+    let unit_names: Vec<String> = units
+        .iter()
+        .filter_map(|u| u.get("unit").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    assert!(
+        !unit_names.iter().any(|u| u == "svc-gamma.service"),
+        "svc-gamma.service should not be present when PODUP_AUTO_DISCOVER is disabled",
+    );
+    assert!(
+        !unit_names.iter().any(|u| u == "svc-delta.service"),
+        "svc-delta.service should not be present when PODUP_AUTO_DISCOVER is disabled",
+    );
+
+    // Auto-discovery enabled: webhooks list should include discovered units.
+    let enabled = env.send_request_with_env(
+        HttpRequest::get("/api/webhooks/status"),
+        |cmd| {
+            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+            cmd.env("PODUP_AUTO_DISCOVER", "1");
+        },
+    )?;
+    assert_eq!(enabled.status, 200);
+    let body = enabled.json_body()?;
+    let units = body["units"].as_array().unwrap();
+    let unit_names: Vec<String> = units
+        .iter()
+        .filter_map(|u| u.get("unit").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+    assert!(
+        unit_names.iter().any(|u| u == "svc-gamma.service"),
+        "svc-gamma.service should be present when PODUP_AUTO_DISCOVER is enabled",
+    );
+    assert!(
+        unit_names.iter().any(|u| u == "svc-delta.service"),
+        "svc-delta.service should be present when PODUP_AUTO_DISCOVER is enabled",
+    );
 
     Ok(())
 }

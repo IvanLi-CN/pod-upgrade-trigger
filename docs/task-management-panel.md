@@ -339,3 +339,204 @@
     - 是否需要为某些关键系统任务只保留“优雅停止”，隐藏强制停止入口。
 - 保留策略：
   - 任务和日志保留时间是否需要在 Settings 页面中提供可配置项。
+
+---
+
+## 九、后端 Task API 合约草案
+
+本节根据前端 `domain/tasks.ts` 与 MSW Mock 行为，整理出后端推荐采用的 Task 实体与 API 形状，作为后端实现的参考合约。
+
+### 9.1 Task 实体结构
+
+Task 对象（列表与详情中的核心单元）建议包含：
+
+- `id: number`：内部自增主键，用于排序与调试；
+- `task_id: string`：公开任务 ID，用于 URL 与 API 路由（`/api/tasks/:id` 中的 `:id`）；
+- `kind: "manual" | "github-webhook" | "scheduler" | "maintenance" | "internal" | "other"`：任务类型；
+- `status: "pending" | "running" | "succeeded" | "failed" | "cancelled" | "skipped"`：任务当前状态；
+- `created_at: number`：创建时间，Unix 秒；
+- `started_at?: number | null`：实际开始执行时间；
+- `finished_at?: number | null`：到达终态时间；
+- `updated_at?: number | null`：最近一次状态更新时间；
+- `summary?: string | null`：用于列表展示的简短摘要，如 “3/5 units succeeded”；
+- `trigger: { ... }`：触发元数据，字段建议为：
+  - `source: "manual" | "webhook" | "scheduler" | "maintenance" | "cli" | "system"`；
+  - `request_id?: string | null`：对应 `event_log.request_id`；
+  - `path?: string | null`：来源 HTTP 路径或 CLI 命令标识；
+  - `caller?: string | null`：手工触发时的 caller 信息；
+  - `reason?: string | null`：手工/调度任务的理由说明；
+  - `scheduler_iteration?: number | null`：由 scheduler 触发时的 iteration 序号；
+- `units: TaskUnitSummary[]`：unit 维度摘要列表：
+  - `unit: string`：systemd unit 名，例如 `svc-alpha.service`；
+  - `slug?: string`：短标识（如 `svc-alpha`），用于 UI；
+  - `display_name?: string`：可选的人类可读名称；
+  - `status: TaskStatus`：与 Task 状态词汇一致；
+  - `phase?: "queued" | "pulling-image" | "restarting" | "waiting" | "verifying" | "done"`：可选阶段提示，仅用于 UX；
+  - `started_at?: number | null`、`finished_at?: number | null`、`duration_ms?: number | null`；
+  - `message?: string | null`：简要说明；
+  - `error?: string | null`：失败或中断时的错误字符串；
+- `unit_counts: { total_units, succeeded, failed, cancelled, running, pending, skipped }`：unit 数量统计，用于列表摘要；
+- `can_stop: boolean`：是否展示“停止任务”按钮；
+- `can_force_stop: boolean`：是否展示“强制停止”按钮；
+- `can_retry: boolean`：是否允许从该任务创建重试任务；
+- `is_long_running?: boolean`：是否视为“长耗时任务”，前端可据此默认打开抽屉；
+- `retry_of?: string | null`：若为重试任务，则指向原任务的 `task_id`。
+
+### 9.2 Task 日志实体
+
+详情端点在 Task 对象基础上附带日志数组：
+
+- `TaskLogEntry`：
+  - `id: number`：日志在任务内部的序号；
+  - `ts: number`：事件时间（Unix 秒）；
+  - `level: "info" | "warning" | "error"`：日志等级；
+  - `action: string`：高层动作名，如 `task-created`、`image-pull`、`restart-unit`；
+  - `status: TaskStatus`：该步骤对应的状态；
+  - `summary: string`：用于时间线展示的短描述；
+  - `unit?: string | null`：可选的关联 unit 名；
+  - `meta?: unknown`：原始元数据，供 JSON 查看器使用。
+
+详情响应形状：
+
+```jsonc
+{
+  // Task 全量字段
+  "id": 1,
+  "task_id": "tsk_xxxxx",
+  "kind": "manual",
+  "status": "running",
+  // ...
+  "logs": [
+    {
+      "id": 1,
+      "ts": 1700000000,
+      "level": "info",
+      "action": "task-created",
+      "status": "running",
+      "summary": "Manual task accepted from UI",
+      "unit": null,
+      "meta": { "caller": "ops" }
+    }
+  ]
+}
+```
+
+### 9.3 API 端点与请求/响应
+
+#### 9.3.1 `GET /api/tasks`
+
+- 查询参数：
+  - `page: number`：页码，从 1 开始；
+  - `per_page: number`（或 `limit`）：每页条数，前端默认 20；
+  - `status?: TaskStatus`：按任务状态过滤；
+  - `kind?: TaskKind`（别名 `type`）：按任务类型过滤；
+  - `unit?: string`（别名 `unit_query`）：按 unit/slug/display_name 模糊匹配。
+- 返回体（与前端 `TasksListResponse` 对齐）：
+
+```jsonc
+{
+  "tasks": [ /* Task[]，字段如上 */ ],
+  "total": 42,
+  "page": 1,
+  "page_size": 20,
+  "has_next": true
+}
+```
+
+#### 9.3.2 `GET /api/tasks/:id`
+
+- 路由参数：
+  - `:id` 为 `task_id`（字符串），而非内部自增 `id`。
+- 返回体：
+  - `TaskDetailResponse = Task & { logs: TaskLogEntry[] }`，如上所述。
+
+#### 9.3.3 `POST /api/tasks`
+
+- 用途：由前端在 Manual/Maintenance 等页面创建长耗时任务。
+- 请求体（与 mock `CreateTaskBody` 对齐）：
+
+```jsonc
+{
+  "kind": "manual",              // 可选，默认 manual
+  "source": "manual",            // 可选，默认 manual
+  "units": ["svc-alpha.service"],// 关联 unit 列表，至少一个
+  "caller": "ops-nightly",       // 可选
+  "reason": "nightly rollout",   // 可选
+  "path": "/api/manual/trigger", // 可选，来源路径
+  "is_long_running": true        // 可选，默认为 true
+}
+```
+
+- 响应体（轻量确认结构）：
+
+```jsonc
+{
+  "task_id": "tsk_xxxxx",
+  "is_long_running": true,
+  "kind": "manual",
+  "status": "running"
+}
+```
+
+前端收到 `task_id` 后会自动打开抽屉并开始轮询 `/api/tasks/:id`。
+
+#### 9.3.4 `POST /api/tasks/:id/stop`
+
+- 语义：优雅停止任务（若仍在运行）。
+- 行为建议：
+  - 若任务为 `running`：
+    - 后端尝试优雅停止，对应 systemd unit 可发送 SIGTERM 或等价操作；
+    - 将任务状态更新为 `cancelled`，填充 `finished_at` 与 `summary`；
+    - 写入一条 `task-cancelled` 日志行；
+  - 若任务已处于终态：
+    - 不改变状态，仅追加一条 `task-stop-noop` 日志。
+- 响应体：更新后的 `TaskDetailResponse`。
+- 错误：
+  - `404`：任务不存在；
+  - `401`：未通过 ForwardAuth 管控。
+
+#### 9.3.5 `POST /api/tasks/:id/force-stop`
+
+- 语义：强制终止任务。
+- 行为建议：
+  - 对 `running` 任务执行更强硬的终止动作（例如 `systemctl stop` 或等价信号），并将状态更新为 `failed`，追加 `task-force-killed` 日志；
+  - 对终态任务只追加 `task-force-stop-noop` 日志。
+- 响应体：更新后的 `TaskDetailResponse`。
+
+#### 9.3.6 `POST /api/tasks/:id/retry`
+
+- 语义：从终态任务创建重试任务。
+- 行为建议：
+  - 仅允许在原任务状态为 `succeeded` / `failed` / `cancelled` / `skipped` 时调用；
+  - 新建一个 Task 记录：
+    - `retry_of` 指向原任务 `task_id`；
+    - 状态初始为 `pending` 或 `running`；
+    - `units` 由原任务复制，但所有 unit 状态重置为 `pending`；
+  - 在原任务的日志中追加 `task-retried` 记录。
+- 返回体：新建任务的 `TaskDetailResponse`。
+- 错误：
+  - `409`：当原任务处于 `running` / `pending` 时拒绝重试；
+  - `404`：任务不存在。
+
+### 9.4 与 `event_log` 的关联关系
+
+- 建议在 `event_log` 表中增加任务维度：
+  - 方案一（推荐）：在表结构中增加 `task_id` 字段，指向 Task 表的业务主键；
+  - 方案二：继续沿用 `meta` JSON，将 `task_id` 写入 `meta.task_id`。
+- 关联原则：
+  - 对于由 Task 驱动的 HTTP/CLI 操作，应在 `event_log` 中记录相同的 `task_id`；
+  - Task 详情接口可返回：
+    - 直接嵌入日志时间线（如 TaskLogEntry）；
+    - 或提供查询条件（如 `request_id`/`task_id`），由前端跳转到 Events 页面进行深度分析。
+
+### 9.5 状态机约定（建议）
+
+- 任务级状态迁移：
+  - `pending -> running -> {succeeded, failed, cancelled, skipped}`；
+  - `pending -> cancelled`：任务尚未开始就被取消；
+  - 终态一旦写入不得回退，仅允许补充 `summary` 与日志。
+- unit 级状态迁移遵循相同词汇，但允许更细粒度的 `phase`：
+  - 典型路径：`queued -> pulling-image -> restarting -> done`（成功）；
+  - 或：`queued -> verifying -> failed`（失败）。
+
+以上合约在不限制具体持久化实现的前提下，为前后端协同提供统一参考；后端实现时只要满足字段与语义约束，即可与当前 Tasks 页面与 Mock 行为保持一致。

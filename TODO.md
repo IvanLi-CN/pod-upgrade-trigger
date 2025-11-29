@@ -21,7 +21,7 @@
 
 ## Future Enhancements
 
-- [ ] Optional auto-discovery of webhook-capable systemd units:
+- [x] Optional auto-discovery of webhook-capable systemd units:
   - When enabled via a dedicated flag/env (e.g. `PODUP_AUTO_DISCOVER=1`), scan systemd units by naming convention or explicit marker (such as `X-Webhook-Enabled=yes`) to build the GitHub Webhooks list instead of (or in addition to) `PODUP_MANUAL_UNITS`.
   - Keep the current explicit list as the default/safe behavior; auto-discovery should be opt-in and clearly documented.
 
@@ -57,7 +57,11 @@
   - On successful creation, automatically open the corresponding task drawer and start polling its detail.
   - Adjust existing UI flows (where appropriate) to guide users from Events/Webhooks/Maintenance into the Tasks view when they need task-centric insights.
 
-- [ ] Backend contract shaping based on frontend experience
+- [x] Backend contract shaping based on frontend experience
   - From the stabilized frontend + mock behavior, extract a concrete Task entity and API contract proposal.
   - Document expected fields, status transitions, and relationships to `event_log` (including how logs are queried per task).
   - Capture any additional fields discovered during UX trials (e.g. richer summaries, counters, or hints for graceful vs force stop).
+
+- [x] Complete MSW mocks for task APIs
+  - Implement `/api/tasks` list, `/api/tasks/:id` detail, and `/api/tasks/:id/{stop,force-stop,retry}` handlers with realistic fixture data.
+  - Ensure `/tasks` 页面在 mock 模式下有可用的列表数据与抽屉详情，便于前端自测。

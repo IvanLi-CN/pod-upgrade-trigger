@@ -68,6 +68,7 @@ const ENV_FWD_AUTH_NICKNAME_HEADER: &str = "PODUP_FWD_AUTH_NICKNAME_HEADER";
 const ENV_ADMIN_MODE_NAME: &str = "PODUP_ADMIN_MODE_NAME";
 const ENV_DEV_OPEN_ADMIN: &str = "PODUP_DEV_OPEN_ADMIN";
 const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
+const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -251,6 +252,16 @@ fn public_base_url() -> Option<String> {
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| {
+            let value = v.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 fn manual_auto_update_unit() -> String {
@@ -2235,7 +2246,7 @@ fn discovered_unit_detail() -> Vec<(String, String)> {
     }
 }
 
-fn manual_unit_list() -> Vec<String> {
+fn manual_env_unit_list() -> Vec<String> {
     let mut units = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -2253,6 +2264,13 @@ fn manual_unit_list() -> Vec<String> {
         }
     }
 
+    units
+}
+
+fn manual_unit_list() -> Vec<String> {
+    let mut units = manual_env_unit_list();
+    let mut seen: HashSet<String> = units.iter().cloned().collect();
+
     for unit in discovered_unit_list() {
         if seen.insert(unit.clone()) {
             units.push(unit);
@@ -2260,6 +2278,14 @@ fn manual_unit_list() -> Vec<String> {
     }
 
     units
+}
+
+fn webhook_unit_list() -> Vec<String> {
+    if env_flag(ENV_AUTO_DISCOVER) {
+        manual_unit_list()
+    } else {
+        manual_env_unit_list()
+    }
 }
 
 fn resolve_unit_identifier(raw: &str) -> Option<String> {
@@ -3129,7 +3155,7 @@ fn handle_webhooks_status(ctx: &RequestContext) -> Result<(), String> {
 
     let mut units: HashMap<String, UnitStatusAgg> = HashMap::new();
 
-    for unit in manual_unit_list() {
+    for unit in webhook_unit_list() {
         units
             .entry(unit.clone())
             .or_insert_with(|| UnitStatusAgg::new(unit));

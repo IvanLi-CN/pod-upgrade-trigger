@@ -39,6 +39,12 @@ web/
 - GET `/sse/hello`（单次 hello，可模拟错误）
 - GET `/api/settings`
 - GET `/api/events`（分页 + request_id/path_prefix/status/action 过滤）
+- GET `/api/tasks`（分页 + status/kind/unit 过滤）
+- GET `/api/tasks/:id`（任务详情 + 日志）
+- POST `/api/tasks`（创建临时/长耗时任务，返回 `task_id`）
+- POST `/api/tasks/:id/stop`（优雅停止任务）
+- POST `/api/tasks/:id/force-stop`（强制停止任务）
+- POST `/api/tasks/:id/retry`（从终态任务创建重试任务）
 - GET `/api/manual/services`
 - POST `/api/manual/trigger`
 - POST `/api/manual/services/:slug`
@@ -89,6 +95,7 @@ web/
 ## 8. 验证清单
 
 - [ ] 无后端进程时，全部页面加载正常。
+- [ ] `/tasks` 页面在 mock 模式下可以正常列出任务、打开详情抽屉，并通过 stop/force-stop/retry 按钮更新状态与时间线。
 - [ ] 场景切换后数据与状态同步变化；空态/异常态表现正确。
 - [ ] 未实现接口会在控制台提示，但不阻断页面。
 - [ ] E2E/CI 可在 mock 模式稳定运行。
