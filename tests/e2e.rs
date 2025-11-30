@@ -83,18 +83,19 @@ async fn scenario_webhook_auto_discovery_toggle() -> AnyResult<()> {
     )?;
 
     // Auto-discovery disabled (default): webhooks list should only include manual/env units.
-    let disabled = env.send_request_with_env(
-        HttpRequest::get("/api/webhooks/status"),
-        |cmd| {
-            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
-        },
-    )?;
+    let disabled = env.send_request_with_env(HttpRequest::get("/api/webhooks/status"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+    })?;
     assert_eq!(disabled.status, 200);
     let body = disabled.json_body()?;
     let units = body["units"].as_array().unwrap();
     let unit_names: Vec<String> = units
         .iter()
-        .filter_map(|u| u.get("unit").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .filter_map(|u| {
+            u.get("unit")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
     assert!(
         !unit_names.iter().any(|u| u == "svc-gamma.service"),
@@ -106,19 +107,20 @@ async fn scenario_webhook_auto_discovery_toggle() -> AnyResult<()> {
     );
 
     // Auto-discovery enabled: webhooks list should include discovered units.
-    let enabled = env.send_request_with_env(
-        HttpRequest::get("/api/webhooks/status"),
-        |cmd| {
-            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
-            cmd.env("PODUP_AUTO_DISCOVER", "1");
-        },
-    )?;
+    let enabled = env.send_request_with_env(HttpRequest::get("/api/webhooks/status"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        cmd.env("PODUP_AUTO_DISCOVER", "1");
+    })?;
     assert_eq!(enabled.status, 200);
     let body = enabled.json_body()?;
     let units = body["units"].as_array().unwrap();
     let unit_names: Vec<String> = units
         .iter()
-        .filter_map(|u| u.get("unit").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .filter_map(|u| {
+            u.get("unit")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
     assert!(
         unit_names.iter().any(|u| u == "svc-gamma.service"),
