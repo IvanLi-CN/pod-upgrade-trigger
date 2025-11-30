@@ -331,7 +331,7 @@ async fn scenario_manual_api() -> AnyResult<()> {
     )?;
     assert_eq!(service.status, 202);
     let service_json = service.json_body()?;
-    assert_eq!(service_json["status"], Value::from("triggered"));
+    assert_eq!(service_json["status"], Value::from("pending"));
 
     let log_lines = env.read_mock_log()?;
     assert!(

@@ -529,6 +529,15 @@ Task 对象（列表与详情中的核心单元）建议包含：
     - 直接嵌入日志时间线（如 TaskLogEntry）；
     - 或提供查询条件（如 `request_id`/`task_id`），由前端跳转到 Events 页面进行深度分析。
 
+在当前实现中：
+
+- HTTP 入口：
+  - GitHub Webhook、手动触发 API（`/api/manual/*`）、`/auto-update`、scheduler loop 以及 `POST /api/prune-state` 都会创建 Task，并由 `run-task <task_id>` 统一执行底层的 `systemctl`/`podman` 命令；
+  - `/api/prune-state` 在同步返回清理结果的同时，也会创建一个 `kind = "maintenance"` 的 Task 用于在任务面板中追踪本次清理。
+- CLI 入口：
+  - `trigger-units` / `trigger-all` 在非 `--dry-run` 模式下，会创建 `kind = "manual"`、`source = "cli"` 的 Task，并在同一进程内通过 `run-task <task_id>` 执行，CLI 输出由 Task 执行结果反推；
+  - `prune-state` 会创建 `kind = "maintenance"`、`source = "cli"` 的 Task，并通过统一的维护任务执行逻辑完成清理。
+
 ### 9.5 状态机约定（建议）
 
 - 任务级状态迁移：
