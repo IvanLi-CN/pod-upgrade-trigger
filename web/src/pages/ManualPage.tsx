@@ -32,6 +32,17 @@ type ManualTriggerResponse = {
   task_id?: string | null
 }
 
+type ServiceTriggerResponse = {
+  unit: string
+  status: string
+  message?: string | null
+  dry_run?: boolean
+  caller?: string | null
+  reason?: string | null
+  image?: string | null
+  task_id?: string | null
+}
+
 type ManualHistoryEntry = {
   id: string
   requestId?: string
@@ -99,7 +110,10 @@ export default function ManualPage() {
       }
       const response = await postJson<ManualTriggerResponse>('/api/manual/trigger', body)
       const ok = response.triggered.every(
-        (r) => r.status === 'triggered' || r.status === 'dry-run',
+        (r) =>
+          r.status === 'triggered' ||
+          r.status === 'dry-run' ||
+          r.status === 'pending',
       )
       pushToast({
         variant: ok ? 'success' : 'warning',
@@ -108,33 +122,14 @@ export default function ManualPage() {
       })
       pushHistory(response, `trigger-all (${response.triggered.length})`)
 
-      if (!response.dry_run) {
-        try {
-          type CreateTaskResponse = {
-            task_id: string
-            is_long_running?: boolean
-          }
-          const task = await postJson<CreateTaskResponse>('/api/tasks', {
-            kind: 'manual',
-            source: 'manual',
-            units: services.map((svc) => svc.unit),
-            caller: body.caller ?? null,
-            reason: body.reason ?? null,
-            path: '/api/manual/trigger',
-            is_long_running: true,
-          })
-          if (task?.task_id) {
-            pushToast({
-              variant: 'info',
-              title: '已创建任务',
-              message: '已在当前页面打开任务抽屉以跟踪本次触发。',
-            })
-            setTaskDrawerInitialTaskId(task.task_id)
-            setTaskDrawerVisible(true)
-          }
-        } catch {
-          // 忽略任务创建失败，只保留原有触发结果
-        }
+      if (!response.dry_run && response.task_id) {
+        pushToast({
+          variant: 'info',
+          title: '已创建任务',
+          message: '已在当前页面打开任务抽屉以跟踪本次触发。',
+        })
+        setTaskDrawerInitialTaskId(response.task_id)
+        setTaskDrawerVisible(true)
       }
     } catch (error) {
       const message =
@@ -154,7 +149,7 @@ export default function ManualPage() {
     params: { dryRun: boolean; image?: string; caller?: string; reason?: string },
   ) => {
     try {
-      const response = await postJson<Record<string, unknown>>(
+      const response = await postJson<ServiceTriggerResponse>(
         `/api/manual/services/${encodeURIComponent(service.slug)}`,
         {
           dry_run: params.dryRun,
@@ -164,7 +159,9 @@ export default function ManualPage() {
         },
       )
       const ok =
-        response?.status === 'triggered' || response?.status === 'dry-run'
+        response?.status === 'triggered' ||
+        response?.status === 'dry-run' ||
+        response?.status === 'pending'
       pushToast({
         variant: ok ? 'success' : 'warning',
         title: ok ? '单元触发成功' : '单元触发失败',
@@ -172,33 +169,14 @@ export default function ManualPage() {
       })
       pushHistory(response, `trigger-unit ${service.unit}`)
 
-      if (!params.dryRun) {
-        try {
-          type CreateTaskResponse = {
-            task_id: string
-            is_long_running?: boolean
-          }
-          const task = await postJson<CreateTaskResponse>('/api/tasks', {
-            kind: 'manual',
-            source: 'manual',
-            units: [service.unit],
-            caller: params.caller?.trim() || undefined,
-            reason: params.reason?.trim() || undefined,
-            path: `/api/manual/services/${service.slug}`,
-            is_long_running: true,
-          })
-          if (task?.task_id) {
-            pushToast({
-              variant: 'info',
-              title: '已创建任务',
-              message: '已在当前页面打开任务抽屉以跟踪本次触发。',
-            })
-            setTaskDrawerInitialTaskId(task.task_id)
-            setTaskDrawerVisible(true)
-          }
-        } catch {
-          // 忽略任务创建失败，只保留原有触发结果
-        }
+      if (!params.dryRun && response.task_id) {
+        pushToast({
+          variant: 'info',
+          title: '已创建任务',
+          message: '已在当前页面打开任务抽屉以跟踪本次触发。',
+        })
+        setTaskDrawerInitialTaskId(response.task_id)
+        setTaskDrawerVisible(true)
       }
     } catch (error) {
       const message =
@@ -593,7 +571,6 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
         return 'badge-neutral'
       case 'skipped':
         return 'badge-ghost'
-      case 'pending':
       default:
         return 'badge-warning'
     }

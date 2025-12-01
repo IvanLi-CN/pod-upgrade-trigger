@@ -3178,6 +3178,17 @@ struct PruneStateRequest {
     dry_run: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct PruneStateResponse {
+    tokens_removed: usize,
+    locks_removed: usize,
+    legacy_dirs_removed: usize,
+    dry_run: bool,
+    max_age_hours: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct UnitActionResult {
     unit: String,
@@ -4963,9 +4974,9 @@ fn trigger_units(units: &[String], dry_run: bool) -> Vec<UnitActionResult> {
 }
 
 fn all_units_ok(results: &[UnitActionResult]) -> bool {
-    results
-        .iter()
-        .all(|r| r.status == "triggered" || r.status == "dry-run")
+    results.iter().all(|r| {
+        r.status == "triggered" || r.status == "dry-run" || r.status == "pending"
+    })
 }
 
 fn trigger_single_unit(unit: &str, dry_run: bool) -> UnitActionResult {
@@ -5367,14 +5378,16 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
 
     match result {
         Ok(report) => {
-            let response = json!({
-                "tokens_removed": report.tokens_removed,
-                "locks_removed": report.locks_removed,
-                "legacy_dirs_removed": report.legacy_dirs_removed,
-                "dry_run": dry_run,
-                "max_age_hours": max_age_hours,
-            });
-            respond_json(ctx, 200, "OK", &response, "prune-state-api", None)?;
+            let response = PruneStateResponse {
+                tokens_removed: report.tokens_removed,
+                locks_removed: report.locks_removed,
+                legacy_dirs_removed: report.legacy_dirs_removed,
+                dry_run,
+                max_age_hours,
+                task_id,
+            };
+            let payload = serde_json::to_value(&response).map_err(|e| e.to_string())?;
+            respond_json(ctx, 200, "OK", &payload, "prune-state-api", None)?;
             Ok(())
         }
         Err(err) => {
@@ -5533,8 +5546,15 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     let head_only = ctx.method == "HEAD";
 
     let relative = match ctx.path.as_str() {
-        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/maintenance"
-        | "/settings" | "/401" => PathBuf::from("index.html"),
+        "/"
+        | "/index.html"
+        | "/manual"
+        | "/webhooks"
+        | "/events"
+        | "/tasks"
+        | "/maintenance"
+        | "/settings"
+        | "/401" => PathBuf::from("index.html"),
         path if path.starts_with("/assets/") => match sanitize_frontend_path(path) {
             Some(p) => p,
             None => return Ok(false),

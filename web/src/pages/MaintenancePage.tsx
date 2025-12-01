@@ -54,6 +54,7 @@ export default function MaintenancePage() {
       legacy_dirs_removed?: number
       dry_run?: boolean
       max_age_hours?: number
+      task_id?: string | null
     }
     try {
       const maxAge = Number(maxAgeHours) || 24
@@ -67,30 +68,13 @@ export default function MaintenancePage() {
         message: `tokens=${result.tokens_removed ?? 0}, locks=${result.locks_removed ?? 0}`,
       })
 
-      try {
-        type CreateTaskResponse = {
-          task_id: string
-          is_long_running?: boolean
-        }
-        const task = await postJson<CreateTaskResponse>('/api/tasks', {
-          kind: 'maintenance',
-          source: 'manual',
-          units: ['state-prune'],
-          caller: null,
-          reason: `prune state <= ${maxAge}h`,
-          path: '/api/prune-state',
-          is_long_running: true,
+      if (result.task_id) {
+        pushToast({
+          variant: 'info',
+          title: '已创建维护任务',
+          message: '正在 /tasks 中跟踪清理进度。',
         })
-        if (task?.task_id) {
-          pushToast({
-            variant: 'info',
-            title: '已创建维护任务',
-            message: '正在 /tasks 中跟踪清理进度。',
-          })
-          navigate(`/tasks?task_id=${encodeURIComponent(task.task_id)}`)
-        }
-      } catch {
-        // 忽略任务创建失败，只保留原有清理结果
+        navigate(`/tasks?task_id=${encodeURIComponent(result.task_id)}`)
       }
     } catch (err) {
       const message =

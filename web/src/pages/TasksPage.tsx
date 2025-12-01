@@ -396,7 +396,7 @@ export default function TasksPage() {
 
           {/* 任务筛选：桌面端一行，label 与控件同一行；移动端整组换行但 label 不换行 */}
           <div className="flex flex-wrap items-center gap-3 text-xs">
-            <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2">
               <span className="whitespace-nowrap text-xs text-base-content/70">
                 状态
               </span>
@@ -413,9 +413,9 @@ export default function TasksPage() {
                 <option value="cancelled">cancelled</option>
                 <option value="skipped">skipped</option>
               </select>
-            </div>
+            </label>
 
-            <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2">
               <span className="whitespace-nowrap text-xs text-base-content/70">
                 类型
               </span>
@@ -432,7 +432,7 @@ export default function TasksPage() {
                 <option value="internal">internal</option>
                 <option value="other">other</option>
               </select>
-            </div>
+            </label>
 
             <div className="flex min-w-[18rem] flex-1 items-center gap-2">
               <span className="whitespace-nowrap text-xs text-base-content/70">

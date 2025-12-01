@@ -435,15 +435,27 @@ const handlers = [
 
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     const services = runtime.cloneData().services
+    const dryRun = Boolean(body.dry_run)
 
-    const triggered = services.map((svc) => ({
-      unit: svc.unit,
-      status: body.dry_run ? 'dry-run' : 'triggered',
-      message: 'ok',
+    const units = services.map((svc) => svc.unit)
+
+    const triggered = units.map((unit) => ({
+      unit,
+      status: dryRun ? 'dry-run' : 'pending',
+      message: dryRun ? 'ok' : 'scheduled via task',
     }))
 
+    const caller =
+      typeof body.caller === 'string' && body.caller.trim()
+        ? body.caller.trim()
+        : null
+    const reason =
+      typeof body.reason === 'string' && body.reason.trim()
+        ? body.reason.trim()
+        : null
+
     const requestId = runtime.addEvent({
-      request_id: body.caller?.toString() ?? `manual-${Date.now()}`,
+      request_id: caller ?? `manual-${Date.now()}`,
       ts: Math.floor(Date.now() / 1000),
       method: 'POST',
       path: '/api/manual/trigger',
@@ -453,13 +465,31 @@ const handlers = [
       meta: body,
     }).request_id
 
-    return HttpResponse.json({
-      triggered,
-      dry_run: Boolean(body.dry_run),
-      request_id: requestId,
-      caller: body.caller ?? null,
-      reason: body.reason ?? null,
-    }, { headers: JSON_HEADERS })
+    let taskId: string | null = null
+    if (!dryRun) {
+      const task = runtime.createAdHocTask({
+        kind: 'manual',
+        source: 'manual',
+        units,
+        caller,
+        reason,
+        path: '/api/manual/trigger',
+        is_long_running: true,
+      })
+      taskId = task.task_id
+    }
+
+    return HttpResponse.json(
+      {
+        triggered,
+        dry_run: dryRun,
+        request_id: requestId,
+        caller,
+        reason,
+        task_id: taskId,
+      },
+      { headers: JSON_HEADERS },
+    )
   }),
 
   http.post('/api/manual/services/:slug', async ({ params, request }) => {
@@ -476,24 +506,54 @@ const handlers = [
       return HttpResponse.json({ error: 'service not found' }, { status: 404 })
     }
 
-    const status = body.dry_run ? 'dry-run' : 'triggered'
+    const dryRun = Boolean(body.dry_run)
+    const status = dryRun ? 'dry-run' : 'pending'
+
+    const caller =
+      typeof body.caller === 'string' && body.caller.trim()
+        ? body.caller.trim()
+        : null
+    const reason =
+      typeof body.reason === 'string' && body.reason.trim()
+        ? body.reason.trim()
+        : null
 
     runtime.addEvent({
       request_id: makeRequestId(),
       ts: Math.floor(Date.now() / 1000),
       method: 'POST',
       path: `/api/manual/services/${service.slug}`,
-      status: body.dry_run ? 202 : 200,
+      status: dryRun ? 202 : 202,
       action: 'manual-trigger',
       duration_ms: 140,
       meta: { service: service.slug, ...body },
     })
 
-    return HttpResponse.json({
-      unit: service.unit,
-      status,
-      request_id: makeRequestId(),
-    }, { headers: JSON_HEADERS })
+    let taskId: string | null = null
+    if (!dryRun) {
+      const task = runtime.createAdHocTask({
+        kind: 'manual',
+        source: 'manual',
+        units: [service.unit],
+        caller,
+        reason,
+        path: `/api/manual/services/${service.slug}`,
+        is_long_running: true,
+      })
+      taskId = task.task_id
+    }
+
+    return HttpResponse.json(
+      {
+        unit: service.unit,
+        status,
+        request_id: makeRequestId(),
+        caller,
+        reason,
+        task_id: taskId,
+      },
+      { headers: JSON_HEADERS },
+    )
   }),
 
   http.get('/api/webhooks/status', async ({ request }) => {
@@ -558,16 +618,34 @@ const handlers = [
 
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
     const maxAge = Number(body.max_age_hours) || 24
+    const dryRun = Boolean(body.dry_run)
 
     runtime.updateLocks([])
 
-    return HttpResponse.json({
-      tokens_removed: 4,
-      locks_removed: 3,
-      legacy_dirs_removed: 1,
-      dry_run: Boolean(body.dry_run),
-      max_age_hours: maxAge,
-    }, { headers: JSON_HEADERS })
+    let taskId: string | null = null
+    try {
+      const task = runtime.createAdHocTask({
+        kind: 'maintenance',
+        source: 'maintenance',
+        units: ['state-prune'],
+        is_long_running: true,
+      })
+      taskId = task.task_id
+    } catch {
+      // If task creation fails in mock mode, still return prune result without task_id.
+    }
+
+    return HttpResponse.json(
+      {
+        tokens_removed: 4,
+        locks_removed: 3,
+        legacy_dirs_removed: 1,
+        dry_run: dryRun,
+        max_age_hours: maxAge,
+        task_id: taskId,
+      },
+      { headers: JSON_HEADERS },
+    )
   }),
 
   http.get('/last_payload.bin', async ({ request }) => {
