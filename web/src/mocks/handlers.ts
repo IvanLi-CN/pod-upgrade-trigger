@@ -305,7 +305,7 @@ const handlers = [
       })
     }
 
-    const updated = runtime.getTask(taskId)!
+    const updated = runtime.getTask(taskId) ?? existing
     const logs = runtime.getTaskLogs(taskId)
     const response: TaskDetailResponse = {
       ...updated,
@@ -361,7 +361,7 @@ const handlers = [
       })
     }
 
-    const updated = runtime.getTask(taskId)!
+    const updated = runtime.getTask(taskId) ?? existing
     const logs = runtime.getTaskLogs(taskId)
     const response: TaskDetailResponse = {
       ...updated,

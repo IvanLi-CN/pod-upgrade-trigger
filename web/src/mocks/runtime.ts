@@ -798,7 +798,6 @@ class RuntimeStore {
     }
   }
 
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: used in constructor
   #profileFromQuery(): MockProfile | null {
     if (typeof window === 'undefined') return null
     const all = new URLSearchParams(window.location.search).getAll('mock')
@@ -810,7 +809,6 @@ class RuntimeStore {
     return value ?? null
   }
 
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: used in constructor
   #readStorage(key: string): string | null {
     if (typeof window === 'undefined') return null
     try {

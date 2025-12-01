@@ -32,13 +32,25 @@ export default function DaisyLabPage() {
 
       <Section title="Buttons & Badges">
         <div className="flex flex-wrap items-center gap-2">
-          <button className="btn btn-primary btn-sm">Primary</button>
-          <button className="btn btn-secondary btn-sm">Secondary</button>
-          <button className="btn btn-accent btn-sm">Accent</button>
-          <button className="btn btn-outline btn-sm">Outline</button>
-          <button className="btn btn-ghost btn-sm">Ghost</button>
-          <button className="btn btn-link btn-sm">Link</button>
-          <button className="btn btn-disabled btn-sm" disabled>
+          <button className="btn btn-primary btn-sm" type="button">
+            Primary
+          </button>
+          <button className="btn btn-secondary btn-sm" type="button">
+            Secondary
+          </button>
+          <button className="btn btn-accent btn-sm" type="button">
+            Accent
+          </button>
+          <button className="btn btn-outline btn-sm" type="button">
+            Outline
+          </button>
+          <button className="btn btn-ghost btn-sm" type="button">
+            Ghost
+          </button>
+          <button className="btn btn-link btn-sm" type="button">
+            Link
+          </button>
+          <button className="btn btn-disabled btn-sm" type="button" disabled>
             Disabled
           </button>
           <span className="badge badge-primary">primary</span>
@@ -87,10 +99,17 @@ export default function DaisyLabPage() {
 
           <div className="flex flex-wrap items-center gap-4">
             <div className="form-control w-40">
-              <label className="label">
+              <label className="label" htmlFor="range-demo">
                 <span className="label-text">Range</span>
               </label>
-              <input type="range" min="0" max="100" defaultValue="40" className="range range-primary" />
+              <input
+                id="range-demo"
+                type="range"
+                min="0"
+                max="100"
+                defaultValue="40"
+                className="range range-primary"
+              />
             </div>
             <progress className="progress progress-accent w-40" value="60" max="100"></progress>
             <div className="radial-progress text-secondary" style={{ '--value': 75 } as CSSProperties}>
@@ -104,55 +123,87 @@ export default function DaisyLabPage() {
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           <div>
             <p className="mb-2 text-xs text-base-content/70">Default</p>
-            <div className="tabs">
-              <a className="tab tab-active">Alpha</a>
-              <a className="tab">Beta</a>
-              <a className="tab tab-disabled">Disabled</a>
+            <div className="tabs" role="tablist">
+              <button className="tab tab-active" type="button" role="tab">
+                Alpha
+              </button>
+              <button className="tab" type="button" role="tab">
+                Beta
+              </button>
+              <button className="tab tab-disabled" type="button" role="tab" disabled aria-disabled="true">
+                Disabled
+              </button>
             </div>
           </div>
 
           <div>
             <p className="mb-2 text-xs text-base-content/70">Boxed</p>
-            <div className="tabs tabs-box">
-              <a className="tab tab-active">Boxed</a>
-              <a className="tab">Idle</a>
-              <a className="tab">Ghost</a>
+            <div className="tabs tabs-box" role="tablist">
+              <button className="tab tab-active" type="button" role="tab">
+                Boxed
+              </button>
+              <button className="tab" type="button" role="tab">
+                Idle
+              </button>
+              <button className="tab" type="button" role="tab">
+                Ghost
+              </button>
             </div>
           </div>
 
           <div>
             <p className="mb-2 text-xs text-base-content/70">Lift</p>
-            <div className="tabs tabs-lift">
-              <a className="tab">One</a>
-              <a className="tab tab-active">Two</a>
-              <a className="tab">Three</a>
+            <div className="tabs tabs-lift" role="tablist">
+              <button className="tab" type="button" role="tab">
+                One
+              </button>
+              <button className="tab tab-active" type="button" role="tab">
+                Two
+              </button>
+              <button className="tab" type="button" role="tab">
+                Three
+              </button>
             </div>
           </div>
 
           <div>
             <p className="mb-2 text-xs text-base-content/70">Border (underline)</p>
-            <div className="tabs tabs-border">
-              <a className="tab tab-active">Active</a>
-              <a className="tab">Idle</a>
-              <a className="tab">Hover</a>
+            <div className="tabs tabs-border" role="tablist">
+              <button className="tab tab-active" type="button" role="tab">
+                Active
+              </button>
+              <button className="tab" type="button" role="tab">
+                Idle
+              </button>
+              <button className="tab" type="button" role="tab">
+                Hover
+              </button>
             </div>
           </div>
 
           <div>
             <p className="mb-2 text-xs text-base-content/70">Tabs Top (with content)</p>
-            <div className="tabs tabs-top w-full">
-              <a className="tab tab-active">First</a>
-              <a className="tab">Second</a>
+            <div className="tabs tabs-top w-full" role="tablist">
+              <button className="tab tab-active" type="button" role="tab" aria-selected="true">
+                First
+              </button>
+              <button className="tab" type="button" role="tab" aria-selected="false">
+                Second
+              </button>
               <div className="tab-content bg-base-100 p-3">Top tab content shows here.</div>
             </div>
           </div>
 
           <div>
             <p className="mb-2 text-xs text-base-content/70">Tabs Bottom (with content)</p>
-            <div className="tabs tabs-bottom w-full">
+            <div className="tabs tabs-bottom w-full" role="tablist">
               <div className="tab-content bg-base-100 p-3">Bottom tab content shows here.</div>
-              <a className="tab tab-active">Summary</a>
-              <a className="tab">History</a>
+              <button className="tab tab-active" type="button" role="tab" aria-selected="true">
+                Summary
+              </button>
+              <button className="tab" type="button" role="tab" aria-selected="false">
+                History
+              </button>
             </div>
           </div>
 
@@ -160,44 +211,44 @@ export default function DaisyLabPage() {
             <p className="mb-2 text-xs text-base-content/70">Sizes</p>
             <div className="flex flex-wrap gap-3">
               <div className="tabs tabs-lift tabs-xs" role="tablist">
-                <a className="tab tab-active" role="tab">
+                <button className="tab tab-active" type="button" role="tab" aria-selected="true">
                   xs
-                </a>
-                <a className="tab" role="tab">
+                </button>
+                <button className="tab" type="button" role="tab" aria-selected="false">
                   tab
-                </a>
+                </button>
               </div>
               <div className="tabs tabs-lift tabs-sm" role="tablist">
-                <a className="tab tab-active" role="tab">
+                <button className="tab tab-active" type="button" role="tab" aria-selected="true">
                   sm
-                </a>
-                <a className="tab" role="tab">
+                </button>
+                <button className="tab" type="button" role="tab" aria-selected="false">
                   tab
-                </a>
+                </button>
               </div>
               <div className="tabs tabs-lift tabs-md" role="tablist">
-                <a className="tab tab-active" role="tab">
+                <button className="tab tab-active" type="button" role="tab" aria-selected="true">
                   md
-                </a>
-                <a className="tab" role="tab">
+                </button>
+                <button className="tab" type="button" role="tab" aria-selected="false">
                   tab
-                </a>
+                </button>
               </div>
               <div className="tabs tabs-lift tabs-lg" role="tablist">
-                <a className="tab tab-active" role="tab">
+                <button className="tab tab-active" type="button" role="tab" aria-selected="true">
                   lg
-                </a>
-                <a className="tab" role="tab">
+                </button>
+                <button className="tab" type="button" role="tab" aria-selected="false">
                   tab
-                </a>
+                </button>
               </div>
               <div className="tabs tabs-lift tabs-xl" role="tablist">
-                <a className="tab tab-active" role="tab">
+                <button className="tab tab-active" type="button" role="tab" aria-selected="true">
                   xl
-                </a>
-                <a className="tab" role="tab">
+                </button>
+                <button className="tab" type="button" role="tab" aria-selected="false">
                   tab
-                </a>
+                </button>
               </div>
             </div>
           </div>
@@ -244,7 +295,9 @@ export default function DaisyLabPage() {
               <h2 className="card-title">Simple card</h2>
               <p className="text-sm text-base-content/70">Use to preview typography and padding.</p>
               <div className="card-actions justify-end">
-                <button className="btn btn-primary btn-sm">Action</button>
+                <button className="btn btn-primary btn-sm" type="button">
+                  Action
+                </button>
               </div>
             </div>
           </div>

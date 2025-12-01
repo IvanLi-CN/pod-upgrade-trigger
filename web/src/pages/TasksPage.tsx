@@ -45,7 +45,6 @@ export default function TasksPage() {
         return 'scheduler'
       case 'maintenance':
         return 'maintenance'
-      case 'all':
       default:
         return ''
     }
@@ -225,7 +224,6 @@ export default function TasksPage() {
       case 'internal':
         return 'Internal'
       case 'other':
-      default:
         return 'Other'
     }
   }
@@ -242,7 +240,6 @@ export default function TasksPage() {
         return 'badge-neutral'
       case 'skipped':
         return 'badge-ghost'
-      case 'pending':
       default:
         return 'badge-warning'
     }

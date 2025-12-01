@@ -554,7 +554,6 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
       case 'internal':
         return 'Internal'
       case 'other':
-      default:
         return 'Other'
     }
   }
