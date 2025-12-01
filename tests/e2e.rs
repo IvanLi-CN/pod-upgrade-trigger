@@ -22,6 +22,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_health_db_error().await?;
     scenario_github_webhook().await?;
     scenario_rate_limit_and_prune().await?;
+    scenario_task_prune_retention().await?;
     scenario_manual_api().await?;
     scenario_scheduler_loop().await?;
     scenario_error_paths().await?;
@@ -281,6 +282,195 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
             .iter()
             .any(|row| row.action == "manual-auto-update" && row.status == 202)
     );
+
+    Ok(())
+}
+
+async fn scenario_task_prune_retention() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    let pool = env.connect_db().await?;
+    let now = current_unix_secs() as i64;
+    let old_finished = now - 2 * 3600;
+    let recent_finished = now;
+
+    // Old succeeded task (should be pruned).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("old-succeeded")
+    .bind("manual")
+    .bind("succeeded")
+    .bind(old_finished)
+    .bind(old_finished)
+    .bind(old_finished)
+    .bind("old succeeded task")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)",
+    )
+    .bind("old-succeeded")
+    .bind("svc-old.service")
+    .bind("succeeded")
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO task_logs (task_id, ts, level, action, status, summary) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("old-succeeded")
+    .bind(old_finished)
+    .bind("info")
+    .bind("test-old")
+    .bind("succeeded")
+    .bind("old task log")
+    .execute(&pool)
+    .await?;
+
+    // Recent succeeded task (should be kept).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("recent-succeeded")
+    .bind("manual")
+    .bind("succeeded")
+    .bind(recent_finished)
+    .bind(recent_finished)
+    .bind(recent_finished)
+    .bind("recent succeeded task")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)",
+    )
+    .bind("recent-succeeded")
+    .bind("svc-recent.service")
+    .bind("succeeded")
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO task_logs (task_id, ts, level, action, status, summary) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("recent-succeeded")
+    .bind(recent_finished)
+    .bind("info")
+    .bind("test-recent")
+    .bind("succeeded")
+    .bind("recent task log")
+    .execute(&pool)
+    .await?;
+
+    // Running task (non-terminal status, should be kept).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("running-task")
+    .bind("manual")
+    .bind("running")
+    .bind(now)
+    .bind(now)
+    .bind(Option::<i64>::None)
+    .bind("running task")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    // Terminal status without finished_at (should be kept).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("succeeded-no-finished")
+    .bind("manual")
+    .bind("succeeded")
+    .bind(now)
+    .bind(now)
+    .bind(Option::<i64>::None)
+    .bind("succeeded without finished_at")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    // Run prune-state with a 1 hour task retention window so only the old task is pruned.
+    let mut prune_cmd = env.command();
+    prune_cmd.arg("prune-state");
+    prune_cmd.env("PODUP_TASK_RETENTION_SECS", "3600");
+    let prune_output = env.run_command(prune_cmd)?;
+    assert!(
+        prune_output.status.success(),
+        "prune-state task prune failed: status={} stdout={} stderr={}",
+        prune_output.status,
+        prune_output.stdout,
+        prune_output.stderr
+    );
+
+    // Old succeeded task and its units/logs should be gone.
+    let remaining_old_tasks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'old-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_old_tasks, 0);
+
+    let remaining_old_units: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_units WHERE task_id = 'old-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_old_units, 0);
+
+    let remaining_old_logs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_logs WHERE task_id = 'old-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_old_logs, 0);
+
+    // Recent succeeded task and its units/logs should still exist.
+    let remaining_recent_tasks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'recent-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_recent_tasks, 1);
+
+    let remaining_recent_units: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_units WHERE task_id = 'recent-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_recent_units, 1);
+
+    let remaining_recent_logs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_logs WHERE task_id = 'recent-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_recent_logs, 1);
+
+    // Running and terminal-without-finished tasks should remain.
+    let remaining_running: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'running-task'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_running, 1);
+
+    let remaining_no_finished: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE task_id = 'succeeded-no-finished'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(remaining_no_finished, 1);
 
     Ok(())
 }

@@ -69,6 +69,7 @@ const ENV_ADMIN_MODE_NAME: &str = "PODUP_ADMIN_MODE_NAME";
 const ENV_DEV_OPEN_ADMIN: &str = "PODUP_DEV_OPEN_ADMIN";
 const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
 const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
+const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -799,6 +800,7 @@ fn run_prune_cli(args: &[String]) -> ! {
 
     let retention_secs = retention_secs.max(1);
     let max_age_hours = retention_secs / 3600;
+    let task_retention_secs = task_retention_secs_from_env();
 
     let task_id = match create_cli_maintenance_prune_task(max_age_hours, dry_run) {
         Ok(id) => id,
@@ -811,8 +813,12 @@ fn run_prune_cli(args: &[String]) -> ! {
     match run_maintenance_prune_task(&task_id, retention_secs, dry_run) {
         Ok(report) => {
             println!(
-                "Removed tokens={} legacy_entries={} stale_locks={} dry_run={}",
-                report.tokens_removed, report.legacy_dirs_removed, report.locks_removed, dry_run
+                "Removed tokens={} legacy_entries={} stale_locks={} tasks_pruned={} dry_run={}",
+                report.tokens_removed,
+                report.legacy_dirs_removed,
+                report.locks_removed,
+                report.tasks_removed,
+                dry_run
             );
             record_system_event(
                 "cli-prune-state",
@@ -823,6 +829,8 @@ fn run_prune_cli(args: &[String]) -> ! {
                     "tokens_removed": report.tokens_removed,
                     "legacy_dirs_removed": report.legacy_dirs_removed,
                     "locks_removed": report.locks_removed,
+                    "task_retention_secs": task_retention_secs,
+                    "tasks_removed": report.tasks_removed,
                     "task_id": task_id,
                 }),
             );
@@ -875,7 +883,7 @@ fn print_usage(exe: &str) {
     eprintln!("  scheduler [options]          Run the periodic auto-update trigger");
     eprintln!("  trigger-units <units...>     Restart specific units immediately");
     eprintln!("  trigger-all [options]        Restart all configured units");
-    eprintln!("  prune-state [options]        Clean ratelimit databases and locks");
+    eprintln!("  prune-state [options]        Clean ratelimit databases, locks, and old tasks");
     eprintln!("  run-task <...internal...>    Internal helper invoked via systemd-run");
     eprintln!("  help                         Show this message");
 }
@@ -3898,6 +3906,8 @@ struct PruneStateResponse {
     tokens_removed: usize,
     locks_removed: usize,
     legacy_dirs_removed: usize,
+    tasks_removed: usize,
+    task_retention_secs: u64,
     dry_run: bool,
     max_age_hours: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5845,6 +5855,15 @@ struct StatePruneReport {
     tokens_removed: usize,
     locks_removed: usize,
     legacy_dirs_removed: usize,
+    tasks_removed: usize,
+}
+
+fn task_retention_secs_from_env() -> u64 {
+    env::var(ENV_TASK_RETENTION_SECS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STATE_RETENTION_SECS)
+        .max(1)
 }
 
 fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneReport, String> {
@@ -5921,6 +5940,39 @@ fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneRepor
     }
 
     Ok(report)
+}
+
+fn prune_tasks_older_than(retention_secs: u64, dry_run: bool) -> Result<u64, String> {
+    let now_secs = current_unix_secs();
+    let cutoff_secs = now_secs.saturating_sub(retention_secs.max(1)) as i64;
+
+    if dry_run {
+        with_db(|pool| async move {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tasks \
+                 WHERE finished_at IS NOT NULL \
+                   AND finished_at < ? \
+                   AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')",
+            )
+            .bind(cutoff_secs)
+            .fetch_one(&pool)
+            .await?;
+            Ok::<u64, sqlx::Error>(count as u64)
+        })
+    } else {
+        with_db(|pool| async move {
+            let res = sqlx::query(
+                "DELETE FROM tasks \
+                 WHERE finished_at IS NOT NULL \
+                   AND finished_at < ? \
+                   AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')",
+            )
+            .bind(cutoff_secs)
+            .execute(&pool)
+            .await?;
+            Ok::<u64, sqlx::Error>(res.rows_affected())
+        })
+    }
 }
 
 fn handle_image_locks_api(ctx: &RequestContext) -> Result<(), String> {
@@ -6096,15 +6148,36 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
         .saturating_mul(3600)
         .max(1);
     let max_age_hours = retention_secs / 3600;
+    let task_retention_secs = task_retention_secs_from_env();
     let dry_run = request.dry_run;
 
     let task_id = create_maintenance_prune_task_for_api(max_age_hours, dry_run, ctx).ok();
 
-    let result = if let Some(ref task_id_ref) = task_id {
+    let mut result = if let Some(ref task_id_ref) = task_id {
         run_maintenance_prune_task(task_id_ref, retention_secs, dry_run)
     } else {
         prune_state_dir(Duration::from_secs(retention_secs), dry_run)
     };
+
+    if task_id.is_none() {
+        if let Ok(report) = &mut result {
+            let tasks_removed = match prune_tasks_older_than(task_retention_secs, dry_run) {
+                Ok(count) => count as usize,
+                Err(err) => {
+                    log_message(&format!(
+                        "error task-prune-failed retention_secs={} dry_run={} err={}",
+                        task_retention_secs, dry_run, err
+                    ));
+                    0
+                }
+            };
+            report.tasks_removed = tasks_removed;
+            log_message(&format!(
+                "info task-prune removed {} tasks older than {} seconds dry_run={}",
+                tasks_removed, task_retention_secs, dry_run
+            ));
+        }
+    }
 
     match result {
         Ok(report) => {
@@ -6112,6 +6185,8 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
                 tokens_removed: report.tokens_removed,
                 locks_removed: report.locks_removed,
                 legacy_dirs_removed: report.legacy_dirs_removed,
+                tasks_removed: report.tasks_removed,
+                task_retention_secs,
                 dry_run,
                 max_age_hours,
                 task_id: task_id.clone(),
@@ -6126,6 +6201,8 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
                 Some(json!({
                     "dry_run": dry_run,
                     "max_age_hours": max_age_hours,
+                    "task_retention_secs": task_retention_secs,
+                    "tasks_removed": report.tasks_removed,
                     "task_id": task_id,
                 })),
             )?;
@@ -7796,16 +7873,39 @@ fn run_maintenance_prune_task(
 ) -> Result<StatePruneReport, String> {
     let unit = "state-prune";
     match prune_state_dir(Duration::from_secs(retention_secs.max(1)), dry_run) {
-        Ok(report) => {
+        Ok(mut report) => {
+            let task_retention_secs = task_retention_secs_from_env();
+            let tasks_removed = match prune_tasks_older_than(task_retention_secs, dry_run) {
+                Ok(count) => count as usize,
+                Err(err) => {
+                    log_message(&format!(
+                        "error task-prune-failed retention_secs={} dry_run={} err={}",
+                        task_retention_secs, dry_run, err
+                    ));
+                    0
+                }
+            };
+            report.tasks_removed = tasks_removed;
+            log_message(&format!(
+                "info task-prune removed {} tasks older than {} seconds dry_run={}",
+                tasks_removed, task_retention_secs, dry_run
+            ));
+
             let summary = if dry_run {
                 format!(
-                    "State prune dry-run completed: tokens={} locks={} legacy_dirs={}",
-                    report.tokens_removed, report.locks_removed, report.legacy_dirs_removed
+                    "State prune dry-run completed: tokens={} locks={} legacy_dirs={} tasks={}",
+                    report.tokens_removed,
+                    report.locks_removed,
+                    report.legacy_dirs_removed,
+                    report.tasks_removed
                 )
             } else {
                 format!(
-                    "State prune completed: tokens={} locks={} legacy_dirs={}",
-                    report.tokens_removed, report.locks_removed, report.legacy_dirs_removed
+                    "State prune completed: tokens={} locks={} legacy_dirs={} tasks={}",
+                    report.tokens_removed,
+                    report.locks_removed,
+                    report.legacy_dirs_removed,
+                    report.tasks_removed
                 )
             };
             let meta = json!({
@@ -7815,6 +7915,8 @@ fn run_maintenance_prune_task(
                 "tokens_removed": report.tokens_removed,
                 "locks_removed": report.locks_removed,
                 "legacy_dirs_removed": report.legacy_dirs_removed,
+                "task_retention_secs": task_retention_secs,
+                "tasks_removed": report.tasks_removed,
             });
             update_task_state_with_unit(
                 task_id,

@@ -213,10 +213,21 @@
 
 ### 5.4 保留与清理
 
-- 任务与日志应定义保留策略：
-  - 可参考现有 `DEFAULT_STATE_RETENTION_SECS`，例如默认保留 24–72 小时；
-  - 清理方式可以复用 / 扩展当前的 prune 逻辑。
-- 列表默认展示最近一段时间数据，历史任务通过翻页访问。
+- 后端为 Task 相关表（`tasks` / `task_units` / `task_logs`）实现统一的保留策略：
+  - 默认保留时长基于 `DEFAULT_STATE_RETENTION_SECS`（当前为 86400 秒，约 24 小时）；
+  - 可通过环境变量 `PODUP_TASK_RETENTION_SECS`（单位：秒）覆盖，未配置时回退到 `DEFAULT_STATE_RETENTION_SECS`。
+- 清理策略：
+  - 仅清理已经处于终态的任务：`status IN ('succeeded','failed','cancelled','skipped')`；
+  - 以 `finished_at` 为基准，要求 `finished_at IS NOT NULL` 且 `finished_at < now - retention`；
+  - 删除发生在 `tasks` 表，依赖外键 `ON DELETE CASCADE` 自动删除对应的 `task_units` 与 `task_logs`。
+- 触发入口：
+  - CLI：`pod-upgrade-trigger prune-state` 每次执行时会在 state 清理之后尝试清理旧任务；
+  - API：`POST /api/prune-state` 成功执行时同样会触发一次 Task 清理；
+  - 其他 Task 执行路径（webhook / scheduler / manual 等）不会隐式触发清理，避免高频请求带来额外负载。
+- dry-run 行为：
+  - `prune-state --dry-run` 和 `POST /api/prune-state` 带 `dry_run=true` 时，Task 部分只做计数查询，不删除记录；
+  - 结果通过 CLI 输出、`/api/prune-state` 响应字段 `tasks_removed` 以及系统事件 `cli-prune-state` / `prune-state-api` 的元数据暴露，便于运维审计。
+- 列表默认展示最近一段时间数据，历史任务通过翻页访问；超出保留期的旧任务会在上述清理入口触发后被逐步回收。
 
 ---
 
