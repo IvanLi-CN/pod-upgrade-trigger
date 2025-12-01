@@ -814,10 +814,32 @@ fn run_prune_cli(args: &[String]) -> ! {
                 "Removed tokens={} legacy_entries={} stale_locks={} dry_run={}",
                 report.tokens_removed, report.legacy_dirs_removed, report.locks_removed, dry_run
             );
+            record_system_event(
+                "cli-prune-state",
+                200,
+                json!({
+                    "dry_run": dry_run,
+                    "max_age_hours": max_age_hours,
+                    "tokens_removed": report.tokens_removed,
+                    "legacy_dirs_removed": report.legacy_dirs_removed,
+                    "locks_removed": report.locks_removed,
+                    "task_id": task_id,
+                }),
+            );
             std::process::exit(0);
         }
         Err(err) => {
             eprintln!("state prune failed: {err}");
+            record_system_event(
+                "cli-prune-state",
+                500,
+                json!({
+                    "dry_run": dry_run,
+                    "max_age_hours": max_age_hours,
+                    "error": format!("{err}"),
+                    "task_id": task_id,
+                }),
+            );
             std::process::exit(1);
         }
     }
@@ -1239,6 +1261,7 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
     let mut page: u64 = 1;
     let mut per_page: u64 = EVENTS_DEFAULT_PAGE_SIZE;
     let mut request_id: Option<String> = None;
+    let mut task_id: Option<String> = None;
     let mut path_prefix: Option<String> = None;
     let mut status: Option<i64> = None;
     let mut action: Option<String> = None;
@@ -1274,6 +1297,11 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
                 "request_id" => {
                     if !value.is_empty() {
                         request_id = Some(value.to_string());
+                    }
+                }
+                "task_id" => {
+                    if !value.is_empty() {
+                        task_id = Some(value.to_string());
                     }
                 }
                 "path_prefix" | "path" => {
@@ -1329,6 +1357,10 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
             filters.push("request_id = ?".to_string());
             params.push(SqlParam::Str(id));
         }
+        if let Some(tid) = task_id {
+            filters.push("task_id = ?".to_string());
+            params.push(SqlParam::Str(tid));
+        }
         if let Some(prefix) = path_prefix {
             filters.push("path LIKE ?".to_string());
             params.push(SqlParam::Str(format!("{prefix}%")));
@@ -1371,7 +1403,7 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
         let total = count_query.fetch_one(&pool).await.unwrap_or(0);
 
         let select_sql = format!(
-            "SELECT id, request_id, ts, method, path, status, action, duration_ms, meta, created_at FROM event_log{where_sql} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT id, request_id, ts, method, path, status, action, duration_ms, meta, task_id, created_at FROM event_log{where_sql} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
         );
         let mut query = sqlx::query(&select_sql);
         for param in &params {
@@ -1404,6 +1436,7 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
                 "action": row.get::<String, _>("action"),
                 "duration_ms": row.get::<i64, _>("duration_ms"),
                 "meta": meta_value,
+                 "task_id": row.get::<Option<String>, _>("task_id"),
                 "created_at": row.get::<i64, _>("created_at"),
             });
             events.push(event);
@@ -1829,8 +1862,13 @@ fn handle_tasks_create(ctx: &RequestContext) -> Result<(), String> {
         .bind(&caller_db)
         .bind(&reason_db)
         .bind(Option::<i64>::None)
-        .bind(1_i64) // can_stop
-        .bind(1_i64) // can_force_stop
+        // Generic /api/tasks ad-hoc tasks do not currently run behind a stable
+        // transient runner unit, so we do not offer stop/force-stop at the
+        // backend level. This keeps can_stop/can_force_stop semantics aligned
+        // with task_runner_unit_for_task(), which will never derive a unit for
+        // these records.
+        .bind(0_i64) // can_stop
+        .bind(0_i64) // can_force_stop
         .bind(0_i64) // can_retry
         .bind(is_long_running_i64)
         .bind(Option::<String>::None)
@@ -3659,6 +3697,7 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
     };
 
     let payload = serde_json::to_value(&response).map_err(|e| e.to_string())?;
+    let events_task_id = response.task_id.clone();
     respond_json(
         ctx,
         status,
@@ -3668,6 +3707,7 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
         Some(json!({
             "units": units,
             "dry_run": dry_run,
+            "task_id": events_task_id,
         })),
     )
 }
@@ -3778,6 +3818,7 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
         "InternalServerError"
     };
 
+    let events_task_id = task_id.clone();
     let response = json!({
         "unit": unit,
         "status": result.status,
@@ -3798,6 +3839,7 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
         Some(json!({
             "unit": unit,
             "dry_run": dry_run,
+            "task_id": events_task_id,
         })),
     )
 }
@@ -4025,6 +4067,13 @@ struct TaskDetailResponse {
     #[serde(flatten)]
     task: TaskRecord,
     logs: Vec<TaskLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events_hint: Option<TaskEventsHint>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskEventsHint {
+    task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5149,7 +5198,15 @@ fn load_task_detail_record(task_id: &str) -> Result<Option<TaskDetailResponse>, 
             });
         }
 
-        Ok(Some(TaskDetailResponse { task, logs }))
+        let events_hint = Some(TaskEventsHint {
+            task_id: task.task_id.clone(),
+        });
+
+        Ok(Some(TaskDetailResponse {
+            task,
+            logs,
+            events_hint,
+        }))
     })
 }
 
@@ -6043,8 +6100,8 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
 
     let task_id = create_maintenance_prune_task_for_api(max_age_hours, dry_run, ctx).ok();
 
-    let result = if let Some(ref task_id) = task_id {
-        run_maintenance_prune_task(task_id, retention_secs, dry_run)
+    let result = if let Some(ref task_id_ref) = task_id {
+        run_maintenance_prune_task(task_id_ref, retention_secs, dry_run)
     } else {
         prune_state_dir(Duration::from_secs(retention_secs), dry_run)
     };
@@ -6057,10 +6114,21 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
                 legacy_dirs_removed: report.legacy_dirs_removed,
                 dry_run,
                 max_age_hours,
-                task_id,
+                task_id: task_id.clone(),
             };
             let payload = serde_json::to_value(&response).map_err(|e| e.to_string())?;
-            respond_json(ctx, 200, "OK", &payload, "prune-state-api", None)?;
+            respond_json(
+                ctx,
+                200,
+                "OK",
+                &payload,
+                "prune-state-api",
+                Some(json!({
+                    "dry_run": dry_run,
+                    "max_age_hours": max_age_hours,
+                    "task_id": task_id,
+                })),
+            )?;
             Ok(())
         }
         Err(err) => {
@@ -6070,7 +6138,10 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
                 "InternalServerError",
                 "failed to prune state",
                 "prune-state-api",
-                Some(json!({ "error": err })),
+                Some(json!({
+                    "error": err,
+                    "task_id": task_id,
+                })),
             )?;
             Ok(())
         }
@@ -6830,7 +6901,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             "InternalServerError",
             "failed to dispatch",
             "github-webhook",
-            Some(json!({ "unit": unit, "image": image, "error": err })),
+            Some(json!({ "unit": unit, "image": image, "error": err, "task_id": task_id })),
         )?;
         return Ok(());
     }
@@ -6841,7 +6912,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         "Accepted",
         "auto-update queued",
         "github-webhook",
-        Some(json!({ "unit": unit, "image": image, "delivery": delivery })),
+        Some(json!({ "unit": unit, "image": image, "delivery": delivery, "task_id": task_id })),
     )
 }
 
@@ -8726,7 +8797,7 @@ fn seed_demo_data() -> Result<(), String> {
 
         for (request_id, ts, method, path, status, action, duration_ms, meta) in events {
             sqlx::query(
-                "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta, task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(request_id)
             .bind(ts)
@@ -8736,6 +8807,7 @@ fn seed_demo_data() -> Result<(), String> {
             .bind(action)
             .bind(duration_ms as i64)
             .bind(serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string()))
+            .bind(None::<String>)
             .execute(&pool)
             .await?;
         }
@@ -8788,6 +8860,13 @@ fn persist_event_record(
         None => return,
     };
 
+    // Extract structured task_id (if present) from meta so it can be stored in
+    // a dedicated column for efficient querying by task.
+    let task_id = meta
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let Ok(meta_str) = serde_json::to_string(meta) else {
         return;
     };
@@ -8801,12 +8880,13 @@ fn persist_event_record(
         action: action.to_string(),
         duration_ms: elapsed_ms as i64,
         meta: meta_str,
+        task_id,
     };
     let pool = pool.clone();
 
     let fut = async move {
         if let Err(err) = sqlx::query(
-            "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta, task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.request_id)
         .bind(record.ts)
@@ -8816,6 +8896,7 @@ fn persist_event_record(
         .bind(record.action)
         .bind(record.duration_ms)
         .bind(record.meta)
+        .bind(record.task_id)
         .execute(&pool)
         .await
         {
@@ -8856,6 +8937,7 @@ struct DbEventRecord {
     action: String,
     duration_ms: i64,
     meta: String,
+    task_id: Option<String>,
 }
 
 fn respond_text(

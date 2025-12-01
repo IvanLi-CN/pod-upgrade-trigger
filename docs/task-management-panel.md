@@ -529,6 +529,14 @@ Task 对象（列表与详情中的核心单元）建议包含：
     - 直接嵌入日志时间线（如 TaskLogEntry）；
     - 或提供查询条件（如 `request_id`/`task_id`），由前端跳转到 Events 页面进行深度分析。
 
+在当前实现中，采用了“结构化列 + 元数据冗余”方案：
+
+- `event_log` 表中增加了可空列 `task_id`，并在 Task 相关的 HTTP/CLI 操作中，将任务 ID 同时写入 `event_log.task_id` 与 `meta.task_id`，便于按任务维度查询与兼容旧数据；
+- `/api/events` 支持可选查询参数 `task_id`，例如：`/api/events?task_id=tsk_xxx` 只返回该任务相关的事件记录；
+- Task 详情接口（`GET /api/tasks/:id`）在原有字段基础上增加 `events_hint` 字段，形如：
+  - `"events_hint": { "task_id": "tsk_xxx" }`，
+  前端可以基于此构造跳转到 Events 视图的查询参数。
+
 在当前实现中：
 
 - HTTP 入口：
