@@ -14,7 +14,7 @@ const POLL_INTERVAL_MS = 7000
 const DETAIL_POLL_INTERVAL_MS = 3000
 
 export default function TasksPage() {
-  const { status: appStatus, getJson, postJson } = useApi()
+  const { status: appStatus, getJson, postJson, mockEnabled } = useApi()
   const { pushToast } = useToast()
   const [params, setParams] = useSearchParams()
   const [tasks, setTasks] = useState<Task[]>([])
@@ -779,9 +779,11 @@ export default function TasksPage() {
                       </button>
                     ) : null}
                   </div>
-                  <span className="text-[10px] text-base-content/60">
-                    操作仅作用于 mock 接口，不会影响真实后端。
-                  </span>
+                  {mockEnabled ? (
+                    <span className="text-[10px] text-base-content/60">
+                      当前在 Mock 模式下，停止、强制停止和重试仅更新本地模拟数据，不会操作真实系统。
+                    </span>
+                  ) : null}
                 </div>
               ) : null}
             </div>

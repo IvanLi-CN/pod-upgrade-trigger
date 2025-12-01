@@ -37,12 +37,25 @@ export type AppStatus = {
   now: Date
 }
 
-const mockEnabled =
-  import.meta.env.VITE_ENABLE_MOCKS === 'true' ||
-  (typeof window !== 'undefined' && Boolean(window.__MOCK_ENABLED__))
+function isMockEnabled(): boolean {
+  if (import.meta.env.VITE_ENABLE_MOCKS === 'true') {
+    return true
+  }
+
+  if (typeof window === 'undefined') {
+    return false
+  }
+
+  if (window.__MOCK_ENABLED__) {
+    return true
+  }
+
+  return window.location.search.includes('mock')
+}
 
 type ApiContextValue = {
   status: AppStatus
+  mockEnabled: boolean
   getJson: <T>(input: RequestInfo | URL, init?: RequestInit) => Promise<T>
   postJson: <T>(
     input: RequestInfo | URL,
@@ -66,6 +79,7 @@ export function ApiProvider({ children }: PropsWithChildren) {
   const { pushToast } = useToast()
   const { token } = useToken()
   const originalPathRef = useRef<string | null>(null)
+  const mockEnabled = isMockEnabled()
 
   const handle401 = useCallback(() => {
     if (!originalPathRef.current) {
@@ -82,7 +96,7 @@ export function ApiProvider({ children }: PropsWithChildren) {
         message: 'Received 401 from backend. Check ForwardAuth configuration.',
       })
     }
-  }, [location.pathname, location.search, navigate, pushToast])
+  }, [location.pathname, location.search, mockEnabled, navigate, pushToast])
 
   useEffect(() => {
     let cancelled = false
@@ -194,7 +208,7 @@ export function ApiProvider({ children }: PropsWithChildren) {
       source.removeEventListener('hello', onMessage)
       source.close()
     }
-  }, [])
+  }, [mockEnabled])
 
   const getJson = useCallback(
     async <T,>(input: RequestInfo | URL, init?: RequestInit): Promise<T> => {
@@ -257,10 +271,11 @@ export function ApiProvider({ children }: PropsWithChildren) {
   const value: ApiContextValue = useMemo(
     () => ({
       status: { health, sseStatus, scheduler, now },
+      mockEnabled,
       getJson,
       postJson,
     }),
-    [getJson, health, now, scheduler, sseStatus, postJson],
+    [getJson, health, mockEnabled, now, scheduler, sseStatus, postJson],
   )
 
   return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>
