@@ -4974,9 +4974,9 @@ fn trigger_units(units: &[String], dry_run: bool) -> Vec<UnitActionResult> {
 }
 
 fn all_units_ok(results: &[UnitActionResult]) -> bool {
-    results.iter().all(|r| {
-        r.status == "triggered" || r.status == "dry-run" || r.status == "pending"
-    })
+    results
+        .iter()
+        .all(|r| r.status == "triggered" || r.status == "dry-run" || r.status == "pending")
 }
 
 fn trigger_single_unit(unit: &str, dry_run: bool) -> UnitActionResult {
@@ -5546,15 +5546,8 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     let head_only = ctx.method == "HEAD";
 
     let relative = match ctx.path.as_str() {
-        "/"
-        | "/index.html"
-        | "/manual"
-        | "/webhooks"
-        | "/events"
-        | "/tasks"
-        | "/maintenance"
-        | "/settings"
-        | "/401" => PathBuf::from("index.html"),
+        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/tasks" | "/maintenance"
+        | "/settings" | "/401" => PathBuf::from("index.html"),
         path if path.starts_with("/assets/") => match sanitize_frontend_path(path) {
             Some(p) => p,
             None => return Ok(false),
