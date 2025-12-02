@@ -314,14 +314,12 @@ async fn scenario_task_prune_retention() -> AnyResult<()> {
     .execute(&pool)
     .await?;
 
-    sqlx::query(
-        "INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)",
-    )
-    .bind("old-succeeded")
-    .bind("svc-old.service")
-    .bind("succeeded")
-    .execute(&pool)
-    .await?;
+    sqlx::query("INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)")
+        .bind("old-succeeded")
+        .bind("svc-old.service")
+        .bind("succeeded")
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         "INSERT INTO task_logs (task_id, ts, level, action, status, summary) \
@@ -353,14 +351,12 @@ async fn scenario_task_prune_retention() -> AnyResult<()> {
     .execute(&pool)
     .await?;
 
-    sqlx::query(
-        "INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)",
-    )
-    .bind("recent-succeeded")
-    .bind("svc-recent.service")
-    .bind("succeeded")
-    .execute(&pool)
-    .await?;
+    sqlx::query("INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)")
+        .bind("recent-succeeded")
+        .bind("svc-recent.service")
+        .bind("succeeded")
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         "INSERT INTO task_logs (task_id, ts, level, action, status, summary) \
@@ -467,11 +463,10 @@ async fn scenario_task_prune_retention() -> AnyResult<()> {
             .await?;
     assert_eq!(remaining_running, 1);
 
-    let remaining_no_finished: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tasks WHERE task_id = 'succeeded-no-finished'",
-    )
-    .fetch_one(&pool)
-    .await?;
+    let remaining_no_finished: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'succeeded-no-finished'")
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(remaining_no_finished, 1);
 
     Ok(())
@@ -608,10 +603,7 @@ async fn scenario_settings_tasks_retention() -> AnyResult<()> {
     let response = env.send_request(HttpRequest::get("/api/settings"))?;
     assert_eq!(response.status, 200);
     let json = response.json_body()?;
-    let tasks = json
-        .get("tasks")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let tasks = json.get("tasks").cloned().unwrap_or_else(|| json!({}));
 
     let effective = tasks["task_retention_secs"].as_u64().unwrap_or(0);
     let default = tasks["default_state_retention_secs"].as_u64().unwrap_or(0);
