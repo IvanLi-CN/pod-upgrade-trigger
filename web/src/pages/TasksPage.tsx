@@ -120,6 +120,8 @@ export default function TasksPage() {
     const initialTaskId = params.get('task_id')
     if (initialTaskId) {
       setSelectedTaskId(initialTaskId)
+    } else {
+      setSelectedTaskId(null)
     }
   }, [params])
 
@@ -325,6 +327,9 @@ export default function TasksPage() {
       setDrawerTask(data)
       setTasks((prev) => [data, ...prev])
       setSelectedTaskId(data.task_id)
+      const next = new URLSearchParams(params)
+      next.set('task_id', data.task_id)
+      setParams(next, { replace: true })
       pushToast({
         variant: 'success',
         title: '已创建重试任务',

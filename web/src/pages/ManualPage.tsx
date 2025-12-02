@@ -439,6 +439,13 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
 
+  // Keep drawer focused on the latest task when parent updates initialTaskId
+  useEffect(() => {
+    if (!initialTaskId) return
+    setSelectedTaskId(initialTaskId)
+    setActiveTab('detail')
+  }, [initialTaskId])
+
   useEffect(() => {
     let cancelled = false
 
