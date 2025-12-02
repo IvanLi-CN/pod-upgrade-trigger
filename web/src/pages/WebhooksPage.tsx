@@ -199,7 +199,7 @@ export default function WebhooksPage() {
 
   return (
     <div className="space-y-6">
-      <section className="card bg-base-100 shadow">
+      <section className="card bg-base-100 shadow-sm">
         <div className="card-body gap-3">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
@@ -298,7 +298,7 @@ export default function WebhooksPage() {
         </div>
       </section>
 
-      <section className="card bg-base-100 shadow">
+      <section className="card bg-base-100 shadow-sm">
         <div className="card-body gap-3">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">

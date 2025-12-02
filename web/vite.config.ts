@@ -16,6 +16,9 @@ async function handleNodeMock(req: IncomingMessage, res: ServerResponse) {
   const url = req.url ?? ''
   const method = (req.method ?? 'GET').toUpperCase()
 
+  // Mirror a subset of the browser MSW handlers at the Node/Vite layer so that
+  // `dev:mock` / `preview:mock` behave consistently even when the request
+  // bypasses the Service Worker (e.g. Playwright, curl against the dev server).
   if (method === 'POST' && url.startsWith('/github-package-update/')) {
     const bytes = new Uint8Array(await bufferBody(req))
     runtime.storePayload(bytes)

@@ -68,6 +68,8 @@ const ENV_FWD_AUTH_NICKNAME_HEADER: &str = "PODUP_FWD_AUTH_NICKNAME_HEADER";
 const ENV_ADMIN_MODE_NAME: &str = "PODUP_ADMIN_MODE_NAME";
 const ENV_DEV_OPEN_ADMIN: &str = "PODUP_DEV_OPEN_ADMIN";
 const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
+const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
+const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -253,6 +255,16 @@ fn public_base_url() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| {
+            let value = v.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 fn manual_auto_update_unit() -> String {
     env::var(ENV_MANUAL_AUTO_UPDATE_UNIT).unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string())
 }
@@ -434,21 +446,17 @@ fn normalize_command(raw: &str) -> String {
 }
 
 fn run_background_cli(args: &[String]) -> ! {
-    let unit = args.get(0).cloned().unwrap_or_default();
-    let image = args.get(1).cloned().unwrap_or_default();
-    let event = args.get(2).cloned().unwrap_or_default();
-    let delivery = args.get(3).cloned().unwrap_or_default();
-    let path = args.get(4).cloned().unwrap_or_default();
+    let task_id = args.get(0).cloned().unwrap_or_default();
 
-    if unit.is_empty() || image.is_empty() {
+    if task_id.is_empty() {
         log_message("500 background-task invalid-args");
-        eprintln!("--run-task requires unit and image");
+        eprintln!("--run-task requires task id");
         std::process::exit(1);
     }
 
-    if let Err(err) = run_background_task(&unit, &image, &event, &delivery, &path) {
+    if let Err(err) = run_task_by_id(&task_id) {
         log_message(&format!(
-            "500 background-task-failed unit={unit} image={image} err={err}"
+            "500 background-task-failed task_id={task_id} err={err}"
         ));
         eprintln!("background task failed: {err}");
         std::process::exit(1);
@@ -635,19 +643,120 @@ fn run_trigger_cli(args: &[String], force_all: bool) -> ! {
         std::process::exit(2);
     }
 
-    let results = trigger_units(&units, opts.dry_run);
-    for result in &results {
-        println!("{} -> {}", result.unit, result.status);
-        if let Some(msg) = &result.message {
-            println!("    {msg}");
+    if opts.dry_run {
+        // Dry-run keeps original synchronous behaviour; no external commands are executed.
+        let results = trigger_units(&units, true);
+        for result in &results {
+            println!("{} -> {}", result.unit, result.status);
+            if let Some(msg) = &result.message {
+                println!("    {msg}");
+            }
+        }
+
+        let ok = all_units_ok(&results);
+        log_message(&format!(
+            "manual-cli units={} dry_run={} caller={} reason={} status={}",
+            results.len(),
+            true,
+            opts.caller.as_deref().unwrap_or("-"),
+            opts.reason.as_deref().unwrap_or("-"),
+            if ok { "ok" } else { "error" }
+        ));
+        record_system_event(
+            "cli-trigger",
+            if ok { 202 } else { 500 },
+            json!({
+                "dry_run": true,
+                "caller": opts.caller,
+                "reason": opts.reason,
+                "units": units,
+                "results": results,
+            }),
+        );
+
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
+    // Non-dry-run: create a Task and execute it via run_task_by_id so that all external
+    // commands are centralized behind the task runner.
+    let task_id = match create_cli_manual_trigger_task(&units, opts.all, &opts.caller, &opts.reason)
+    {
+        Ok(id) => id,
+        Err(err) => {
+            eprintln!("failed to create trigger task: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(err) = run_task_by_id(&task_id) {
+        eprintln!("trigger task failed to run: {err}");
+        std::process::exit(1);
+    }
+
+    // Load unit-level results from task_units to report back to CLI and events.
+    let task_id_owned = task_id.clone();
+    let rows_result: Result<Vec<(String, String, Option<String>)>, String> =
+        with_db(|pool| async move {
+            let rows: Vec<SqliteRow> = sqlx::query(
+                "SELECT unit, status, message FROM task_units \
+                 WHERE task_id = ? ORDER BY id",
+            )
+            .bind(&task_id_owned)
+            .fetch_all(&pool)
+            .await?;
+
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let unit: String = row.get("unit");
+                let status: String = row.get("status");
+                let message: Option<String> = row.get("message");
+                out.push((unit, status, message));
+            }
+            Ok::<Vec<(String, String, Option<String>)>, sqlx::Error>(out)
+        });
+
+    let rows = match rows_result {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("failed to load task results: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    if rows.is_empty() {
+        eprintln!("no results recorded for trigger task {task_id}");
+        std::process::exit(1);
+    }
+
+    for (unit, status, message) in &rows {
+        println!("{unit} -> {status}");
+        if let Some(msg) = message {
+            if !msg.is_empty() {
+                println!("    {msg}");
+            }
         }
     }
 
-    let ok = all_units_ok(&results);
+    let ok = !rows
+        .iter()
+        .any(|(_, status, _)| status == "failed" || status == "error");
+
+    let units_for_event: Vec<String> = rows.iter().map(|(u, _, _)| u.clone()).collect();
+    let results_for_event: Vec<Value> = rows
+        .iter()
+        .map(|(u, s, m)| {
+            json!({
+                "unit": u,
+                "status": s,
+                "message": m,
+            })
+        })
+        .collect();
+
     log_message(&format!(
         "manual-cli units={} dry_run={} caller={} reason={} status={}",
-        results.len(),
-        opts.dry_run,
+        rows.len(),
+        false,
         opts.caller.as_deref().unwrap_or("-"),
         opts.reason.as_deref().unwrap_or("-"),
         if ok { "ok" } else { "error" }
@@ -656,19 +765,16 @@ fn run_trigger_cli(args: &[String], force_all: bool) -> ! {
         "cli-trigger",
         if ok { 202 } else { 500 },
         json!({
-            "dry_run": opts.dry_run,
+            "dry_run": false,
             "caller": opts.caller,
             "reason": opts.reason,
-            "units": units,
-            "results": results,
+            "units": units_for_event,
+            "results": results_for_event,
+            "task_id": task_id,
         }),
     );
 
-    if ok {
-        std::process::exit(0);
-    } else {
-        std::process::exit(1);
-    }
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 fn run_prune_cli(args: &[String]) -> ! {
@@ -692,16 +798,56 @@ fn run_prune_cli(args: &[String]) -> ! {
         idx += 1;
     }
 
-    match prune_state_dir(Duration::from_secs(retention_secs.max(1)), dry_run) {
+    let retention_secs = retention_secs.max(1);
+    let max_age_hours = retention_secs / 3600;
+    let task_retention_secs = task_retention_secs_from_env();
+
+    let task_id = match create_cli_maintenance_prune_task(max_age_hours, dry_run) {
+        Ok(id) => id,
+        Err(err) => {
+            eprintln!("failed to create prune-state task: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    match run_maintenance_prune_task(&task_id, retention_secs, dry_run) {
         Ok(report) => {
             println!(
-                "Removed tokens={} legacy_entries={} stale_locks={} dry_run={}",
-                report.tokens_removed, report.legacy_dirs_removed, report.locks_removed, dry_run
+                "Removed tokens={} legacy_entries={} stale_locks={} tasks_pruned={} dry_run={}",
+                report.tokens_removed,
+                report.legacy_dirs_removed,
+                report.locks_removed,
+                report.tasks_removed,
+                dry_run
+            );
+            record_system_event(
+                "cli-prune-state",
+                200,
+                json!({
+                    "dry_run": dry_run,
+                    "max_age_hours": max_age_hours,
+                    "tokens_removed": report.tokens_removed,
+                    "legacy_dirs_removed": report.legacy_dirs_removed,
+                    "locks_removed": report.locks_removed,
+                    "task_retention_secs": task_retention_secs,
+                    "tasks_removed": report.tasks_removed,
+                    "task_id": task_id,
+                }),
             );
             std::process::exit(0);
         }
         Err(err) => {
             eprintln!("state prune failed: {err}");
+            record_system_event(
+                "cli-prune-state",
+                500,
+                json!({
+                    "dry_run": dry_run,
+                    "max_age_hours": max_age_hours,
+                    "error": format!("{err}"),
+                    "task_id": task_id,
+                }),
+            );
             std::process::exit(1);
         }
     }
@@ -737,7 +883,7 @@ fn print_usage(exe: &str) {
     eprintln!("  scheduler [options]          Run the periodic auto-update trigger");
     eprintln!("  trigger-units <units...>     Restart specific units immediately");
     eprintln!("  trigger-all [options]        Restart all configured units");
-    eprintln!("  prune-state [options]        Clean ratelimit databases and locks");
+    eprintln!("  prune-state [options]        Clean ratelimit databases, locks, and old tasks");
     eprintln!("  run-task <...internal...>    Internal helper invoked via systemd-run");
     eprintln!("  help                         Show this message");
 }
@@ -881,6 +1027,8 @@ fn handle_connection() -> Result<(), String> {
         handle_settings_api(&ctx)?;
     } else if ctx.path == "/api/events" {
         handle_events_api(&ctx)?;
+    } else if ctx.path == "/api/tasks" || ctx.path.starts_with("/api/tasks/") {
+        handle_tasks_api(&ctx)?;
     } else if ctx.path == "/api/webhooks/status" {
         handle_webhooks_status(&ctx)?;
     } else if ctx.path == "/api/image-locks" || ctx.path.starts_with("/api/image-locks/") {
@@ -1027,6 +1175,12 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
     let debug_payload_stats = path_stats(Path::new(&debug_payload_path));
     let web_dist_stats = path_stats(&web_dist);
 
+    let task_retention_secs = task_retention_secs_from_env();
+    let task_retention_env_override = env::var(ENV_TASK_RETENTION_SECS)
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
     let response = json!({
         "env": {
             "PODUP_STATE_DIR": state_dir,
@@ -1038,6 +1192,11 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
             "interval_secs": scheduler_interval_secs,
             "min_interval_secs": scheduler_min_interval_secs,
             "max_iterations": scheduler_max_iterations,
+        },
+        "tasks": {
+            "task_retention_secs": task_retention_secs,
+            "default_state_retention_secs": DEFAULT_STATE_RETENTION_SECS,
+            "env_override": task_retention_env_override,
         },
         "systemd": {
             "auto_update_unit": auto_update_unit,
@@ -1121,6 +1280,7 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
     let mut page: u64 = 1;
     let mut per_page: u64 = EVENTS_DEFAULT_PAGE_SIZE;
     let mut request_id: Option<String> = None;
+    let mut task_id: Option<String> = None;
     let mut path_prefix: Option<String> = None;
     let mut status: Option<i64> = None;
     let mut action: Option<String> = None;
@@ -1156,6 +1316,11 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
                 "request_id" => {
                     if !value.is_empty() {
                         request_id = Some(value.to_string());
+                    }
+                }
+                "task_id" => {
+                    if !value.is_empty() {
+                        task_id = Some(value.to_string());
                     }
                 }
                 "path_prefix" | "path" => {
@@ -1211,6 +1376,10 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
             filters.push("request_id = ?".to_string());
             params.push(SqlParam::Str(id));
         }
+        if let Some(tid) = task_id {
+            filters.push("task_id = ?".to_string());
+            params.push(SqlParam::Str(tid));
+        }
         if let Some(prefix) = path_prefix {
             filters.push("path LIKE ?".to_string());
             params.push(SqlParam::Str(format!("{prefix}%")));
@@ -1253,7 +1422,7 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
         let total = count_query.fetch_one(&pool).await.unwrap_or(0);
 
         let select_sql = format!(
-            "SELECT id, request_id, ts, method, path, status, action, duration_ms, meta, created_at FROM event_log{where_sql} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+            "SELECT id, request_id, ts, method, path, status, action, duration_ms, meta, task_id, created_at FROM event_log{where_sql} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
         );
         let mut query = sqlx::query(&select_sql);
         for param in &params {
@@ -1286,6 +1455,7 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
                 "action": row.get::<String, _>("action"),
                 "duration_ms": row.get::<i64, _>("duration_ms"),
                 "meta": meta_value,
+                 "task_id": row.get::<Option<String>, _>("task_id"),
                 "created_at": row.get::<i64, _>("created_at"),
             });
             events.push(event);
@@ -1318,6 +1488,1809 @@ fn handle_events_api(ctx: &RequestContext) -> Result<(), String> {
     });
 
     respond_json(ctx, 200, "OK", &response, "events-api", None)
+}
+
+fn handle_tasks_api(ctx: &RequestContext) -> Result<(), String> {
+    if !ensure_admin(ctx, "tasks-api")? {
+        return Ok(());
+    }
+
+    // Routing within /api/tasks namespace.
+    if ctx.path == "/api/tasks" {
+        match ctx.method.as_str() {
+            "GET" => return handle_tasks_list(ctx),
+            "POST" => return handle_tasks_create(ctx),
+            _ => {
+                respond_text(
+                    ctx,
+                    405,
+                    "MethodNotAllowed",
+                    "method not allowed",
+                    "tasks-api",
+                    Some(json!({ "reason": "method" })),
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    // Paths of the form /api/tasks/:id, /api/tasks/:id/stop, etc.
+    if let Some(rest) = ctx.path.strip_prefix("/api/tasks/") {
+        let trimmed = rest.trim_matches('/');
+        if trimmed.is_empty() {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "missing task id",
+                "tasks-api",
+                Some(json!({ "reason": "task-id" })),
+            )?;
+            return Ok(());
+        }
+
+        if ctx.method == "GET" && !trimmed.contains('/') {
+            return handle_task_detail(ctx, trimmed);
+        }
+
+        if ctx.method == "POST" {
+            if let Some(id) = trimmed.strip_suffix("/stop") {
+                let id = id.trim_matches('/');
+                return handle_task_stop(ctx, id);
+            }
+            if let Some(id) = trimmed.strip_suffix("/force-stop") {
+                let id = id.trim_matches('/');
+                return handle_task_force_stop(ctx, id);
+            }
+            if let Some(id) = trimmed.strip_suffix("/retry") {
+                let id = id.trim_matches('/');
+                return handle_task_retry(ctx, id);
+            }
+        }
+    }
+
+    respond_text(
+        ctx,
+        405,
+        "MethodNotAllowed",
+        "method not allowed",
+        "tasks-api",
+        Some(json!({ "reason": "route" })),
+    )?;
+    Ok(())
+}
+
+fn handle_tasks_list(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-list-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    // Pagination and filters.
+    let mut page: u64 = 1;
+    let mut per_page: u64 = 20;
+    let mut status_filter: Option<String> = None;
+    let mut kind_filter: Option<String> = None;
+    let mut unit_query: Option<String> = None;
+
+    if let Some(q) = &ctx.query {
+        for (key, value) in url::form_urlencoded::parse(q.as_bytes()) {
+            let key = key.as_ref();
+            let value = value.as_ref();
+            match key {
+                "page" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        if v > 0 {
+                            page = v;
+                        }
+                    }
+                }
+                "per_page" | "page_size" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        if v > 0 {
+                            per_page = v.min(100);
+                        }
+                    }
+                }
+                "status" => {
+                    if !value.is_empty() {
+                        status_filter = Some(value.to_string());
+                    }
+                }
+                "kind" | "type" => {
+                    if !value.is_empty() {
+                        kind_filter = Some(value.to_string());
+                    }
+                }
+                "unit" | "unit_query" => {
+                    if !value.is_empty() {
+                        unit_query = Some(value.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let page = page.max(1);
+    let per_page = per_page.max(1);
+    let offset = (page.saturating_sub(1)).saturating_mul(per_page) as i64;
+
+    enum SqlParam {
+        Str(String),
+    }
+
+    let db_result = with_db(|pool| async move {
+        let mut filters: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParam> = Vec::new();
+
+        if let Some(status) = status_filter {
+            filters.push("tasks.status = ?".to_string());
+            params.push(SqlParam::Str(status));
+        }
+        if let Some(kind) = kind_filter {
+            filters.push("tasks.kind = ?".to_string());
+            params.push(SqlParam::Str(kind));
+        }
+        if let Some(unit) = unit_query {
+            let needle = unit.to_lowercase();
+            filters.push(
+                "EXISTS (SELECT 1 FROM task_units tu \
+                 WHERE tu.task_id = tasks.task_id \
+                 AND (LOWER(tu.unit) LIKE ? \
+                      OR LOWER(COALESCE(tu.slug, '')) LIKE ? \
+                      OR LOWER(COALESCE(tu.display_name, '')) LIKE ?))"
+                    .to_string(),
+            );
+            let pattern = format!("%{needle}%");
+            params.push(SqlParam::Str(pattern.clone()));
+            params.push(SqlParam::Str(pattern.clone()));
+            params.push(SqlParam::Str(pattern));
+        }
+
+        let mut where_sql = String::new();
+        if !filters.is_empty() {
+            where_sql.push_str(" WHERE ");
+            where_sql.push_str(&filters.join(" AND "));
+        }
+
+        let count_sql = format!("SELECT COUNT(*) as cnt FROM tasks{where_sql}");
+        let mut count_query = sqlx::query_scalar::<_, i64>(&count_sql);
+        for param in &params {
+            if let SqlParam::Str(v) = param {
+                count_query = count_query.bind(v);
+            }
+        }
+        let total = count_query.fetch_one(&pool).await.unwrap_or(0);
+
+        let select_sql = format!(
+            "SELECT id, task_id, kind, status, created_at, started_at, finished_at, updated_at, \
+             summary, trigger_source, trigger_request_id, trigger_path, trigger_caller, \
+             trigger_reason, trigger_scheduler_iteration, can_stop, can_force_stop, can_retry, \
+             is_long_running, retry_of \
+             FROM tasks{where_sql} \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT ? OFFSET ?"
+        );
+
+        let mut query = sqlx::query(&select_sql);
+        for param in &params {
+            if let SqlParam::Str(v) = param {
+                query = query.bind(v);
+            }
+        }
+        query = query.bind(per_page as i64).bind(offset);
+
+        let rows: Vec<SqliteRow> = query.fetch_all(&pool).await?;
+
+        // Preload units for all tasks in this page.
+        let mut task_ids: Vec<String> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let tid: String = row.get("task_id");
+            task_ids.push(tid);
+        }
+
+        let mut units_by_task: HashMap<String, Vec<TaskUnitSummary>> = HashMap::new();
+        if !task_ids.is_empty() {
+            let mut in_sql = String::from(
+                "SELECT task_id, unit, slug, display_name, status, phase, started_at, finished_at, duration_ms, message, error FROM task_units WHERE task_id IN (",
+            );
+            for idx in 0..task_ids.len() {
+                if idx > 0 {
+                    in_sql.push(',');
+                }
+                in_sql.push('?');
+            }
+            in_sql.push(')');
+            in_sql.push_str(" ORDER BY id ASC");
+
+            let mut units_query = sqlx::query(&in_sql);
+            for id in &task_ids {
+                units_query = units_query.bind(id);
+            }
+
+            let unit_rows: Vec<SqliteRow> = units_query.fetch_all(&pool).await?;
+            for row in unit_rows {
+                let task_id: String = row.get("task_id");
+                let entry = units_by_task.entry(task_id).or_insert_with(Vec::new);
+                entry.push(TaskUnitSummary {
+                    unit: row.get::<String, _>("unit"),
+                    slug: row.get::<Option<String>, _>("slug"),
+                    display_name: row.get::<Option<String>, _>("display_name"),
+                    status: row.get::<String, _>("status"),
+                    phase: row.get::<Option<String>, _>("phase"),
+                    started_at: row.get::<Option<i64>, _>("started_at"),
+                    finished_at: row.get::<Option<i64>, _>("finished_at"),
+                    duration_ms: row.get::<Option<i64>, _>("duration_ms"),
+                    message: row.get::<Option<String>, _>("message"),
+                    error: row.get::<Option<String>, _>("error"),
+                });
+            }
+        }
+
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tid: String = row.get("task_id");
+            let units = units_by_task.remove(&tid).unwrap_or_else(Vec::new);
+            tasks.push(build_task_record_from_row(row, units));
+        }
+
+        Ok::<(Vec<TaskRecord>, i64), sqlx::Error>((tasks, total))
+    });
+
+    let (tasks, total) = match db_result {
+        Ok(ok) => ok,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to query tasks",
+                "tasks-list-api",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let response = TasksListResponse {
+        tasks,
+        total,
+        page,
+        page_size: per_page,
+        has_next: (page as i64) * (per_page as i64) < total,
+    };
+
+    let payload = serde_json::to_value(&response).unwrap_or_else(|_| json!({}));
+    respond_json(ctx, 200, "OK", &payload, "tasks-list-api", None)
+}
+
+fn handle_tasks_create(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "POST" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-create-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    let request: CreateTaskRequest = match parse_json_body(ctx) {
+        Ok(body) => body,
+        Err(err) => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "invalid request",
+                "tasks-create-api",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let kind = request
+        .kind
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("manual")
+        .to_string();
+    let source = request
+        .source
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("manual")
+        .to_string();
+
+    let units: Vec<String> = request
+        .units
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|u| !u.trim().is_empty())
+        .collect();
+    let units = if units.is_empty() {
+        vec!["unknown.unit".to_string()]
+    } else {
+        units
+    };
+
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_request_id = Some(ctx.request_id.clone());
+    let caller = request
+        .caller
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let reason = request
+        .reason
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let path = request
+        .path
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let is_long_running_flag = request.is_long_running.unwrap_or(true);
+
+    let summary = if kind == "maintenance" {
+        Some("Maintenance task started from API".to_string())
+    } else {
+        Some("Manual task started from API".to_string())
+    };
+
+    let task_id_db = task_id.clone();
+    let kind_db = kind.clone();
+    let source_db = source.clone();
+    let caller_db = caller.clone();
+    let reason_db = reason.clone();
+    let path_db = path.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        let is_long_running_i64: Option<i64> = Some(if is_long_running_flag { 1 } else { 0 });
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_db)
+        .bind(&kind_db)
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(&summary)
+        .bind(&source_db)
+        .bind(&trigger_request_id)
+        .bind(&path_db)
+        .bind(&caller_db)
+        .bind(&reason_db)
+        .bind(Option::<i64>::None)
+        // Generic /api/tasks ad-hoc tasks do not currently run behind a stable
+        // transient runner unit, so we do not offer stop/force-stop at the
+        // backend level. This keeps can_stop/can_force_stop semantics aligned
+        // with task_runner_unit_for_task(), which will never derive a unit for
+        // these records.
+        .bind(0_i64) // can_stop
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(is_long_running_i64)
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        for unit_name in &units {
+            let slug = if let Some(stripped) = unit_name.strip_suffix(".service") {
+                Some(stripped.trim_matches('/').to_string())
+            } else {
+                None
+            };
+
+            sqlx::query(
+                "INSERT INTO task_units \
+                 (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+                  duration_ms, message, error) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_db)
+            .bind(unit_name)
+            .bind(&slug)
+            .bind(unit_name)
+            .bind("running")
+            .bind(Some("queued"))
+            .bind(Some(now))
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Some("Task started from API"))
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let meta = json!({
+            "source": source_db,
+            "caller": caller_db,
+            "reason": reason_db,
+            "kind": kind_db,
+        });
+        let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_db)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Task created from API request")
+        .bind(Option::<String>::None)
+        .bind(meta_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => {
+            let response = json!({
+                "task_id": task_id,
+                "is_long_running": is_long_running_flag,
+                "kind": kind,
+                "status": "running",
+            });
+            respond_json(ctx, 200, "OK", &response, "tasks-create-api", None)?;
+            Ok(())
+        }
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to create task",
+                "tasks-create-api",
+                Some(json!({ "error": err })),
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn handle_task_detail(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-detail-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    let result = load_task_detail_record(task_id);
+    match result {
+        Ok(Some(detail)) => {
+            let payload = serde_json::to_value(&detail).unwrap_or_else(|_| json!({}));
+            respond_json(
+                ctx,
+                200,
+                "OK",
+                &payload,
+                "tasks-detail-api",
+                Some(json!({ "task_id": task_id })),
+            )?;
+            Ok(())
+        }
+        Ok(None) => {
+            respond_text(
+                ctx,
+                404,
+                "NotFound",
+                "task not found",
+                "tasks-detail-api",
+                Some(json!({ "task_id": task_id })),
+            )?;
+            Ok(())
+        }
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to load task",
+                "tasks-detail-api",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// Derive the underlying systemd transient unit (task runner) for a given task.
+/// Returns Ok(Some(unit_name)) when the backend can safely target a unit for
+/// stop/force-stop, Ok(None) when the task kind is not stop-capable, and Err
+/// when the persisted metadata is malformed.
+fn task_runner_unit_for_task(kind: &str, meta_raw: Option<&str>) -> Result<Option<String>, String> {
+    match kind {
+        // GitHub webhook tasks are dispatched via:
+        //   systemd-run --user --unit=webhook-task-<suffix> ... --run-task <task_id>
+        // where <suffix> is derived from the delivery id. We reconstruct the
+        // transient unit name from the stored TaskMeta.
+        "github-webhook" => {
+            let meta_str = match meta_raw {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+
+            let meta: TaskMeta = serde_json::from_str(meta_str)
+                .map_err(|e| format!("invalid task meta for kind=github-webhook: {e}"))?;
+
+            match meta {
+                TaskMeta::GithubWebhook { delivery, .. } => {
+                    let suffix = sanitize_image_key(&delivery);
+                    Ok(Some(format!("webhook-task-{suffix}")))
+                }
+                _ => Ok(None),
+            }
+        }
+        // Other kinds currently do not run behind a stable, named transient
+        // unit. They are treated as not safely stoppable.
+        _ => Ok(None),
+    }
+}
+
+fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
+    if ctx.method != "POST" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-stop-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    let now = current_unix_secs() as i64;
+
+    let task_id_owned = task_id.to_string();
+
+    // Load current task state and metadata first so we can decide whether there
+    // is anything to stop and which underlying unit (if any) should be
+    // targeted.
+    let row_result = with_db(|pool| async move {
+        let row_opt: Option<SqliteRow> = sqlx::query(
+            "SELECT status, summary, finished_at, kind, meta, can_stop \
+             FROM tasks WHERE task_id = ? LIMIT 1",
+        )
+        .bind(&task_id_owned)
+        .fetch_optional(&pool)
+        .await?;
+
+        Ok::<Option<SqliteRow>, sqlx::Error>(row_opt)
+    });
+
+    let row_opt = match row_result {
+        Ok(row) => row,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to load task",
+                "tasks-stop-api",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let Some(row) = row_opt else {
+        respond_text(
+            ctx,
+            404,
+            "NotFound",
+            "task not found",
+            "tasks-stop-api",
+            Some(json!({ "task_id": task_id })),
+        )?;
+        return Ok(());
+    };
+
+    let status: String = row.get("status");
+    let existing_summary: Option<String> = row.get("summary");
+    let finished_at: Option<i64> = row.get("finished_at");
+    let kind: String = row.get("kind");
+    let meta_raw: Option<String> = row.get("meta");
+    let can_stop_raw: i64 = row.get("can_stop");
+    let can_stop_flag = can_stop_raw != 0;
+
+    // Terminal states: keep existing noop semantics but always log the request.
+    if status != "running" {
+        let status_copy = status.clone();
+        let task_id_db = task_id.to_string();
+        let meta = json!({ "status": status_copy });
+        let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+        let log_result = with_db(|pool| async move {
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_db)
+            .bind(now)
+            .bind("info")
+            .bind("task-stop-noop")
+            .bind(&status_copy)
+            .bind("Stop requested but task already in terminal state")
+            .bind(Option::<String>::None)
+            .bind(meta_str)
+            .execute(&pool)
+            .await?;
+
+            Ok::<(), sqlx::Error>(())
+        });
+
+        if let Err(err) = log_result {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to stop task",
+                "tasks-stop-api",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            return Ok(());
+        }
+
+        // Reload detail for the caller, keeping behaviour idempotent.
+        match load_task_detail_record(task_id) {
+            Ok(Some(detail)) => {
+                let payload = serde_json::to_value(&detail).unwrap_or_else(|_| json!({}));
+                respond_json(
+                    ctx,
+                    200,
+                    "OK",
+                    &payload,
+                    "tasks-stop-api",
+                    Some(json!({ "task_id": task_id })),
+                )?;
+                Ok(())
+            }
+            Ok(None) => {
+                respond_text(
+                    ctx,
+                    404,
+                    "NotFound",
+                    "task not found",
+                    "tasks-stop-api",
+                    Some(json!({ "task_id": task_id })),
+                )?;
+                Ok(())
+            }
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to load task",
+                    "tasks-stop-api",
+                    Some(json!({ "task_id": task_id, "error": err })),
+                )?;
+                Ok(())
+            }
+        }
+    } else {
+        // Running tasks: attempt a graceful stop when we know how to locate the
+        // underlying transient unit. If the task is marked as not safely
+        // stoppable, fail fast with a descriptive error and log.
+        if !can_stop_flag {
+            let task_id_db = task_id.to_string();
+            let kind_copy = kind.clone();
+            let meta = json!({
+                "kind": kind_copy,
+                "reason": "can_stop_false",
+            });
+            let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+            let log_result = with_db(|pool| async move {
+                sqlx::query(
+                    "INSERT INTO task_logs \
+                     (task_id, ts, level, action, status, summary, unit, meta) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&task_id_db)
+                .bind(now)
+                .bind("info")
+                .bind("task-stop-unsupported")
+                .bind("running")
+                .bind("Stop requested but task cannot be safely stopped")
+                .bind(Option::<String>::None)
+                .bind(meta_str)
+                .execute(&pool)
+                .await?;
+
+                Ok::<(), sqlx::Error>(())
+            });
+
+            if let Err(err) = log_result {
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to stop task",
+                    "tasks-stop-api",
+                    Some(json!({ "task_id": task_id, "error": err })),
+                )?;
+                return Ok(());
+            }
+
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "task cannot be safely stopped",
+                "tasks-stop-api",
+                Some(json!({ "task_id": task_id, "reason": "unsupported" })),
+            )?;
+            return Ok(());
+        }
+
+        let runner_unit = match task_runner_unit_for_task(&kind, meta_raw.as_deref()) {
+            Ok(Some(unit)) => unit,
+            Ok(None) => {
+                // No stable transient unit associated with this task; treat as
+                // not safely stoppable.
+                let task_id_db = task_id.to_string();
+                let kind_copy = kind.clone();
+                let meta = json!({
+                    "kind": kind_copy,
+                    "reason": "no-runner-unit",
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let log_result = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("info")
+                    .bind("task-stop-unsupported")
+                    .bind("running")
+                    .bind("Stop requested but task has no controllable runner unit")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                if let Err(err) = log_result {
+                    respond_text(
+                        ctx,
+                        500,
+                        "InternalServerError",
+                        "failed to stop task",
+                        "tasks-stop-api",
+                        Some(json!({ "task_id": task_id, "error": err })),
+                    )?;
+                    return Ok(());
+                }
+
+                respond_text(
+                    ctx,
+                    400,
+                    "BadRequest",
+                    "task cannot be safely stopped",
+                    "tasks-stop-api",
+                    Some(json!({ "task_id": task_id, "reason": "no-runner-unit" })),
+                )?;
+                return Ok(());
+            }
+            Err(err) => {
+                // Malformed meta for a supposedly stoppable task.
+                let task_id_db = task_id.to_string();
+                let meta = json!({
+                    "kind": kind,
+                    "error": err,
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let _ = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("error")
+                    .bind("task-stop-meta-error")
+                    .bind("running")
+                    .bind("Stop requested but task metadata was invalid")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to stop task",
+                    "tasks-stop-api",
+                    Some(json!({ "task_id": task_id, "error": "invalid-task-meta" })),
+                )?;
+                return Ok(());
+            }
+        };
+
+        // Attempt graceful stop of the transient unit. A successful systemctl
+        // call is treated as "stop requested" and we immediately transition the
+        // task into cancelled.
+        match stop_task_runner_unit(&runner_unit) {
+            Ok(result) if result.success() => {
+                let finish_ts = finished_at.unwrap_or(now);
+                let new_summary = match existing_summary {
+                    Some(ref s) if s.contains("cancelled") => s.clone(),
+                    Some(ref s) => format!("{s} · cancelled by user"),
+                    None => "Task · cancelled by user".to_string(),
+                };
+
+                let task_id_db = task_id.to_string();
+                let new_summary_db = new_summary.clone();
+
+                let update_result = with_db(|pool| async move {
+                    let mut tx = pool.begin().await?;
+
+                    sqlx::query(
+                        "UPDATE tasks SET status = ?, finished_at = ?, updated_at = ?, summary = ?, \
+                         can_stop = 0, can_force_stop = 0, can_retry = 1 WHERE task_id = ?",
+                    )
+                    .bind("cancelled")
+                    .bind(finish_ts)
+                    .bind(now)
+                    .bind(&new_summary_db)
+                    .bind(&task_id_db)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "UPDATE task_units SET status = 'cancelled', \
+                         finished_at = COALESCE(finished_at, ?), \
+                         message = COALESCE(message, 'cancelled by user') \
+                         WHERE task_id = ? AND status IN ('running', 'pending')",
+                    )
+                    .bind(finish_ts)
+                    .bind(&task_id_db)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    let meta = json!({ "via": "stop", "runner_unit": runner_unit });
+                    let meta_str =
+                        serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("warning")
+                    .bind("task-cancelled")
+                    .bind("cancelled")
+                    .bind("Task cancelled via /stop API")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    tx.commit().await?;
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                if let Err(err) = update_result {
+                    respond_text(
+                        ctx,
+                        500,
+                        "InternalServerError",
+                        "failed to stop task",
+                        "tasks-stop-api",
+                        Some(json!({ "task_id": task_id, "error": err })),
+                    )?;
+                    return Ok(());
+                }
+
+                match load_task_detail_record(task_id) {
+                    Ok(Some(detail)) => {
+                        let payload = serde_json::to_value(&detail).unwrap_or_else(|_| json!({}));
+                        respond_json(
+                            ctx,
+                            200,
+                            "OK",
+                            &payload,
+                            "tasks-stop-api",
+                            Some(json!({ "task_id": task_id })),
+                        )?;
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        respond_text(
+                            ctx,
+                            404,
+                            "NotFound",
+                            "task not found",
+                            "tasks-stop-api",
+                            Some(json!({ "task_id": task_id })),
+                        )?;
+                        Ok(())
+                    }
+                    Err(err) => {
+                        respond_text(
+                            ctx,
+                            500,
+                            "InternalServerError",
+                            "failed to load task",
+                            "tasks-stop-api",
+                            Some(json!({ "task_id": task_id, "error": err })),
+                        )?;
+                        Ok(())
+                    }
+                }
+            }
+            Ok(result) => {
+                let exit = exit_code_string(&result.status);
+                let stderr = result.stderr.clone();
+
+                let task_id_db = task_id.to_string();
+                let meta = json!({
+                    "runner_unit": runner_unit,
+                    "exit": exit,
+                    "stderr": stderr,
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let _ = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("error")
+                    .bind("task-stop-failed")
+                    .bind("running")
+                    .bind("Failed to stop underlying runner unit")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to stop task",
+                    "tasks-stop-api",
+                    Some(json!({
+                        "task_id": task_id,
+                        "error": exit,
+                    })),
+                )?;
+                Ok(())
+            }
+            Err(err) => {
+                let task_id_db = task_id.to_string();
+                let meta = json!({
+                    "runner_unit": runner_unit,
+                    "error": err,
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let _ = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("error")
+                    .bind("task-stop-error")
+                    .bind("running")
+                    .bind("Error while stopping underlying runner unit")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to stop task",
+                    "tasks-stop-api",
+                    Some(json!({ "task_id": task_id, "error": "runner-stop-error" })),
+                )?;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
+    if ctx.method != "POST" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-force-stop-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    let now = current_unix_secs() as i64;
+
+    let task_id_owned = task_id.to_string();
+
+    // Load current task state and metadata first.
+    let row_result = with_db(|pool| async move {
+        let row_opt: Option<SqliteRow> = sqlx::query(
+            "SELECT status, summary, finished_at, kind, meta, can_force_stop \
+             FROM tasks WHERE task_id = ? LIMIT 1",
+        )
+        .bind(&task_id_owned)
+        .fetch_optional(&pool)
+        .await?;
+
+        Ok::<Option<SqliteRow>, sqlx::Error>(row_opt)
+    });
+
+    let row_opt = match row_result {
+        Ok(row) => row,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to load task",
+                "tasks-force-stop-api",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let Some(row) = row_opt else {
+        respond_text(
+            ctx,
+            404,
+            "NotFound",
+            "task not found",
+            "tasks-force-stop-api",
+            Some(json!({ "task_id": task_id })),
+        )?;
+        return Ok(());
+    };
+
+    let status: String = row.get("status");
+    let existing_summary: Option<String> = row.get("summary");
+    let finished_at: Option<i64> = row.get("finished_at");
+    let kind: String = row.get("kind");
+    let meta_raw: Option<String> = row.get("meta");
+    let can_force_stop_raw: i64 = row.get("can_force_stop");
+    let can_force_stop_flag = can_force_stop_raw != 0;
+
+    // Terminal states: keep existing noop semantics but always log the request.
+    if status != "running" {
+        let status_copy = status.clone();
+        let task_id_db = task_id.to_string();
+        let meta = json!({ "status": status_copy });
+        let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+        let log_result = with_db(|pool| async move {
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_db)
+            .bind(now)
+            .bind("info")
+            .bind("task-force-stop-noop")
+            .bind(&status_copy)
+            .bind("Force-stop requested but task already in terminal state")
+            .bind(Option::<String>::None)
+            .bind(meta_str)
+            .execute(&pool)
+            .await?;
+
+            Ok::<(), sqlx::Error>(())
+        });
+
+        if let Err(err) = log_result {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to force-stop task",
+                "tasks-force-stop-api",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            return Ok(());
+        }
+
+        match load_task_detail_record(task_id) {
+            Ok(Some(detail)) => {
+                let payload = serde_json::to_value(&detail).unwrap_or_else(|_| json!({}));
+                respond_json(
+                    ctx,
+                    200,
+                    "OK",
+                    &payload,
+                    "tasks-force-stop-api",
+                    Some(json!({ "task_id": task_id })),
+                )?;
+                Ok(())
+            }
+            Ok(None) => {
+                respond_text(
+                    ctx,
+                    404,
+                    "NotFound",
+                    "task not found",
+                    "tasks-force-stop-api",
+                    Some(json!({ "task_id": task_id })),
+                )?;
+                Ok(())
+            }
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to load task",
+                    "tasks-force-stop-api",
+                    Some(json!({ "task_id": task_id, "error": err })),
+                )?;
+                Ok(())
+            }
+        }
+    } else {
+        // Running tasks: attempt a forceful stop when we know how to locate the
+        // underlying transient unit. If the task is marked as not safely
+        // force-stoppable, fail fast with a descriptive error and log.
+        if !can_force_stop_flag {
+            let task_id_db = task_id.to_string();
+            let kind_copy = kind.clone();
+            let meta = json!({
+                "kind": kind_copy,
+                "reason": "can_force_stop_false",
+            });
+            let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+            let log_result = with_db(|pool| async move {
+                sqlx::query(
+                    "INSERT INTO task_logs \
+                     (task_id, ts, level, action, status, summary, unit, meta) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&task_id_db)
+                .bind(now)
+                .bind("info")
+                .bind("task-force-stop-unsupported")
+                .bind("running")
+                .bind("Force-stop requested but task cannot be safely force-stopped")
+                .bind(Option::<String>::None)
+                .bind(meta_str)
+                .execute(&pool)
+                .await?;
+
+                Ok::<(), sqlx::Error>(())
+            });
+
+            if let Err(err) = log_result {
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to force-stop task",
+                    "tasks-force-stop-api",
+                    Some(json!({ "task_id": task_id, "error": err })),
+                )?;
+                return Ok(());
+            }
+
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "task cannot be safely force-stopped",
+                "tasks-force-stop-api",
+                Some(json!({ "task_id": task_id, "reason": "unsupported" })),
+            )?;
+            return Ok(());
+        }
+
+        let runner_unit = match task_runner_unit_for_task(&kind, meta_raw.as_deref()) {
+            Ok(Some(unit)) => unit,
+            Ok(None) => {
+                let task_id_db = task_id.to_string();
+                let kind_copy = kind.clone();
+                let meta = json!({
+                    "kind": kind_copy,
+                    "reason": "no-runner-unit",
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let log_result = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("info")
+                    .bind("task-force-stop-unsupported")
+                    .bind("running")
+                    .bind("Force-stop requested but task has no controllable runner unit")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                if let Err(err) = log_result {
+                    respond_text(
+                        ctx,
+                        500,
+                        "InternalServerError",
+                        "failed to force-stop task",
+                        "tasks-force-stop-api",
+                        Some(json!({ "task_id": task_id, "error": err })),
+                    )?;
+                    return Ok(());
+                }
+
+                respond_text(
+                    ctx,
+                    400,
+                    "BadRequest",
+                    "task cannot be safely force-stopped",
+                    "tasks-force-stop-api",
+                    Some(json!({ "task_id": task_id, "reason": "no-runner-unit" })),
+                )?;
+                return Ok(());
+            }
+            Err(err) => {
+                let task_id_db = task_id.to_string();
+                let meta = json!({
+                    "kind": kind,
+                    "error": err,
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let _ = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("error")
+                    .bind("task-force-stop-meta-error")
+                    .bind("running")
+                    .bind("Force-stop requested but task metadata was invalid")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to force-stop task",
+                    "tasks-force-stop-api",
+                    Some(json!({ "task_id": task_id, "error": "invalid-task-meta" })),
+                )?;
+                return Ok(());
+            }
+        };
+
+        match kill_task_runner_unit(&runner_unit) {
+            Ok(result) if result.success() => {
+                let finish_ts = finished_at.unwrap_or(now);
+                let new_summary = match existing_summary {
+                    Some(ref s) if s.contains("force-stopped") => s.clone(),
+                    Some(ref s) => format!("{s} · force-stopped"),
+                    None => "Task · force-stopped".to_string(),
+                };
+
+                let task_id_db = task_id.to_string();
+                let new_summary_db = new_summary.clone();
+
+                let update_result = with_db(|pool| async move {
+                    let mut tx = pool.begin().await?;
+
+                    sqlx::query(
+                        "UPDATE tasks SET status = ?, finished_at = ?, updated_at = ?, summary = ?, \
+                         can_stop = 0, can_force_stop = 0, can_retry = 1 WHERE task_id = ?",
+                    )
+                    .bind("failed")
+                    .bind(finish_ts)
+                    .bind(now)
+                    .bind(&new_summary_db)
+                    .bind(&task_id_db)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        "UPDATE task_units SET status = 'failed', \
+                         finished_at = COALESCE(finished_at, ?), \
+                         message = COALESCE(message, 'force-stopped by user') \
+                         WHERE task_id = ? AND status IN ('running', 'pending')",
+                    )
+                    .bind(finish_ts)
+                    .bind(&task_id_db)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    let meta = json!({ "via": "force-stop", "runner_unit": runner_unit });
+                    let meta_str =
+                        serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("error")
+                    .bind("task-force-killed")
+                    .bind("failed")
+                    .bind("Task force-stopped via /force-stop API")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    tx.commit().await?;
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                if let Err(err) = update_result {
+                    respond_text(
+                        ctx,
+                        500,
+                        "InternalServerError",
+                        "failed to force-stop task",
+                        "tasks-force-stop-api",
+                        Some(json!({ "task_id": task_id, "error": err })),
+                    )?;
+                    return Ok(());
+                }
+
+                match load_task_detail_record(task_id) {
+                    Ok(Some(detail)) => {
+                        let payload = serde_json::to_value(&detail).unwrap_or_else(|_| json!({}));
+                        respond_json(
+                            ctx,
+                            200,
+                            "OK",
+                            &payload,
+                            "tasks-force-stop-api",
+                            Some(json!({ "task_id": task_id })),
+                        )?;
+                        Ok(())
+                    }
+                    Ok(None) => {
+                        respond_text(
+                            ctx,
+                            404,
+                            "NotFound",
+                            "task not found",
+                            "tasks-force-stop-api",
+                            Some(json!({ "task_id": task_id })),
+                        )?;
+                        Ok(())
+                    }
+                    Err(err) => {
+                        respond_text(
+                            ctx,
+                            500,
+                            "InternalServerError",
+                            "failed to load task",
+                            "tasks-force-stop-api",
+                            Some(json!({ "task_id": task_id, "error": err })),
+                        )?;
+                        Ok(())
+                    }
+                }
+            }
+            Ok(result) => {
+                let exit = exit_code_string(&result.status);
+                let stderr = result.stderr.clone();
+
+                let task_id_db = task_id.to_string();
+                let meta = json!({
+                    "runner_unit": runner_unit,
+                    "exit": exit,
+                    "stderr": stderr,
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let _ = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("error")
+                    .bind("task-force-stop-failed")
+                    .bind("running")
+                    .bind("Failed to force-stop underlying runner unit")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to force-stop task",
+                    "tasks-force-stop-api",
+                    Some(json!({
+                        "task_id": task_id,
+                        "error": exit,
+                    })),
+                )?;
+                Ok(())
+            }
+            Err(err) => {
+                let task_id_db = task_id.to_string();
+                let meta = json!({
+                    "runner_unit": runner_unit,
+                    "error": err,
+                });
+                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+                let _ = with_db(|pool| async move {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_db)
+                    .bind(now)
+                    .bind("error")
+                    .bind("task-force-stop-error")
+                    .bind("running")
+                    .bind("Error while force-stopping underlying runner unit")
+                    .bind(Option::<String>::None)
+                    .bind(meta_str)
+                    .execute(&pool)
+                    .await?;
+
+                    Ok::<(), sqlx::Error>(())
+                });
+
+                respond_text(
+                    ctx,
+                    500,
+                    "InternalServerError",
+                    "failed to force-stop task",
+                    "tasks-force-stop-api",
+                    Some(json!({ "task_id": task_id, "error": "runner-force-stop-error" })),
+                )?;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn handle_task_retry(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
+    if ctx.method != "POST" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-retry-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    let task_id_owned = task_id.to_string();
+    let now = current_unix_secs() as i64;
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        let row_opt: Option<SqliteRow> = sqlx::query(
+            "SELECT id, task_id, kind, status, created_at, started_at, finished_at, updated_at, \
+             summary, trigger_source, trigger_request_id, trigger_path, trigger_caller, \
+             trigger_reason, trigger_scheduler_iteration, can_stop, can_force_stop, can_retry, \
+             is_long_running, retry_of \
+             FROM tasks WHERE task_id = ? LIMIT 1",
+        )
+        .bind(&task_id_owned)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(original_row) = row_opt else {
+            tx.rollback().await.ok();
+            return Ok::<Option<String>, sqlx::Error>(None);
+        };
+
+        let status: String = original_row.get("status");
+        if status == "running" || status == "pending" {
+            tx.rollback().await.ok();
+            return Ok(Some("conflict".to_string()));
+        }
+
+        let original_kind: String = original_row.get("kind");
+        let original_summary: Option<String> = original_row.get("summary");
+        let original_trigger_source: String = original_row.get("trigger_source");
+        let original_trigger_request_id: Option<String> = original_row.get("trigger_request_id");
+        let original_trigger_path: Option<String> = original_row.get("trigger_path");
+        let original_trigger_caller: Option<String> = original_row.get("trigger_caller");
+        let original_trigger_reason: Option<String> = original_row.get("trigger_reason");
+        let original_trigger_iteration: Option<i64> =
+            original_row.get("trigger_scheduler_iteration");
+        let original_is_long_running: Option<i64> = original_row.get("is_long_running");
+
+        // Load units from original task.
+        let unit_rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT unit, slug, display_name FROM task_units WHERE task_id = ? ORDER BY id ASC",
+        )
+        .bind(&task_id_owned)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut units: Vec<(String, Option<String>, Option<String>)> =
+            Vec::with_capacity(unit_rows.len());
+        for u in unit_rows {
+            units.push((
+                u.get::<String, _>("unit"),
+                u.get::<Option<String>, _>("slug"),
+                u.get::<Option<String>, _>("display_name"),
+            ));
+        }
+
+        let new_task_id = format!("retry_{}", next_request_id());
+        let is_long_running_i64: Option<i64> =
+            original_is_long_running.map(|v| if v != 0 { 1 } else { 0 });
+
+        let retry_summary = original_summary
+            .as_ref()
+            .map(|s| format!("{s} · retry"))
+            .unwrap_or_else(|| "Retry of previous task".to_string());
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&new_task_id)
+        .bind(&original_kind)
+        .bind("pending")
+        .bind(now)
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(&retry_summary)
+        .bind(&original_trigger_source)
+        .bind(&original_trigger_request_id)
+        .bind(&original_trigger_path)
+        .bind(&original_trigger_caller)
+        .bind(&original_trigger_reason)
+        .bind(&original_trigger_iteration)
+        .bind(1_i64) // can_stop
+        .bind(1_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(is_long_running_i64)
+        .bind(&task_id_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        for (unit, slug, display_name) in &units {
+            sqlx::query(
+                "INSERT INTO task_units \
+                 (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+                  duration_ms, message, error) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&new_task_id)
+            .bind(unit)
+            .bind(slug)
+            .bind(display_name)
+            .bind("pending")
+            .bind(Some("queued"))
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Some("Retry pending"))
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Log on original task that a retry was created.
+        let meta = json!({ "retry_task_id": new_task_id });
+        let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_owned)
+        .bind(now)
+        .bind("info")
+        .bind("task-retried")
+        .bind(&status)
+        .bind("Retry task created from this task")
+        .bind(Option::<String>::None)
+        .bind(meta_str)
+        .execute(&mut *tx)
+        .await?;
+
+        // Log creation of retry task.
+        let meta_new = json!({ "retry_of": task_id_owned });
+        let meta_new_str = serde_json::to_string(&meta_new).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&new_task_id)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("pending")
+        .bind("Retry task created from existing task")
+        .bind(Option::<String>::None)
+        .bind(meta_new_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<Option<String>, sqlx::Error>(Some(new_task_id))
+    });
+
+    match db_result {
+        Ok(Some(new_id)) => {
+            if new_id == "conflict" {
+                respond_text(
+                    ctx,
+                    409,
+                    "Conflict",
+                    "cannot retry a running or pending task",
+                    "tasks-retry-api",
+                    Some(json!({ "task_id": task_id })),
+                )?;
+                return Ok(());
+            }
+
+            match load_task_detail_record(&new_id) {
+                Ok(Some(detail)) => {
+                    let payload = serde_json::to_value(&detail).unwrap_or_else(|_| json!({}));
+                    respond_json(
+                        ctx,
+                        200,
+                        "OK",
+                        &payload,
+                        "tasks-retry-api",
+                        Some(json!({ "task_id": new_id })),
+                    )?;
+                    Ok(())
+                }
+                Ok(None) => {
+                    respond_text(
+                        ctx,
+                        404,
+                        "NotFound",
+                        "retry task not found",
+                        "tasks-retry-api",
+                        Some(json!({ "task_id": task_id })),
+                    )?;
+                    Ok(())
+                }
+                Err(err) => {
+                    respond_text(
+                        ctx,
+                        500,
+                        "InternalServerError",
+                        "failed to load retry task",
+                        "tasks-retry-api",
+                        Some(json!({ "task_id": task_id, "error": err })),
+                    )?;
+                    Ok(())
+                }
+            }
+        }
+        Ok(None) => {
+            respond_text(
+                ctx,
+                404,
+                "NotFound",
+                "task not found",
+                "tasks-retry-api",
+                Some(json!({ "task_id": task_id })),
+            )?;
+            Ok(())
+        }
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to retry task",
+                "tasks-retry-api",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            Ok(())
+        }
+    }
 }
 
 fn is_github_route(path: &str) -> bool {
@@ -1471,28 +3444,33 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
     }
 
     let unit = manual_auto_update_unit();
-    let result = start_auto_update_unit(&unit)?;
-    if result.success() {
-        log_message(&format!("202 triggered unit={unit} {}", redacted_line));
-        respond_text(
-            ctx,
-            202,
-            "Accepted",
-            "auto-update triggered",
-            "manual-auto-update",
-            Some(json!({ "unit": unit })),
-        )?;
-    } else {
-        let mut message = format!(
-            "500 failed unit={unit} {} exit={}",
-            redacted_line,
-            exit_code_string(&result.status)
-        );
-        if !result.stderr.is_empty() {
-            message.push_str(" stderr=");
-            message.push_str(&result.stderr);
+    let task_id = match create_manual_auto_update_task(&unit, &ctx.request_id, &ctx.path) {
+        Ok(id) => id,
+        Err(err) => {
+            log_message(&format!(
+                "500 manual-auto-update-task-create-failed unit={unit} err={err} {}",
+                redacted_line
+            ));
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to schedule auto-update",
+                "manual-auto-update",
+                Some(json!({
+                    "unit": unit,
+                    "error": err,
+                })),
+            )?;
+            return Ok(());
         }
-        log_message(&message);
+    };
+
+    if let Err(err) = spawn_manual_task(&task_id, "manual-auto-update") {
+        log_message(&format!(
+            "500 manual-auto-update-dispatch-failed unit={unit} task_id={task_id} err={err} {}",
+            redacted_line
+        ));
         respond_text(
             ctx,
             500,
@@ -1501,10 +3479,24 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
             "manual-auto-update",
             Some(json!({
                 "unit": unit,
-                "stderr": result.stderr,
+                "error": err,
             })),
         )?;
+        return Ok(());
     }
+
+    log_message(&format!(
+        "202 triggered unit={unit} {} task_id={task_id}",
+        redacted_line
+    ));
+    respond_text(
+        ctx,
+        202,
+        "Accepted",
+        "auto-update triggered",
+        "manual-auto-update",
+        Some(json!({ "unit": unit, "task_id": task_id })),
+    )?;
 
     Ok(())
 }
@@ -1672,13 +3664,46 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
     }
 
     let dry_run = request.dry_run;
-    let results = trigger_units(&units, dry_run);
+    let mut results: Vec<UnitActionResult> = Vec::new();
+
+    let mut task_id: Option<String> = None;
+    if dry_run {
+        // Dry-run 保持原有同步行为，不创建任务，只记录计划中的操作。
+        results = trigger_units(&units, true);
+    } else {
+        // 非 dry-run：创建 Task 并异步执行，由 run-task 接管外部命令。
+        let meta = TaskMeta::ManualTrigger {
+            all: request.all,
+            dry_run: request.dry_run,
+        };
+        let task = create_manual_trigger_task(
+            &units,
+            &request.caller,
+            &request.reason,
+            &ctx.request_id,
+            meta,
+        )?;
+        task_id = Some(task.clone());
+
+        // 立即返回的结果沿用“计划中的结果”，不再同步执行 systemctl。
+        results = units
+            .iter()
+            .map(|unit| UnitActionResult {
+                unit: unit.clone(),
+                status: "pending".to_string(),
+                message: Some("scheduled via task".to_string()),
+            })
+            .collect();
+
+        // Fire-and-forget 调度 run-task <task_id>。
+        let _ = spawn_manual_task(&task, "manual-trigger");
+    }
+
     let (status, reason) = if all_units_ok(&results) {
         (202, "Accepted")
     } else {
         (207, "Multi-Status")
     };
-
     units.sort();
     units.dedup();
 
@@ -1687,9 +3712,12 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
         dry_run,
         caller: request.caller.clone(),
         reason: request.reason.clone(),
+        task_id,
+        request_id: Some(ctx.request_id.clone()),
     };
 
     let payload = serde_json::to_value(&response).map_err(|e| e.to_string())?;
+    let events_task_id = response.task_id.clone();
     respond_json(
         ctx,
         status,
@@ -1699,6 +3727,7 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
         Some(json!({
             "units": units,
             "dry_run": dry_run,
+            "task_id": events_task_id,
         })),
     )
 }
@@ -1764,34 +3793,52 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
     }
 
     let dry_run = request.dry_run;
-    if !dry_run {
-        if let Some(image) = request.image.as_deref() {
-            if let Err(err) = pull_container_image(image) {
-                respond_text(
-                    ctx,
-                    500,
-                    "InternalServerError",
-                    "image pull failed",
-                    "manual-service",
-                    Some(json!({ "unit": unit, "error": err })),
-                )?;
-                return Ok(());
-            }
-        }
+    let mut result: UnitActionResult;
+    let mut task_id: Option<String> = None;
+
+    if dry_run {
+        // 保持原有 dry-run 行为。
+        result = trigger_single_unit(&unit, true);
+    } else {
+        // 非 dry-run：创建 Task 并异步执行。
+        let meta = TaskMeta::ManualService {
+            unit: unit.clone(),
+            dry_run: request.dry_run,
+            image: request.image.clone(),
+        };
+        let task = create_manual_service_task(
+            &unit,
+            &request.caller,
+            &request.reason,
+            request.image.as_deref(),
+            &ctx.request_id,
+            meta,
+        )?;
+        task_id = Some(task.clone());
+
+        result = UnitActionResult {
+            unit: unit.clone(),
+            status: "pending".to_string(),
+            message: Some("scheduled via task".to_string()),
+        };
+
+        let _ = spawn_manual_task(&task, "manual-service");
     }
 
-    let result = trigger_single_unit(&unit, dry_run);
-    let status = if result.status == "triggered" || result.status == "dry-run" {
-        202
-    } else {
-        500
-    };
+    let status =
+        if result.status == "triggered" || result.status == "dry-run" || result.status == "pending"
+        {
+            202
+        } else {
+            500
+        };
     let reason = if status == 202 {
         "Accepted"
     } else {
         "InternalServerError"
     };
 
+    let events_task_id = task_id.clone();
     let response = json!({
         "unit": unit,
         "status": result.status,
@@ -1800,6 +3847,8 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
         "caller": request.caller,
         "reason": request.reason,
         "image": request.image,
+        "task_id": task_id,
+        "request_id": ctx.request_id,
     });
 
     respond_json(
@@ -1811,6 +3860,7 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
         Some(json!({
             "unit": unit,
             "dry_run": dry_run,
+            "task_id": events_task_id,
         })),
     )
 }
@@ -1864,6 +3914,19 @@ struct PruneStateRequest {
     dry_run: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct PruneStateResponse {
+    tokens_removed: usize,
+    locks_removed: usize,
+    legacy_dirs_removed: usize,
+    tasks_removed: usize,
+    task_retention_secs: u64,
+    dry_run: bool,
+    max_age_hours: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct UnitActionResult {
     unit: String,
@@ -1880,6 +3943,173 @@ struct ManualTriggerResponse {
     caller: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+}
+
+// --- Task domain types (backend representation mirroring web/src/domain/tasks.ts) ---
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum TaskMeta {
+    #[serde(rename = "manual-trigger")]
+    ManualTrigger {
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    #[serde(rename = "manual-service")]
+    ManualService {
+        unit: String,
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default)]
+        image: Option<String>,
+    },
+    #[serde(rename = "github-webhook")]
+    GithubWebhook {
+        unit: String,
+        image: String,
+        event: String,
+        delivery: String,
+        path: String,
+    },
+    #[serde(rename = "auto-update")]
+    AutoUpdate { unit: String },
+    #[serde(rename = "maintenance-prune")]
+    MaintenancePrune {
+        max_age_hours: u64,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TaskTriggerMeta {
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduler_iteration: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TaskUnitSummary {
+    unit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TaskSummaryCounts {
+    total_units: usize,
+    succeeded: usize,
+    failed: usize,
+    cancelled: usize,
+    running: usize,
+    pending: usize,
+    skipped: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TaskRecord {
+    id: i64,
+    task_id: String,
+    kind: String,
+    status: String,
+    created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    trigger: TaskTriggerMeta,
+    units: Vec<TaskUnitSummary>,
+    unit_counts: TaskSummaryCounts,
+    can_stop: bool,
+    can_force_stop: bool,
+    can_retry: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_long_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_of: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct TaskLogEntry {
+    id: i64,
+    ts: i64,
+    level: String,
+    action: String,
+    status: String,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct TasksListResponse {
+    tasks: Vec<TaskRecord>,
+    total: i64,
+    page: u64,
+    page_size: u64,
+    has_next: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskDetailResponse {
+    #[serde(flatten)]
+    task: TaskRecord,
+    logs: Vec<TaskLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events_hint: Option<TaskEventsHint>,
+}
+
+#[derive(Debug, Serialize)]
+struct TaskEventsHint {
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTaskRequest {
+    kind: Option<String>,
+    source: Option<String>,
+    units: Option<Vec<String>>,
+    caller: Option<String>,
+    reason: Option<String>,
+    path: Option<String>,
+    is_long_running: Option<bool>,
 }
 
 #[derive(Default)]
@@ -1889,6 +4119,1195 @@ struct ManualCliOptions {
     all: bool,
     caller: Option<String>,
     reason: Option<String>,
+}
+
+fn summarize_task_units(units: &[TaskUnitSummary]) -> TaskSummaryCounts {
+    let mut summary = TaskSummaryCounts {
+        total_units: units.len(),
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+        running: 0,
+        pending: 0,
+        skipped: 0,
+    };
+
+    for unit in units {
+        match unit.status.as_str() {
+            "succeeded" => summary.succeeded = summary.succeeded.saturating_add(1),
+            "failed" => summary.failed = summary.failed.saturating_add(1),
+            "cancelled" => summary.cancelled = summary.cancelled.saturating_add(1),
+            "running" => summary.running = summary.running.saturating_add(1),
+            "pending" => summary.pending = summary.pending.saturating_add(1),
+            "skipped" => summary.skipped = summary.skipped.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    summary
+}
+
+fn build_task_record_from_row(row: SqliteRow, units: Vec<TaskUnitSummary>) -> TaskRecord {
+    let unit_counts = summarize_task_units(&units);
+    let trigger = TaskTriggerMeta {
+        source: row.get::<String, _>("trigger_source"),
+        request_id: row.get::<Option<String>, _>("trigger_request_id"),
+        path: row.get::<Option<String>, _>("trigger_path"),
+        caller: row.get::<Option<String>, _>("trigger_caller"),
+        reason: row.get::<Option<String>, _>("trigger_reason"),
+        scheduler_iteration: row.get::<Option<i64>, _>("trigger_scheduler_iteration"),
+    };
+
+    let can_stop_raw: i64 = row.get("can_stop");
+    let can_force_stop_raw: i64 = row.get("can_force_stop");
+    let can_retry_raw: i64 = row.get("can_retry");
+    let is_long_running_raw: Option<i64> = row.get("is_long_running");
+
+    TaskRecord {
+        id: row.get::<i64, _>("id"),
+        task_id: row.get::<String, _>("task_id"),
+        kind: row.get::<String, _>("kind"),
+        status: row.get::<String, _>("status"),
+        created_at: row.get::<i64, _>("created_at"),
+        started_at: row.get::<Option<i64>, _>("started_at"),
+        finished_at: row.get::<Option<i64>, _>("finished_at"),
+        updated_at: row.get::<Option<i64>, _>("updated_at"),
+        summary: row.get::<Option<String>, _>("summary"),
+        trigger,
+        units,
+        unit_counts,
+        can_stop: can_stop_raw != 0,
+        can_force_stop: can_force_stop_raw != 0,
+        can_retry: can_retry_raw != 0,
+        is_long_running: is_long_running_raw.map(|v| v != 0),
+        retry_of: row.get::<Option<String>, _>("retry_of"),
+    }
+}
+
+fn create_github_task(
+    unit: &str,
+    image: &str,
+    event: &str,
+    delivery: &str,
+    path: &str,
+    request_id: &str,
+    meta: &TaskMeta,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "webhook".to_string();
+
+    let meta_value = serde_json::to_value(meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let unit_owned = unit.to_string();
+    let path_owned = path.to_string();
+    let request_id_owned = request_id.to_string();
+    let image_owned = image.to_string();
+    let event_owned = event.to_string();
+    let delivery_owned = delivery.to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("github-webhook")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some(format!(
+            "Webhook task for {unit_owned} ({event_owned} delivery={delivery_owned})"
+        )))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(&path_owned)
+        .bind(Option::<String>::None) // caller
+        .bind(Option::<String>::None) // reason
+        .bind(Option::<i64>::None) // scheduler_iteration
+        .bind(1_i64) // can_stop
+        .bind(1_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64)) // is_long_running
+        .bind(Option::<String>::None) // retry_of
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_owned)
+        .bind(Some(
+            unit_owned
+                .trim_end_matches(".service")
+                .trim_matches('/')
+                .to_string(),
+        ))
+        .bind(&unit_owned)
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(format!(
+            "Webhook {event_owned} delivery={delivery_owned} image={image_owned}"
+        )))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        // Initial log entry.
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Github webhook accepted for background processing")
+        .bind(Some(unit_owned.clone()))
+        .bind(
+            serde_json::to_string(&json!({
+                "unit": unit_owned,
+                "image": image_owned,
+                "event": event_owned,
+                "delivery": delivery_owned,
+                "path": path_owned,
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_manual_trigger_task(
+    units: &[String],
+    caller: &Option<String>,
+    reason: &Option<String>,
+    request_id: &str,
+    meta: TaskMeta,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "manual".to_string();
+
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let units_owned: Vec<String> = units.to_vec();
+    let caller_owned = caller.clone();
+    let reason_owned = reason.clone();
+    let request_id_owned = request_id.to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("manual")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("Manual trigger task created".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(Some("/api/manual/trigger".to_string()))
+        .bind(&caller_owned)
+        .bind(&reason_owned)
+        .bind(Option::<i64>::None)
+        .bind(0_i64) // can_stop (manual trigger tasks cannot be safely cancelled at system level)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        for unit in &units_owned {
+            sqlx::query(
+                "INSERT INTO task_units \
+                 (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+                  duration_ms, message, error) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(unit)
+            .bind(Some(
+                unit.trim_end_matches(".service")
+                    .trim_matches('/')
+                    .to_string(),
+            ))
+            .bind(unit)
+            .bind("running")
+            .bind(Some("queued"))
+            .bind(Some(now))
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Some("Manual trigger scheduled from API".to_string()))
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Manual trigger task created from API")
+        .bind(Option::<String>::None)
+        .bind(
+            serde_json::to_string(&json!({
+                "units": units_owned,
+                "caller": caller_owned,
+                "reason": reason_owned,
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_cli_manual_trigger_task(
+    units: &[String],
+    all: bool,
+    caller: &Option<String>,
+    reason: &Option<String>,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "cli".to_string();
+
+    let meta = TaskMeta::ManualTrigger {
+        all,
+        dry_run: false,
+    };
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let units_owned: Vec<String> = units.to_vec();
+    let caller_owned = caller.clone();
+    let reason_owned = reason.clone();
+    let request_id_owned = "cli-trigger".to_string();
+    let path_owned = "cli-trigger".to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("manual")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("Manual trigger task created from CLI".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(Some(path_owned.clone()))
+        .bind(&caller_owned)
+        .bind(&reason_owned)
+        .bind(Option::<i64>::None)
+        .bind(0_i64) // can_stop (CLI manual trigger tasks cannot be safely cancelled)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        for unit in &units_owned {
+            sqlx::query(
+                "INSERT INTO task_units \
+                 (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+                  duration_ms, message, error) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(unit)
+            .bind(Some(
+                unit.trim_end_matches(".service")
+                    .trim_matches('/')
+                    .to_string(),
+            ))
+            .bind(unit)
+            .bind("running")
+            .bind(Some("queued"))
+            .bind(Some(now))
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Some("Manual trigger scheduled from CLI".to_string()))
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Manual trigger task created from CLI")
+        .bind(Option::<String>::None)
+        .bind(
+            serde_json::to_string(&json!({
+                "units": units_owned,
+                "caller": caller_owned,
+                "reason": reason_owned,
+                "source": trigger_source,
+                "path": path_owned,
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_manual_service_task(
+    unit: &str,
+    caller: &Option<String>,
+    reason: &Option<String>,
+    image: Option<&str>,
+    request_id: &str,
+    meta: TaskMeta,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "manual".to_string();
+
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let unit_owned = unit.to_string();
+    let caller_owned = caller.clone();
+    let reason_owned = reason.clone();
+    let image_owned = image.map(|s| s.to_string());
+    let request_id_owned = request_id.to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("manual")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("Manual service task created".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(Some(format!(
+            "/api/manual/services/{unit}",
+            unit = unit_owned
+        )))
+        .bind(&caller_owned)
+        .bind(&reason_owned)
+        .bind(Option::<i64>::None)
+        .bind(0_i64) // can_stop (manual service tasks cannot be safely cancelled at system level)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_owned)
+        .bind(Some(
+            unit_owned
+                .trim_end_matches(".service")
+                .trim_matches('/')
+                .to_string(),
+        ))
+        .bind(&unit_owned)
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some("Manual service task scheduled from API".to_string()))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Manual service task created from API")
+        .bind(Some(unit_owned.clone()))
+        .bind(
+            serde_json::to_string(&json!({
+                "unit": unit_owned,
+                "image": image_owned,
+                "caller": caller_owned,
+                "reason": reason_owned,
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_manual_auto_update_task(
+    unit: &str,
+    request_id: &str,
+    path: &str,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "manual".to_string();
+
+    let meta = TaskMeta::AutoUpdate {
+        unit: unit.to_string(),
+    };
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let unit_owned = unit.to_string();
+    let request_id_owned = request_id.to_string();
+    let path_owned = path.to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("manual")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some(format!("Manual auto-update for {unit_owned}")))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(Some(path_owned.clone()))
+        .bind(Option::<String>::None) // caller
+        .bind(Option::<String>::None) // reason
+        .bind(Option::<i64>::None) // scheduler_iteration
+        .bind(0_i64) // can_stop (manual auto-update tasks cannot be safely cancelled)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64)) // is_long_running
+        .bind(Option::<String>::None) // retry_of
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_owned)
+        .bind(Some(
+            unit_owned
+                .trim_end_matches(".service")
+                .trim_matches('/')
+                .to_string(),
+        ))
+        .bind(&unit_owned)
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some("Manual auto-update scheduled from API".to_string()))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        let meta_log = json!({
+            "unit": unit_owned,
+            "source": trigger_source,
+            "path": path_owned,
+        });
+        let meta_log_str = serde_json::to_string(&meta_log).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Manual auto-update task created from API")
+        .bind(Some(unit_owned.clone()))
+        .bind(meta_log_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_scheduler_auto_update_task(unit: &str, iteration: u64) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "scheduler".to_string();
+
+    let meta = TaskMeta::AutoUpdate {
+        unit: unit.to_string(),
+    };
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let unit_owned = unit.to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("scheduler")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some(format!(
+            "Scheduler auto-update iteration={iteration} for {unit_owned}"
+        )))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(Option::<String>::None) // request_id
+        .bind(Some("scheduler-loop".to_string()))
+        .bind(Option::<String>::None) // caller
+        .bind(Option::<String>::None) // reason
+        .bind(Some(iteration as i64))
+        .bind(0_i64) // can_stop
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64)) // is_long_running
+        .bind(Option::<String>::None) // retry_of
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_owned)
+        .bind(Some(
+            unit_owned
+                .trim_end_matches(".service")
+                .trim_matches('/')
+                .to_string(),
+        ))
+        .bind(&unit_owned)
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(format!(
+            "Scheduler auto-update scheduled (iteration={iteration})"
+        )))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        let meta_log = json!({
+            "unit": unit_owned,
+            "iteration": iteration,
+            "source": trigger_source,
+        });
+        let meta_log_str = serde_json::to_string(&meta_log).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Scheduler auto-update task created")
+        .bind(Some(unit_owned.clone()))
+        .bind(meta_log_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_maintenance_prune_task_for_api(
+    max_age_hours: u64,
+    dry_run: bool,
+    ctx: &RequestContext,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "maintenance".to_string();
+
+    let meta = TaskMeta::MaintenancePrune {
+        max_age_hours,
+        dry_run,
+    };
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let request_id_owned = ctx.request_id.clone();
+    let path_owned = ctx.path.clone();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("maintenance")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("State prune task created from API".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(Some(request_id_owned))
+        .bind(Some(path_owned.clone()))
+        .bind(Option::<String>::None) // caller
+        .bind(Option::<String>::None) // reason
+        .bind(Option::<i64>::None) // scheduler_iteration
+        .bind(0_i64) // can_stop (state prune tasks cannot be safely cancelled at system level)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64)) // is_long_running
+        .bind(Option::<String>::None) // retry_of
+        .execute(&mut *tx)
+        .await?;
+
+        let unit_name = "state-prune".to_string();
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_name)
+        .bind(Some(unit_name.clone()))
+        .bind("State prune")
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(format!(
+            "State prune task scheduled from API (dry_run={})",
+            dry_run
+        )))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        let meta_log = json!({
+            "unit": unit_name,
+            "dry_run": dry_run,
+            "max_age_hours": max_age_hours,
+            "source": trigger_source,
+            "path": path_owned,
+        });
+        let meta_log_str = serde_json::to_string(&meta_log).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("State prune task created from API")
+        .bind(Some(unit_name))
+        .bind(meta_log_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_cli_maintenance_prune_task(max_age_hours: u64, dry_run: bool) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "cli".to_string();
+
+    let meta = TaskMeta::MaintenancePrune {
+        max_age_hours,
+        dry_run,
+    };
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("maintenance")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("State prune task created from CLI".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(Some("cli-prune-state".to_string()))
+        .bind(Some("cli-prune-state".to_string()))
+        .bind(Option::<String>::None) // caller
+        .bind(Option::<String>::None) // reason
+        .bind(Option::<i64>::None) // scheduler_iteration
+        .bind(0_i64) // can_stop (CLI prune tasks cannot be safely cancelled)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64)) // is_long_running
+        .bind(Option::<String>::None) // retry_of
+        .execute(&mut *tx)
+        .await?;
+
+        let unit_name = "state-prune".to_string();
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_name)
+        .bind(Some(unit_name.clone()))
+        .bind("State prune")
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(format!(
+            "State prune task scheduled from CLI (dry_run={})",
+            dry_run
+        )))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        let meta_log = json!({
+            "unit": unit_name,
+            "dry_run": dry_run,
+            "max_age_hours": max_age_hours,
+            "source": trigger_source,
+            "path": "cli-prune-state",
+        });
+        let meta_log_str = serde_json::to_string(&meta_log).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("State prune task created from CLI")
+        .bind(Some(unit_name))
+        .bind(meta_log_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn spawn_manual_task(task_id: &str, action: &str) -> Result<(), String> {
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let exe_str = exe.to_str().ok_or_else(|| "invalid exe path".to_string())?;
+
+    log_message(&format!(
+        "debug manual-dispatch-launch task_id={task_id} action={action} exe={exe_str}"
+    ));
+
+    // For manual tasks我们不单独创建 transient unit 名称，复用 run-task 调用。
+    let args = vec![
+        "--user".to_string(),
+        "--quiet".to_string(),
+        exe_str.to_string(),
+        "run-task".to_string(),
+        task_id.to_string(),
+    ];
+
+    let status = Command::new("systemd-run")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status();
+
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            let code = exit_code_string(&status);
+            log_message(&format!(
+                "warn manual-dispatch-fallback systemd-run-exit code={code} task_id={task_id} action={action}"
+            ));
+            // Fallback to inline process.
+            Command::new(exe_str)
+                .arg("run-task")
+                .arg(task_id)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        Err(err) => {
+            log_message(&format!(
+                "warn manual-dispatch-fallback no-systemd-run err={err} task_id={task_id} action={action}"
+            ));
+            Command::new(exe_str)
+                .arg("run-task")
+                .arg(task_id)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+fn load_task_detail_record(task_id: &str) -> Result<Option<TaskDetailResponse>, String> {
+    let task_id_owned = task_id.to_string();
+    with_db(|pool| async move {
+        let row_opt: Option<SqliteRow> = sqlx::query(
+            "SELECT id, task_id, kind, status, created_at, started_at, finished_at, updated_at, \
+             summary, trigger_source, trigger_request_id, trigger_path, trigger_caller, \
+             trigger_reason, trigger_scheduler_iteration, can_stop, can_force_stop, can_retry, \
+             is_long_running, retry_of \
+             FROM tasks WHERE task_id = ? LIMIT 1",
+        )
+        .bind(&task_id_owned)
+        .fetch_optional(&pool)
+        .await?;
+
+        let Some(row) = row_opt else {
+            return Ok(None);
+        };
+
+        let unit_rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT unit, slug, display_name, status, phase, started_at, finished_at, \
+             duration_ms, message, error \
+             FROM task_units WHERE task_id = ? ORDER BY id ASC",
+        )
+        .bind(&task_id_owned)
+        .fetch_all(&pool)
+        .await?;
+
+        let mut units = Vec::with_capacity(unit_rows.len());
+        for u in unit_rows {
+            units.push(TaskUnitSummary {
+                unit: u.get::<String, _>("unit"),
+                slug: u.get::<Option<String>, _>("slug"),
+                display_name: u.get::<Option<String>, _>("display_name"),
+                status: u.get::<String, _>("status"),
+                phase: u.get::<Option<String>, _>("phase"),
+                started_at: u.get::<Option<i64>, _>("started_at"),
+                finished_at: u.get::<Option<i64>, _>("finished_at"),
+                duration_ms: u.get::<Option<i64>, _>("duration_ms"),
+                message: u.get::<Option<String>, _>("message"),
+                error: u.get::<Option<String>, _>("error"),
+            });
+        }
+
+        let task = build_task_record_from_row(row, units);
+
+        let log_rows: Vec<SqliteRow> = sqlx::query(
+            "SELECT id, ts, level, action, status, summary, unit, meta \
+             FROM task_logs WHERE task_id = ? ORDER BY ts ASC, id ASC",
+        )
+        .bind(&task_id_owned)
+        .fetch_all(&pool)
+        .await?;
+
+        let mut logs = Vec::with_capacity(log_rows.len());
+        for row in log_rows {
+            let meta_raw: Option<String> = row.get("meta");
+            let meta_value: Option<Value> = meta_raw
+                .as_deref()
+                .map(|raw| serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw })));
+
+            logs.push(TaskLogEntry {
+                id: row.get::<i64, _>("id"),
+                ts: row.get::<i64, _>("ts"),
+                level: row.get::<String, _>("level"),
+                action: row.get::<String, _>("action"),
+                status: row.get::<String, _>("status"),
+                summary: row.get::<String, _>("summary"),
+                unit: row.get::<Option<String>, _>("unit"),
+                meta: meta_value,
+            });
+        }
+
+        let events_hint = Some(TaskEventsHint {
+            task_id: task.task_id.clone(),
+        });
+
+        Ok(Some(TaskDetailResponse {
+            task,
+            logs,
+            events_hint,
+        }))
+    })
+}
+
+fn run_task_by_id(task_id: &str) -> Result<(), String> {
+    // For now we only support github-webhook tasks; other kinds are no-ops.
+    let task_id_owned = task_id.to_string();
+    let record = with_db(|pool| async move {
+        let row_opt: Option<SqliteRow> =
+            sqlx::query("SELECT kind, status, meta FROM tasks WHERE task_id = ? LIMIT 1")
+                .bind(&task_id_owned)
+                .fetch_optional(&pool)
+                .await?;
+
+        Ok::<Option<SqliteRow>, sqlx::Error>(row_opt)
+    })?;
+
+    let Some(row) = record else {
+        return Err(format!("task-not-found task_id={task_id}"));
+    };
+
+    let kind: String = row.get("kind");
+    let meta_raw: Option<String> = row.get("meta");
+
+    let meta_str = meta_raw.ok_or_else(|| format!("task-meta-missing task_id={task_id}"))?;
+    let meta: TaskMeta = serde_json::from_str(&meta_str)
+        .map_err(|_| format!("task-meta-invalid task_id={task_id}"))?;
+
+    match (kind.as_str(), meta) {
+        (
+            "github-webhook",
+            TaskMeta::GithubWebhook {
+                unit,
+                image,
+                event,
+                delivery,
+                path,
+            },
+        ) => run_background_task(task_id, &unit, &image, &event, &delivery, &path),
+        ("manual", TaskMeta::ManualTrigger { .. }) => run_manual_trigger_task(task_id),
+        (
+            "manual",
+            TaskMeta::ManualService {
+                unit,
+                dry_run,
+                image,
+            },
+        ) => {
+            if dry_run {
+                log_message(&format!(
+                    "info run-task manual-service-dry-run task_id={task_id} unit={unit}"
+                ));
+                Ok(())
+            } else {
+                run_manual_service_task(task_id, &unit, image.as_deref())
+            }
+        }
+        ("manual", TaskMeta::AutoUpdate { unit }) => run_auto_update_task(task_id, &unit),
+        ("scheduler", TaskMeta::AutoUpdate { unit }) => run_auto_update_task(task_id, &unit),
+        (
+            "maintenance",
+            TaskMeta::MaintenancePrune {
+                max_age_hours,
+                dry_run,
+            },
+        ) => {
+            let retention_secs = max_age_hours.saturating_mul(3600).max(1);
+            let _ = run_maintenance_prune_task(task_id, retention_secs, dry_run)?;
+            Ok(())
+        }
+        _ => {
+            log_message(&format!(
+                "info run-task unsupported-kind task_id={task_id} kind={kind}"
+            ));
+            Ok(())
+        }
+    }
 }
 
 fn manual_api_token() -> String {
@@ -2235,7 +5654,7 @@ fn discovered_unit_detail() -> Vec<(String, String)> {
     }
 }
 
-fn manual_unit_list() -> Vec<String> {
+fn manual_env_unit_list() -> Vec<String> {
     let mut units = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -2253,6 +5672,13 @@ fn manual_unit_list() -> Vec<String> {
         }
     }
 
+    units
+}
+
+fn manual_unit_list() -> Vec<String> {
+    let mut units = manual_env_unit_list();
+    let mut seen: HashSet<String> = units.iter().cloned().collect();
+
     for unit in discovered_unit_list() {
         if seen.insert(unit.clone()) {
             units.push(unit);
@@ -2260,6 +5686,14 @@ fn manual_unit_list() -> Vec<String> {
     }
 
     units
+}
+
+fn webhook_unit_list() -> Vec<String> {
+    if env_flag(ENV_AUTO_DISCOVER) {
+        manual_unit_list()
+    } else {
+        manual_env_unit_list()
+    }
 }
 
 fn resolve_unit_identifier(raw: &str) -> Option<String> {
@@ -2297,7 +5731,7 @@ fn trigger_units(units: &[String], dry_run: bool) -> Vec<UnitActionResult> {
 fn all_units_ok(results: &[UnitActionResult]) -> bool {
     results
         .iter()
-        .all(|r| r.status == "triggered" || r.status == "dry-run")
+        .all(|r| r.status == "triggered" || r.status == "dry-run" || r.status == "pending")
 }
 
 fn trigger_single_unit(unit: &str, dry_run: bool) -> UnitActionResult {
@@ -2369,42 +5803,42 @@ fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result
             "scheduler tick iteration={iterations} unit={unit}"
         ));
 
-        match start_auto_update_unit(&unit) {
-            Ok(result) if result.success() => {
-                log_message(&format!(
-                    "scheduler triggered unit={unit} iteration={iterations}"
-                ));
-                record_system_event(
-                    "scheduler",
-                    202,
-                    json!({
-                        "unit": unit.clone(),
-                        "iteration": iterations,
-                        "status": "triggered",
-                    }),
-                );
-            }
-            Ok(result) => {
-                log_message(&format!(
-                    "scheduler failed unit={unit} iteration={iterations} exit={} stderr={}",
-                    exit_code_string(&result.status),
-                    result.stderr
-                ));
-                record_system_event(
-                    "scheduler",
-                    500,
-                    json!({
-                        "unit": unit.clone(),
-                        "iteration": iterations,
-                        "status": "failed",
-                        "stderr": result.stderr,
-                        "exit": exit_code_string(&result.status),
-                    }),
-                );
-            }
+        match create_scheduler_auto_update_task(&unit, iterations) {
+            Ok(task_id) => match spawn_manual_task(&task_id, "scheduler-auto-update") {
+                Ok(()) => {
+                    log_message(&format!(
+                        "scheduler dispatched task_id={task_id} unit={unit} iteration={iterations}"
+                    ));
+                    record_system_event(
+                        "scheduler",
+                        202,
+                        json!({
+                            "unit": unit.clone(),
+                            "iteration": iterations,
+                            "status": "queued",
+                            "task_id": task_id,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    log_message(&format!(
+                        "scheduler dispatch error unit={unit} iteration={iterations} err={err}"
+                    ));
+                    record_system_event(
+                        "scheduler",
+                        500,
+                        json!({
+                            "unit": unit.clone(),
+                            "iteration": iterations,
+                            "status": "dispatch-error",
+                            "error": err,
+                        }),
+                    );
+                }
+            },
             Err(err) => {
                 log_message(&format!(
-                    "scheduler error unit={unit} iteration={iterations} err={err}"
+                    "scheduler task-create error unit={unit} iteration={iterations} err={err}"
                 ));
                 record_system_event(
                     "scheduler",
@@ -2412,7 +5846,7 @@ fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result
                     json!({
                         "unit": unit.clone(),
                         "iteration": iterations,
-                        "status": "error",
+                        "status": "task-create-error",
                         "error": err,
                     }),
                 );
@@ -2436,6 +5870,15 @@ struct StatePruneReport {
     tokens_removed: usize,
     locks_removed: usize,
     legacy_dirs_removed: usize,
+    tasks_removed: usize,
+}
+
+fn task_retention_secs_from_env() -> u64 {
+    env::var(ENV_TASK_RETENTION_SECS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STATE_RETENTION_SECS)
+        .max(1)
 }
 
 fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneReport, String> {
@@ -2512,6 +5955,39 @@ fn prune_state_dir(retention: Duration, dry_run: bool) -> Result<StatePruneRepor
     }
 
     Ok(report)
+}
+
+fn prune_tasks_older_than(retention_secs: u64, dry_run: bool) -> Result<u64, String> {
+    let now_secs = current_unix_secs();
+    let cutoff_secs = now_secs.saturating_sub(retention_secs.max(1)) as i64;
+
+    if dry_run {
+        with_db(|pool| async move {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tasks \
+                 WHERE finished_at IS NOT NULL \
+                   AND finished_at < ? \
+                   AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')",
+            )
+            .bind(cutoff_secs)
+            .fetch_one(&pool)
+            .await?;
+            Ok::<u64, sqlx::Error>(count as u64)
+        })
+    } else {
+        with_db(|pool| async move {
+            let res = sqlx::query(
+                "DELETE FROM tasks \
+                 WHERE finished_at IS NOT NULL \
+                   AND finished_at < ? \
+                   AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')",
+            )
+            .bind(cutoff_secs)
+            .execute(&pool)
+            .await?;
+            Ok::<u64, sqlx::Error>(res.rows_affected())
+        })
+    }
 }
 
 fn handle_image_locks_api(ctx: &RequestContext) -> Result<(), String> {
@@ -2686,18 +6162,65 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
         .unwrap_or(DEFAULT_STATE_RETENTION_SECS / 3600)
         .saturating_mul(3600)
         .max(1);
+    let max_age_hours = retention_secs / 3600;
+    let task_retention_secs = task_retention_secs_from_env();
     let dry_run = request.dry_run;
 
-    match prune_state_dir(Duration::from_secs(retention_secs), dry_run) {
+    let task_id = create_maintenance_prune_task_for_api(max_age_hours, dry_run, ctx).ok();
+
+    let mut result = if let Some(ref task_id_ref) = task_id {
+        run_maintenance_prune_task(task_id_ref, retention_secs, dry_run)
+    } else {
+        prune_state_dir(Duration::from_secs(retention_secs), dry_run)
+    };
+
+    if task_id.is_none() {
+        if let Ok(report) = &mut result {
+            let tasks_removed = match prune_tasks_older_than(task_retention_secs, dry_run) {
+                Ok(count) => count as usize,
+                Err(err) => {
+                    log_message(&format!(
+                        "error task-prune-failed retention_secs={} dry_run={} err={}",
+                        task_retention_secs, dry_run, err
+                    ));
+                    0
+                }
+            };
+            report.tasks_removed = tasks_removed;
+            log_message(&format!(
+                "info task-prune removed {} tasks older than {} seconds dry_run={}",
+                tasks_removed, task_retention_secs, dry_run
+            ));
+        }
+    }
+
+    match result {
         Ok(report) => {
-            let response = json!({
-                "tokens_removed": report.tokens_removed,
-                "locks_removed": report.locks_removed,
-                "legacy_dirs_removed": report.legacy_dirs_removed,
-                "dry_run": dry_run,
-                "max_age_hours": retention_secs / 3600,
-            });
-            respond_json(ctx, 200, "OK", &response, "prune-state-api", None)?;
+            let response = PruneStateResponse {
+                tokens_removed: report.tokens_removed,
+                locks_removed: report.locks_removed,
+                legacy_dirs_removed: report.legacy_dirs_removed,
+                tasks_removed: report.tasks_removed,
+                task_retention_secs,
+                dry_run,
+                max_age_hours,
+                task_id: task_id.clone(),
+            };
+            let payload = serde_json::to_value(&response).map_err(|e| e.to_string())?;
+            respond_json(
+                ctx,
+                200,
+                "OK",
+                &payload,
+                "prune-state-api",
+                Some(json!({
+                    "dry_run": dry_run,
+                    "max_age_hours": max_age_hours,
+                    "task_retention_secs": task_retention_secs,
+                    "tasks_removed": report.tasks_removed,
+                    "task_id": task_id,
+                })),
+            )?;
             Ok(())
         }
         Err(err) => {
@@ -2707,7 +6230,10 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
                 "InternalServerError",
                 "failed to prune state",
                 "prune-state-api",
-                Some(json!({ "error": err })),
+                Some(json!({
+                    "error": err,
+                    "task_id": task_id,
+                })),
             )?;
             Ok(())
         }
@@ -2856,7 +6382,7 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     let head_only = ctx.method == "HEAD";
 
     let relative = match ctx.path.as_str() {
-        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/maintenance"
+        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/tasks" | "/maintenance"
         | "/settings" | "/401" => PathBuf::from("index.html"),
         path if path.starts_with("/assets/") => match sanitize_frontend_path(path) {
             Some(p) => p,
@@ -3129,7 +6655,7 @@ fn handle_webhooks_status(ctx: &RequestContext) -> Result<(), String> {
 
     let mut units: HashMap<String, UnitStatusAgg> = HashMap::new();
 
-    for unit in manual_unit_list() {
+    for unit in webhook_unit_list() {
         units
             .entry(unit.clone())
             .or_insert_with(|| UnitStatusAgg::new(unit));
@@ -3438,7 +6964,25 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         ctx.path
     ));
 
-    if let Err(err) = spawn_background_task(&unit, &image, &event, &delivery, &ctx.path) {
+    // Create a Task record for this webhook-triggered background job.
+    let task_meta = TaskMeta::GithubWebhook {
+        unit: unit.clone(),
+        image: image.clone(),
+        event: event.clone(),
+        delivery: delivery.clone(),
+        path: ctx.path.clone(),
+    };
+    let task_id = create_github_task(
+        &unit,
+        &image,
+        &event,
+        &delivery,
+        &ctx.path,
+        &ctx.request_id,
+        &task_meta,
+    )?;
+
+    if let Err(err) = spawn_background_task(&unit, &image, &event, &delivery, &ctx.path, &task_id) {
         log_message(&format!(
             "500 github-dispatch-failed unit={unit} image={image} event={event} delivery={delivery} path={} err={err}",
             ctx.path
@@ -3449,7 +6993,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             "InternalServerError",
             "failed to dispatch",
             "github-webhook",
-            Some(json!({ "unit": unit, "image": image, "error": err })),
+            Some(json!({ "unit": unit, "image": image, "error": err, "task_id": task_id })),
         )?;
         return Ok(());
     }
@@ -3460,7 +7004,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         "Accepted",
         "auto-update queued",
         "github-webhook",
-        Some(json!({ "unit": unit, "image": image, "delivery": delivery })),
+        Some(json!({ "unit": unit, "image": image, "delivery": delivery, "task_id": task_id })),
     )
 }
 
@@ -3744,6 +7288,27 @@ fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
     })
 }
 
+/// Best-effort graceful stop of a systemd unit backing a running task.
+fn stop_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
+    run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user").arg("stop").arg(unit);
+        cmd
+    })
+}
+
+/// Forcefully terminate a systemd unit backing a running task.
+fn kill_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
+    run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user")
+            .arg("kill")
+            .arg("--signal=SIGKILL")
+            .arg(unit);
+        cmd
+    })
+}
+
 fn pull_container_image(image: &str) -> Result<(), String> {
     for attempt in 1..=PULL_RETRY_ATTEMPTS {
         let result = run_quiet_command({
@@ -3801,6 +7366,7 @@ fn spawn_background_task(
     event: &str,
     delivery: &str,
     path: &str,
+    task_id: &str,
 ) -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let exe_str = exe.to_str().ok_or_else(|| "invalid exe path".to_string())?;
@@ -3808,10 +7374,10 @@ fn spawn_background_task(
     let unit_name = format!("webhook-task-{}", suffix);
 
     log_message(&format!(
-        "debug github-dispatch-launch unit={unit} image={image} event={event} delivery={delivery} path={path} exe={exe_str} task-unit={unit_name}"
+        "debug github-dispatch-launch unit={unit} image={image} event={event} delivery={delivery} path={path} exe={exe_str} task-unit={unit_name} task_id={task_id}"
     ));
 
-    let args = build_systemd_run_args(&unit_name, exe_str, unit, image, event, delivery, path);
+    let args = build_systemd_run_args(&unit_name, exe_str, task_id);
 
     if let Ok(snapshot) = env::var(ENV_SYSTEMD_RUN_SNAPSHOT) {
         fs::write(snapshot, args.join("\n")).map_err(|e| e.to_string())?;
@@ -3832,27 +7398,16 @@ fn spawn_background_task(
             log_message(&format!(
                 "warn github-dispatch-fallback no-systemd-run err={err} running-inline"
             ));
-            spawn_inline_task(exe_str, unit, image, event, delivery, path)
+            spawn_inline_task(exe_str, task_id)
         }
     }
 }
 
-fn spawn_inline_task(
-    exe: &str,
-    unit: &str,
-    image: &str,
-    event: &str,
-    delivery: &str,
-    path: &str,
-) -> Result<(), String> {
+fn spawn_inline_task(exe: &str, task_id: &str) -> Result<(), String> {
     // Best-effort fallback when systemd-run is unavailable (dev/test containers).
     Command::new(exe)
         .arg("--run-task")
-        .arg(unit)
-        .arg(image)
-        .arg(event)
-        .arg(delivery)
-        .arg(path)
+        .arg(task_id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -3861,15 +7416,7 @@ fn spawn_inline_task(
         .map_err(|e| e.to_string())
 }
 
-fn build_systemd_run_args(
-    unit_name: &str,
-    exe: &str,
-    unit: &str,
-    image: &str,
-    event: &str,
-    delivery: &str,
-    path: &str,
-) -> Vec<String> {
+fn build_systemd_run_args(unit_name: &str, exe: &str, task_id: &str) -> Vec<String> {
     vec![
         "--user".into(),
         "--collect".into(),
@@ -3877,15 +7424,12 @@ fn build_systemd_run_args(
         format!("--unit={unit_name}"),
         exe.to_string(),
         "--run-task".into(),
-        unit.to_string(),
-        image.to_string(),
-        event.to_string(),
-        delivery.to_string(),
-        path.to_string(),
+        task_id.to_string(),
     ]
 }
 
 fn run_background_task(
+    task_id: &str,
     unit: &str,
     image: &str,
     event: &str,
@@ -3902,12 +7446,32 @@ fn run_background_task(
             log_message(&format!(
                 "429 github-rate-limit lock-timeout image={image} event={event} delivery={delivery} path={path}"
             ));
+            update_task_state_with_unit(
+                task_id,
+                "skipped",
+                unit,
+                "skipped",
+                "Skipped due to image rate-limit lock timeout",
+                "image-rate-limit",
+                "warning",
+                json!({ "reason": "lock-timeout", "image": image, "event": event, "delivery": delivery, "path": path }),
+            );
             return Ok(());
         }
         Err(RateLimitError::Exceeded { c1, l1, .. }) => {
             log_message(&format!(
                 "429 github-rate-limit image={image} count={c1}/{l1} event={event} delivery={delivery} path={path}"
             ));
+            update_task_state_with_unit(
+                task_id,
+                "skipped",
+                unit,
+                "skipped",
+                "Skipped due to image rate-limit exceeded",
+                "image-rate-limit",
+                "warning",
+                json!({ "reason": "limit", "c1": c1, "l1": l1, "image": image, "event": event, "delivery": delivery, "path": path }),
+            );
             return Ok(());
         }
         Err(RateLimitError::Io(err)) => return Err(err),
@@ -3919,6 +7483,16 @@ fn run_background_task(
         log_message(&format!(
             "500 github-image-pull-failed unit={unit} image={image} event={event} delivery={delivery} path={path} err={err}"
         ));
+        update_task_state_with_unit(
+            task_id,
+            "failed",
+            unit,
+            "failed",
+            "Image pull failed for github webhook task",
+            "image-pull",
+            "error",
+            json!({ "error": err, "image": image, "event": event, "delivery": delivery, "path": path }),
+        );
         return Ok(());
     }
 
@@ -3928,6 +7502,16 @@ fn run_background_task(
                 "202 github-triggered unit={unit} image={image} event={event} delivery={delivery} path={path}"
             ));
             prune_images_silently();
+            update_task_state_with_unit(
+                task_id,
+                "succeeded",
+                unit,
+                "succeeded",
+                "Github webhook task completed successfully",
+                "restart-unit",
+                "info",
+                json!({ "status": "ok", "image": image, "event": event, "delivery": delivery, "path": path }),
+            );
         }
         Ok(result) => {
             let mut message = format!(
@@ -3939,15 +7523,449 @@ fn run_background_task(
                 message.push_str(&result.stderr);
             }
             log_message(&message);
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Restart unit failed for github webhook task",
+                "restart-unit",
+                "error",
+                json!({
+                    "exit": exit_code_string(&result.status),
+                    "stderr": result.stderr,
+                    "image": image,
+                    "event": event,
+                    "delivery": delivery,
+                    "path": path,
+                }),
+            );
         }
         Err(err) => {
             log_message(&format!(
                 "500 github-restart-error unit={unit} image={image} event={event} delivery={delivery} path={path} err={err}"
             ));
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Restart unit error for github webhook task",
+                "restart-unit",
+                "error",
+                json!({ "error": err, "image": image, "event": event, "delivery": delivery, "path": path }),
+            );
         }
     }
 
     Ok(())
+}
+
+fn update_task_state_with_unit(
+    task_id: &str,
+    new_status: &str,
+    unit: &str,
+    unit_status: &str,
+    summary: &str,
+    log_action: &str,
+    log_level: &str,
+    meta: Value,
+) {
+    let task_id_owned = task_id.to_string();
+    let unit_owned = unit.to_string();
+    let status_owned = new_status.to_string();
+    let unit_status_owned = unit_status.to_string();
+    let summary_owned = summary.to_string();
+    let log_action_owned = log_action.to_string();
+    let log_level_owned = log_level.to_string();
+    let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+    let now = current_unix_secs() as i64;
+
+    let _ = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "UPDATE tasks \
+             SET status = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?, summary = ? \
+             WHERE task_id = ?",
+        )
+        .bind(&status_owned)
+        .bind(now)
+        .bind(now)
+        .bind(&summary_owned)
+        .bind(&task_id_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE task_units \
+             SET status = ?, finished_at = COALESCE(finished_at, ?), message = ? \
+             WHERE task_id = ? AND unit = ?",
+        )
+        .bind(&unit_status_owned)
+        .bind(now)
+        .bind(&summary_owned)
+        .bind(&task_id_owned)
+        .bind(&unit_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_owned)
+        .bind(now)
+        .bind(&log_level_owned)
+        .bind(&log_action_owned)
+        .bind(&status_owned)
+        .bind(&summary_owned)
+        .bind(Some(unit_owned))
+        .bind(meta_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+}
+
+fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
+    let task_id_owned = task_id.to_string();
+    let (units,): (Vec<String>,) = with_db(|pool| async move {
+        let rows: Vec<SqliteRow> =
+            sqlx::query("SELECT unit FROM task_units WHERE task_id = ? ORDER BY id")
+                .bind(&task_id_owned)
+                .fetch_all(&pool)
+                .await?;
+        let mut units = Vec::with_capacity(rows.len());
+        for row in rows {
+            units.push(row.get::<String, _>("unit"));
+        }
+        Ok::<(Vec<String>,), sqlx::Error>((units,))
+    })?;
+
+    if units.is_empty() {
+        log_message(&format!(
+            "info run-task manual-trigger no-units task_id={task_id}"
+        ));
+        return Ok(());
+    }
+
+    let mut results = Vec::with_capacity(units.len());
+    for unit in &units {
+        results.push(trigger_single_unit(unit, false));
+    }
+
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    for res in &results {
+        match res.status.as_str() {
+            "triggered" => succeeded = succeeded.saturating_add(1),
+            "dry-run" => {}
+            _ => failed = failed.saturating_add(1),
+        }
+    }
+
+    let total = results.len();
+    let status = if failed > 0 { "failed" } else { "succeeded" };
+    let summary = if failed > 0 {
+        format!("{succeeded}/{total} units triggered, {failed} failed")
+    } else {
+        format!("{succeeded}/{total} units triggered")
+    };
+
+    let task_id_upd = task_id.to_string();
+    let units_upd = units.clone();
+
+    let _ = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+        let now = current_unix_secs() as i64;
+
+        sqlx::query(
+            "UPDATE tasks \
+             SET status = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?, summary = ? \
+             WHERE task_id = ?",
+        )
+        .bind(status)
+        .bind(now)
+        .bind(now)
+        .bind(&summary)
+        .bind(&task_id_upd)
+        .execute(&mut *tx)
+        .await?;
+
+        for (unit, res) in units_upd.iter().zip(results.iter()) {
+            let unit_status = match res.status.as_str() {
+                "triggered" => "succeeded",
+                "dry-run" => "skipped",
+                "failed" | "error" => "failed",
+                other => other,
+            };
+
+            sqlx::query(
+                "UPDATE task_units \
+                 SET status = ?, finished_at = COALESCE(finished_at, ?), message = ? \
+                 WHERE task_id = ? AND unit = ?",
+            )
+            .bind(unit_status)
+            .bind(now)
+            .bind(&res.message)
+            .bind(&task_id_upd)
+            .bind(unit)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_upd)
+        .bind(now)
+        .bind(if failed > 0 { "warning" } else { "info" })
+        .bind("manual-trigger-run")
+        .bind(status)
+        .bind(&summary)
+        .bind(Option::<String>::None)
+        .bind(
+            serde_json::to_string(&json!({
+                "units": units_upd,
+                "results": results,
+            }))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    Ok(())
+}
+
+fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Result<(), String> {
+    let unit_owned = unit.to_string();
+    if let Some(image) = image {
+        if let Err(err) = pull_container_image(image) {
+            log_message(&format!(
+                "500 manual-service-image-pull-failed unit={unit_owned} image={image} err={err}"
+            ));
+            let meta = json!({ "unit": unit_owned, "image": image, "error": err });
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                &unit_owned,
+                "failed",
+                "Manual service image pull failed",
+                "image-pull",
+                "error",
+                meta,
+            );
+            return Ok(());
+        }
+    }
+
+    let result = trigger_single_unit(&unit_owned, false);
+    let unit_status = match result.status.as_str() {
+        "triggered" => "succeeded",
+        "dry-run" => "skipped",
+        "failed" | "error" => "failed",
+        other => other,
+    };
+    let task_status = if unit_status == "failed" {
+        "failed"
+    } else {
+        "succeeded"
+    };
+    let summary = if unit_status == "failed" {
+        "Manual service task failed".to_string()
+    } else {
+        "Manual service task succeeded".to_string()
+    };
+
+    let meta = json!({
+        "unit": unit_owned,
+        "image": image,
+        "result_status": result.status,
+        "result_message": result.message,
+    });
+
+    update_task_state_with_unit(
+        task_id,
+        task_status,
+        &unit_owned,
+        unit_status,
+        &summary,
+        "manual-service-run",
+        if unit_status == "failed" {
+            "error"
+        } else {
+            "info"
+        },
+        meta,
+    );
+
+    Ok(())
+}
+
+fn run_auto_update_task(task_id: &str, unit: &str) -> Result<(), String> {
+    let unit_owned = unit.to_string();
+    match start_auto_update_unit(&unit_owned) {
+        Ok(result) if result.success() => {
+            log_message(&format!(
+                "202 auto-update-start unit={unit_owned} task_id={task_id}"
+            ));
+            let meta = json!({
+                "unit": unit_owned,
+                "stderr": result.stderr,
+            });
+            update_task_state_with_unit(
+                task_id,
+                "succeeded",
+                unit,
+                "succeeded",
+                "Auto-update unit started successfully",
+                "auto-update-start",
+                "info",
+                meta,
+            );
+            Ok(())
+        }
+        Ok(result) => {
+            let exit = exit_code_string(&result.status);
+            log_message(&format!(
+                "500 auto-update-failed unit={unit_owned} task_id={task_id} exit={exit} stderr={}",
+                result.stderr
+            ));
+            let meta = json!({
+                "unit": unit_owned,
+                "stderr": result.stderr,
+                "exit": exit,
+            });
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Auto-update unit failed to start",
+                "auto-update-start",
+                "error",
+                meta,
+            );
+            Ok(())
+        }
+        Err(err) => {
+            log_message(&format!(
+                "500 auto-update-error unit={unit_owned} task_id={task_id} err={err}"
+            ));
+            let meta = json!({
+                "unit": unit_owned,
+                "error": err,
+            });
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Auto-update unit error",
+                "auto-update-start",
+                "error",
+                meta,
+            );
+            Ok(())
+        }
+    }
+}
+
+fn run_maintenance_prune_task(
+    task_id: &str,
+    retention_secs: u64,
+    dry_run: bool,
+) -> Result<StatePruneReport, String> {
+    let unit = "state-prune";
+    match prune_state_dir(Duration::from_secs(retention_secs.max(1)), dry_run) {
+        Ok(mut report) => {
+            let task_retention_secs = task_retention_secs_from_env();
+            let tasks_removed = match prune_tasks_older_than(task_retention_secs, dry_run) {
+                Ok(count) => count as usize,
+                Err(err) => {
+                    log_message(&format!(
+                        "error task-prune-failed retention_secs={} dry_run={} err={}",
+                        task_retention_secs, dry_run, err
+                    ));
+                    0
+                }
+            };
+            report.tasks_removed = tasks_removed;
+            log_message(&format!(
+                "info task-prune removed {} tasks older than {} seconds dry_run={}",
+                tasks_removed, task_retention_secs, dry_run
+            ));
+
+            let summary = if dry_run {
+                format!(
+                    "State prune dry-run completed: tokens={} locks={} legacy_dirs={} tasks={}",
+                    report.tokens_removed,
+                    report.locks_removed,
+                    report.legacy_dirs_removed,
+                    report.tasks_removed
+                )
+            } else {
+                format!(
+                    "State prune completed: tokens={} locks={} legacy_dirs={} tasks={}",
+                    report.tokens_removed,
+                    report.locks_removed,
+                    report.legacy_dirs_removed,
+                    report.tasks_removed
+                )
+            };
+            let meta = json!({
+                "unit": unit,
+                "dry_run": dry_run,
+                "retention_secs": retention_secs.max(1),
+                "tokens_removed": report.tokens_removed,
+                "locks_removed": report.locks_removed,
+                "legacy_dirs_removed": report.legacy_dirs_removed,
+                "task_retention_secs": task_retention_secs,
+                "tasks_removed": report.tasks_removed,
+            });
+            update_task_state_with_unit(
+                task_id,
+                "succeeded",
+                unit,
+                "succeeded",
+                &summary,
+                "state-prune-run",
+                "info",
+                meta,
+            );
+            Ok(report)
+        }
+        Err(err) => {
+            let summary = "State prune failed".to_string();
+            let meta = json!({
+                "unit": unit,
+                "dry_run": dry_run,
+                "retention_secs": retention_secs.max(1),
+                "error": err.clone(),
+            });
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                &summary,
+                "state-prune-run",
+                "error",
+                meta,
+            );
+            Err(err)
+        }
+    }
 }
 
 fn unit_configured_image(unit: &str) -> Option<String> {
@@ -4034,6 +8052,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+    use std::fs;
     use std::io::Write;
     use std::sync::Once;
     use tempfile::NamedTempFile;
@@ -4054,6 +8073,22 @@ mod tests {
                 .await?;
             Ok::<(), sqlx::Error>(())
         });
+    }
+
+    fn init_test_db_with_systemctl_mock() {
+        init_test_db();
+
+        // Point systemctl to the test stub under tests/mock-bin to avoid
+        // touching the real host systemd during tests.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mock_dir = format!("{manifest_dir}/tests/mock-bin");
+
+        let current_path = env::var("PATH").unwrap_or_default();
+        let new_path = format!("{mock_dir}:{current_path}");
+        set_env("PATH", &new_path);
+
+        let log_path = format!("{mock_dir}/log.txt");
+        let _ = fs::remove_file(&log_path);
     }
 
     #[allow(unused_unsafe)]
@@ -4157,16 +8192,83 @@ mod tests {
     }
 
     #[test]
-    fn systemd_run_args_match_expected() {
-        let args = build_systemd_run_args(
-            "webhook-task-demo",
-            "/usr/bin/webhook",
+    fn github_task_stop_marks_cancelled_and_stops_runner_unit() {
+        init_test_db_with_systemctl_mock();
+
+        // Create a github-webhook task with a known delivery id so we can
+        // predict the transient unit name.
+        let meta = TaskMeta::GithubWebhook {
+            unit: "demo.service".to_string(),
+            image: "ghcr.io/example/demo:latest".to_string(),
+            event: "push".to_string(),
+            delivery: "abc123".to_string(),
+            path: "/github/demo".to_string(),
+        };
+
+        let task_id = create_github_task(
             "demo.service",
-            "ghcr.io/example/demo:main",
-            "registry_package",
-            "delivery123",
-            "/github-package-update/demo",
+            "ghcr.io/example/demo:latest",
+            "push",
+            "abc123",
+            "/github/demo",
+            "req-test-stop",
+            &meta,
+        )
+        .expect("task created");
+
+        // Invoke the stop handler as the HTTP layer would.
+        let ctx = RequestContext {
+            method: "POST".to_string(),
+            path: format!("/api/tasks/{task_id}/stop"),
+            query: None,
+            headers: HashMap::new(),
+            body: Vec::new(),
+            raw_request: String::new(),
+            request_id: "req-test-stop".to_string(),
+            started_at: Instant::now(),
+            received_at: SystemTime::now(),
+        };
+
+        handle_task_stop(&ctx, &task_id).expect("stop handler should not error");
+
+        // Verify DB state: task is cancelled and no longer stoppable.
+        let task_id_clone = task_id.clone();
+        let (status, can_stop, can_force_stop, can_retry) = with_db(|pool| async move {
+            let row: SqliteRow = sqlx::query(
+                "SELECT status, can_stop, can_force_stop, can_retry \
+                     FROM tasks WHERE task_id = ?",
+            )
+            .bind(&task_id_clone)
+            .fetch_one(&pool)
+            .await?;
+
+            Ok::<(String, i64, i64, i64), sqlx::Error>((
+                row.get("status"),
+                row.get("can_stop"),
+                row.get("can_force_stop"),
+                row.get("can_retry"),
+            ))
+        })
+        .expect("db query");
+
+        assert_eq!(status, "cancelled");
+        assert_eq!(can_stop, 0);
+        assert_eq!(can_force_stop, 0);
+        assert_eq!(can_retry, 1);
+
+        // Verify that the mock systemctl saw a stop for the derived transient unit.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let log_path = format!("{manifest_dir}/tests/mock-bin/log.txt");
+        let log_contents = fs::read_to_string(&log_path).expect("systemctl log should exist");
+        assert!(
+            log_contents.contains("systemctl --user stop webhook-task-abc123"),
+            "expected stop of webhook-task-abc123, got log:\n{log_contents}"
         );
+    }
+
+    #[test]
+    fn systemd_run_args_match_expected() {
+        let args = build_systemd_run_args("webhook-task-demo", "/usr/bin/webhook", "tsk_demo_task");
 
         assert_eq!(args[0], "--user");
         assert_eq!(args[1], "--collect");
@@ -4174,11 +8276,7 @@ mod tests {
         assert_eq!(args[3], "--unit=webhook-task-demo");
         assert_eq!(args[4], "/usr/bin/webhook");
         assert_eq!(args[5], "--run-task");
-        assert_eq!(args[6], "demo.service");
-        assert_eq!(args[7], "ghcr.io/example/demo:main");
-        assert_eq!(args[8], "registry_package");
-        assert_eq!(args[9], "delivery123");
-        assert_eq!(args[10], "/github-package-update/demo");
+        assert_eq!(args[6], "tsk_demo_task");
     }
 
     #[test]
@@ -4816,7 +8914,7 @@ fn seed_demo_data() -> Result<(), String> {
 
         for (request_id, ts, method, path, status, action, duration_ms, meta) in events {
             sqlx::query(
-                "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta, task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(request_id)
             .bind(ts)
@@ -4826,6 +8924,7 @@ fn seed_demo_data() -> Result<(), String> {
             .bind(action)
             .bind(duration_ms as i64)
             .bind(serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string()))
+            .bind(None::<String>)
             .execute(&pool)
             .await?;
         }
@@ -4878,6 +8977,13 @@ fn persist_event_record(
         None => return,
     };
 
+    // Extract structured task_id (if present) from meta so it can be stored in
+    // a dedicated column for efficient querying by task.
+    let task_id = meta
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let Ok(meta_str) = serde_json::to_string(meta) else {
         return;
     };
@@ -4891,12 +8997,13 @@ fn persist_event_record(
         action: action.to_string(),
         duration_ms: elapsed_ms as i64,
         meta: meta_str,
+        task_id,
     };
     let pool = pool.clone();
 
     let fut = async move {
         if let Err(err) = sqlx::query(
-            "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO event_log (request_id, ts, method, path, status, action, duration_ms, meta, task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.request_id)
         .bind(record.ts)
@@ -4906,6 +9013,7 @@ fn persist_event_record(
         .bind(record.action)
         .bind(record.duration_ms)
         .bind(record.meta)
+        .bind(record.task_id)
         .execute(&pool)
         .await
         {
@@ -4946,6 +9054,7 @@ struct DbEventRecord {
     action: String,
     duration_ms: i64,
     meta: String,
+    task_id: Option<String>,
 }
 
 fn respond_text(

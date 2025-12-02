@@ -18,11 +18,15 @@ type HmacSha256 = Hmac<Sha256>;
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_full_suite() -> AnyResult<()> {
     scenario_auto_discovery().await?;
+    scenario_webhook_auto_discovery_toggle().await?;
     scenario_health_db_error().await?;
     scenario_github_webhook().await?;
     scenario_rate_limit_and_prune().await?;
+    scenario_task_prune_retention().await?;
+    scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
     scenario_scheduler_loop().await?;
+    scenario_events_task_filter().await?;
     scenario_error_paths().await?;
     scenario_static_assets().await?;
     scenario_cli_maintenance().await?;
@@ -63,6 +67,72 @@ async fn scenario_auto_discovery() -> AnyResult<()> {
         .filter(|svc| svc["source"] == Value::from("discovered"))
         .collect();
     assert_eq!(sources.len(), 2);
+
+    Ok(())
+}
+
+async fn scenario_webhook_auto_discovery_toggle() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-gamma.container"),
+        b"[Container]\nImage=example\nAutoupdate=registry",
+    )?;
+    fs::write(
+        container_dir.join("svc-delta.service"),
+        b"[Unit]\nDescription=dummy",
+    )?;
+
+    // Auto-discovery disabled (default): webhooks list should only include manual/env units.
+    let disabled = env.send_request_with_env(HttpRequest::get("/api/webhooks/status"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+    })?;
+    assert_eq!(disabled.status, 200);
+    let body = disabled.json_body()?;
+    let units = body["units"].as_array().unwrap();
+    let unit_names: Vec<String> = units
+        .iter()
+        .filter_map(|u| {
+            u.get("unit")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert!(
+        !unit_names.iter().any(|u| u == "svc-gamma.service"),
+        "svc-gamma.service should not be present when PODUP_AUTO_DISCOVER is disabled",
+    );
+    assert!(
+        !unit_names.iter().any(|u| u == "svc-delta.service"),
+        "svc-delta.service should not be present when PODUP_AUTO_DISCOVER is disabled",
+    );
+
+    // Auto-discovery enabled: webhooks list should include discovered units.
+    let enabled = env.send_request_with_env(HttpRequest::get("/api/webhooks/status"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        cmd.env("PODUP_AUTO_DISCOVER", "1");
+    })?;
+    assert_eq!(enabled.status, 200);
+    let body = enabled.json_body()?;
+    let units = body["units"].as_array().unwrap();
+    let unit_names: Vec<String> = units
+        .iter()
+        .filter_map(|u| {
+            u.get("unit")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    assert!(
+        unit_names.iter().any(|u| u == "svc-gamma.service"),
+        "svc-gamma.service should be present when PODUP_AUTO_DISCOVER is enabled",
+    );
+    assert!(
+        unit_names.iter().any(|u| u == "svc-delta.service"),
+        "svc-delta.service should be present when PODUP_AUTO_DISCOVER is enabled",
+    );
 
     Ok(())
 }
@@ -218,6 +288,190 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
     Ok(())
 }
 
+async fn scenario_task_prune_retention() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    let pool = env.connect_db().await?;
+    let now = current_unix_secs() as i64;
+    let old_finished = now - 2 * 3600;
+    let recent_finished = now;
+
+    // Old succeeded task (should be pruned).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("old-succeeded")
+    .bind("manual")
+    .bind("succeeded")
+    .bind(old_finished)
+    .bind(old_finished)
+    .bind(old_finished)
+    .bind("old succeeded task")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)")
+        .bind("old-succeeded")
+        .bind("svc-old.service")
+        .bind("succeeded")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO task_logs (task_id, ts, level, action, status, summary) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("old-succeeded")
+    .bind(old_finished)
+    .bind("info")
+    .bind("test-old")
+    .bind("succeeded")
+    .bind("old task log")
+    .execute(&pool)
+    .await?;
+
+    // Recent succeeded task (should be kept).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("recent-succeeded")
+    .bind("manual")
+    .bind("succeeded")
+    .bind(recent_finished)
+    .bind(recent_finished)
+    .bind(recent_finished)
+    .bind("recent succeeded task")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("INSERT INTO task_units (task_id, unit, status) VALUES (?, ?, ?)")
+        .bind("recent-succeeded")
+        .bind("svc-recent.service")
+        .bind("succeeded")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO task_logs (task_id, ts, level, action, status, summary) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("recent-succeeded")
+    .bind(recent_finished)
+    .bind("info")
+    .bind("test-recent")
+    .bind("succeeded")
+    .bind("recent task log")
+    .execute(&pool)
+    .await?;
+
+    // Running task (non-terminal status, should be kept).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("running-task")
+    .bind("manual")
+    .bind("running")
+    .bind(now)
+    .bind(now)
+    .bind(Option::<i64>::None)
+    .bind("running task")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    // Terminal status without finished_at (should be kept).
+    sqlx::query(
+        "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, summary, meta, trigger_source) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind("succeeded-no-finished")
+    .bind("manual")
+    .bind("succeeded")
+    .bind(now)
+    .bind(now)
+    .bind(Option::<i64>::None)
+    .bind("succeeded without finished_at")
+    .bind("{}")
+    .bind("test")
+    .execute(&pool)
+    .await?;
+
+    // Run prune-state with a 1 hour task retention window so only the old task is pruned.
+    let mut prune_cmd = env.command();
+    prune_cmd.arg("prune-state");
+    prune_cmd.env("PODUP_TASK_RETENTION_SECS", "3600");
+    let prune_output = env.run_command(prune_cmd)?;
+    assert!(
+        prune_output.status.success(),
+        "prune-state task prune failed: status={} stdout={} stderr={}",
+        prune_output.status,
+        prune_output.stdout,
+        prune_output.stderr
+    );
+
+    // Old succeeded task and its units/logs should be gone.
+    let remaining_old_tasks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'old-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_old_tasks, 0);
+
+    let remaining_old_units: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_units WHERE task_id = 'old-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_old_units, 0);
+
+    let remaining_old_logs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_logs WHERE task_id = 'old-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_old_logs, 0);
+
+    // Recent succeeded task and its units/logs should still exist.
+    let remaining_recent_tasks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'recent-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_recent_tasks, 1);
+
+    let remaining_recent_units: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_units WHERE task_id = 'recent-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_recent_units, 1);
+
+    let remaining_recent_logs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task_logs WHERE task_id = 'recent-succeeded'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_recent_logs, 1);
+
+    // Running and terminal-without-finished tasks should remain.
+    let remaining_running: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'running-task'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_running, 1);
+
+    let remaining_no_finished: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE task_id = 'succeeded-no-finished'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(remaining_no_finished, 1);
+
+    Ok(())
+}
+
 async fn scenario_manual_api() -> AnyResult<()> {
     let env = TestEnv::new()?;
     env.clear_mock_log()?;
@@ -240,6 +494,15 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let trigger_json = trigger.json_body()?;
     assert_eq!(trigger_json["dry_run"], Value::from(true));
     assert_eq!(trigger_json["triggered"].as_array().unwrap().len(), 3);
+    // Manual trigger response should echo a non-empty request_id for UI navigation.
+    let trigger_request_id = trigger_json["request_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !trigger_request_id.is_empty(),
+        "manual trigger response must include request_id"
+    );
     let non_discovery: Vec<_> = env
         .read_mock_log()?
         .into_iter()
@@ -266,7 +529,16 @@ async fn scenario_manual_api() -> AnyResult<()> {
     )?;
     assert_eq!(service.status, 202);
     let service_json = service.json_body()?;
-    assert_eq!(service_json["status"], Value::from("triggered"));
+    assert_eq!(service_json["status"], Value::from("pending"));
+    // Per-service trigger should also return a non-empty request_id.
+    let service_request_id = service_json["request_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !service_request_id.is_empty(),
+        "manual service response must include request_id"
+    );
 
     let log_lines = env.read_mock_log()?;
     assert!(
@@ -323,6 +595,73 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
         .filter(|row| row.action == "scheduler")
         .collect();
     assert_eq!(scheduler_events.len(), 2);
+    Ok(())
+}
+
+async fn scenario_settings_tasks_retention() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    let response = env.send_request(HttpRequest::get("/api/settings"))?;
+    assert_eq!(response.status, 200);
+    let json = response.json_body()?;
+    let tasks = json.get("tasks").cloned().unwrap_or_else(|| json!({}));
+
+    let effective = tasks["task_retention_secs"].as_u64().unwrap_or(0);
+    let default = tasks["default_state_retention_secs"].as_u64().unwrap_or(0);
+    let env_override = tasks["env_override"].as_bool().unwrap_or(false);
+
+    assert_eq!(
+        effective, 86_400,
+        "expected default task_retention_secs to match DEFAULT_STATE_RETENTION_SECS (86400)"
+    );
+    assert_eq!(
+        default, 86_400,
+        "default_state_retention_secs should reflect DEFAULT_STATE_RETENTION_SECS (86400)"
+    );
+    assert!(
+        !env_override,
+        "env_override should be false when PODUP_TASK_RETENTION_SECS is not set"
+    );
+
+    Ok(())
+}
+
+async fn scenario_events_task_filter() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    let mut trigger_cmd = env.command();
+    trigger_cmd.arg("trigger-units").arg("svc-alpha.service");
+    let trigger_output = env.run_command(trigger_cmd)?;
+    assert!(
+        trigger_output.status.success(),
+        "trigger-units svc-alpha.service failed: status={} stdout={} stderr={}",
+        trigger_output.status,
+        trigger_output.stdout,
+        trigger_output.stderr
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find_map(|row| row.meta.get("task_id").and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "cli-trigger events should include a task_id in meta"
+    );
+
+    let path = format!("/api/events?task_id={task_id}");
+    let response = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(response.status, 200, "/api/events?task_id status");
+    let body = response.json_body()?;
+    let events = body["events"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !events.is_empty(),
+        "/api/events?task_id filter should return at least one event"
+    );
+
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 import { Icon } from '@iconify/react'
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
 
@@ -23,6 +24,7 @@ type FileStats = {
 export default function MaintenancePage() {
   const { getJson, postJson } = useApi()
   const { pushToast } = useToast()
+  const navigate = useNavigate()
   const [resources, setResources] = useState<SettingsResources['resources'] | null>(null)
   const [maxAgeHours, setMaxAgeHours] = useState('24')
   const [prunePending, setPrunePending] = useState(false)
@@ -52,6 +54,7 @@ export default function MaintenancePage() {
       legacy_dirs_removed?: number
       dry_run?: boolean
       max_age_hours?: number
+      task_id?: string | null
     }
     try {
       const maxAge = Number(maxAgeHours) || 24
@@ -64,6 +67,15 @@ export default function MaintenancePage() {
         title: '清理完成',
         message: `tokens=${result.tokens_removed ?? 0}, locks=${result.locks_removed ?? 0}`,
       })
+
+      if (result.task_id) {
+        pushToast({
+          variant: 'info',
+          title: '已创建维护任务',
+          message: '正在 /tasks 中跟踪清理进度。',
+        })
+        navigate(`/tasks?task_id=${encodeURIComponent(result.task_id)}`)
+      }
     } catch (err) {
       const message =
         err && typeof err === 'object' && 'message' in err && err.message

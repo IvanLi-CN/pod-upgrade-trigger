@@ -21,7 +21,7 @@
 
 ## Future Enhancements
 
-- [ ] Optional auto-discovery of webhook-capable systemd units:
+- [x] Optional auto-discovery of webhook-capable systemd units:
   - When enabled via a dedicated flag/env (e.g. `PODUP_AUTO_DISCOVER=1`), scan systemd units by naming convention or explicit marker (such as `X-Webhook-Enabled=yes`) to build the GitHub Webhooks list instead of (or in addition to) `PODUP_MANUAL_UNITS`.
   - Keep the current explicit list as the default/safe behavior; auto-discovery should be opt-in and clearly documented.
 
@@ -31,3 +31,43 @@
 - [x] Add startup/self-check paths so `/api/webhooks/status` and `/api/image-locks` return structured errors (not 502) and emit logs when DB or Podman connectivity fails.
 - [x] Auto-create/migrate the state DB when missing or unwritable; when impossible, surface actionable guidance on the health page (path + env hints).
 - [x] Settings page should show the discovered auto-update unit count plus a summary list, distinct from env-provided manual units, to aid ops reconciliation.
+
+## Task Management Panel – Frontend-First Phase
+
+- [x] Task domain modeling & mock infrastructure (frontend only)
+  - Define Task-related TypeScript types in `web` (Task, TaskStatus, TaskKind, TaskUnitSummary, TaskLogEntry, etc.).
+  - Add MSW handlers for `/api/tasks` list, `/api/tasks/:id` detail, and actions (`/api/tasks/:id/stop`, `/force-stop`, `/retry`), with rich fake data.
+  - Cover core scenarios in mock data: manual/webhook/scheduler/maintenance/other automatic tasks, running/failed/succeeded/cancelled.
+
+- [x] Tasks list page (page mode) UI & interactions (frontend + mock)
+  - Introduce `/tasks` route and sidebar navigation entry, wired to `useApi` over mocked endpoints.
+  - Implement tasks table with pagination, status/type/unit filters, and unit text search.
+  - Implement quick category switcher (e.g. All / Manual / Webhook / Automatic / Maintenance) synced with type filters.
+  - Add list polling (e.g. every 5–10 seconds) with proper loading/empty/error states.
+
+- [x] Task detail view & drawer mode (frontend + mock)
+  - Implement task detail layout: summary card, per-unit status list, and log timeline backed by mock detail API.
+  - Implement right-side drawer component that hosts the full-detail view in a compact layout.
+  - Wire `/tasks` list rows to open the drawer on click; support closing without losing list filters/scroll position.
+  - Add detail polling for running tasks only, stopping automatically once a terminal state is reached.
+  - Implement stop/force-stop/retry flows purely against mocks, updating local state and surfacing toast feedback.
+
+- [x] Integration with existing pages for long-running flows (frontend + mock)
+  - For Manual/Maintenance-style actions that may launch long-running work, mock a “create task” API that returns `task_id` and long-running hints.
+  - On successful creation, automatically open the corresponding task drawer and start polling its detail.
+  - Adjust existing UI flows (where appropriate) to guide users from Events/Webhooks/Maintenance into the Tasks view when they need task-centric insights.
+
+- [x] Backend contract shaping based on frontend experience
+  - From the stabilized frontend + mock behavior, extract a concrete Task entity and API contract proposal.
+  - Document expected fields, status transitions, and relationships to `event_log` (including how logs are queried per task).
+  - Capture any additional fields discovered during UX trials (e.g. richer summaries, counters, or hints for graceful vs force stop).
+
+- [x] Complete MSW mocks for task APIs
+  - Implement `/api/tasks` list, `/api/tasks/:id` detail, and `/api/tasks/:id/{stop,force-stop,retry}` handlers with realistic fixture data.
+  - Ensure `/tasks` 页面在 mock 模式下有可用的列表数据与抽屉详情，便于前端自测。
+
+## Frontend Mock – Follow-ups
+
+- [x] Add Playwright E2E coverage for `/tasks` in mock mode (list + detail drawer + stop/force-stop/retry flows) to match `docs/frontend-mock.md` verification checklist.
+- [x] Strengthen mock profile coverage with UI/E2E tests for `empty-state`, `rate-limit-hot`, and `degraded` (including Mock 控制台场景切换与空态/异常态表现) per `docs/frontend-mock.md`.
+- [x] Adjust MSW worker startup to surface unhandled mock routes (e.g. `onUnhandledRequest: 'warn'`) instead of fully bypassing, and consider introducing `zod.safeParse` schemas for core mock responses (`/api/settings`, `/api/webhooks/status`, `/api/tasks`) as an optional validation layer.

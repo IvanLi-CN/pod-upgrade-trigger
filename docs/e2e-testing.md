@@ -57,6 +57,9 @@
 5. **错误路径**：设置 `MOCK_PODMAN_FAIL=1` 或 `MOCK_SYSTEMD_RUN_FAIL=unitA`；确认 HTTP/CLI 返回值、SQLite 中的失败事件，以及 `last_payload.bin` dump。
 6. **静态资源与健康检查**：`GET /health` 正常返回；`PODUP_STATE_DIR/web/dist` 或内置 `/srv/app/web` 存在时 `GET /`、`/assets/*` 提供对应文件。
 7. **维护命令**：执行 `trigger-units`、`trigger-all --dry-run`、`prune-state` 等 CLI，查证 mock 日志与数据库状态。
+   - 对非 `--dry-run` 的 CLI 触发命令，额外验证：
+     - `tasks` / `task_units` 中有对应记录（`source = \"cli\"`）；
+     - `event_log` 中的 `cli-trigger` / `cli-prune-state` 事件包含相同的 `task_id` 元数据。
 
 ## 执行与 CI 集成
 
@@ -286,7 +289,8 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
    - 输入 “最大保留时间（小时）” 值，点击 “清理”：
      - 触发 `POST /api/prune-state`；
      - 返回成功后出现 Toast 文案，包含 tokens/locks removed 数量；
-     - 再访问 Events 页面，可以看到对应的 `prune-state-api` 事件（在有事件的预热环境中验证）。
+      - 在 Tasks 页面可以看到对应的 `kind = "maintenance"` 任务及其执行日志；
+      - 再访问 Events 页面，可以看到对应的 `prune-state-api` 事件（在有事件的预热环境中验证）。
 
 3. **下载调试包**
    - 通过后端制造一次 GitHub HMAC 签名失败，使 `last_payload.bin` 存在；
