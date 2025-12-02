@@ -168,7 +168,11 @@ export type TasksListResponse = {
   has_next: boolean
 }
 
-export type TaskDetailResponse = Task & {
-  logs: TaskLogEntry[]
+export type TaskEventsHint = {
+  task_id: string
 }
 
+export type TaskDetailResponse = Task & {
+  logs: TaskLogEntry[]
+  events_hint?: TaskEventsHint | null
+}

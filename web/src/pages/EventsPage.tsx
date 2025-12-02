@@ -13,6 +13,7 @@ type EventRecord = {
   action: string
   duration_ms: number
   meta: unknown
+  task_id?: string | null
   created_at: number
 }
 
@@ -40,6 +41,7 @@ export default function EventsPage() {
       pathPrefix: params.get('path_prefix') ?? '',
       status: params.get('status') ?? '',
       action: params.get('action') ?? '',
+      taskId: params.get('task_id') ?? '',
     }),
     [params],
   )
@@ -53,6 +55,7 @@ export default function EventsPage() {
     if (filters.pathPrefix) query.set('path_prefix', filters.pathPrefix)
     if (filters.status) query.set('status', filters.status)
     if (filters.action) query.set('action', filters.action)
+    if (filters.taskId) query.set('task_id', filters.taskId)
 
     ;(async () => {
       try {
@@ -76,6 +79,7 @@ export default function EventsPage() {
     }
   }, [
     filters.action,
+    filters.taskId,
     filters.pathPrefix,
     filters.requestId,
     filters.status,
@@ -85,7 +89,10 @@ export default function EventsPage() {
     selected,
   ])
 
-  const updateFilter = (key: 'request_id' | 'path_prefix' | 'status' | 'action', value: string) => {
+  const updateFilter = (
+    key: 'request_id' | 'path_prefix' | 'status' | 'action' | 'task_id',
+    value: string,
+  ) => {
     const next = new URLSearchParams(params)
     if (value) {
       next.set(key, value)
@@ -148,7 +155,7 @@ export default function EventsPage() {
 
       <section className="card bg-base-100 shadow-sm">
         <div className="card-body gap-3">
-          <div className="grid gap-2 md:grid-cols-4">
+          <div className="grid gap-2 md:grid-cols-4 lg:grid-cols-5">
             <label className="form-control">
               <span className="label-text text-xs">Request ID</span>
               <input
@@ -183,6 +190,15 @@ export default function EventsPage() {
                 value={filters.action}
                 onChange={(event) => updateFilter('action', event.target.value)}
                 placeholder="manual-trigger / github-webhook"
+              />
+            </label>
+            <label className="form-control">
+              <span className="label-text text-xs">Task ID</span>
+              <input
+                className="input input-xs input-bordered"
+                value={filters.taskId}
+                onChange={(event) => updateFilter('task_id', event.target.value)}
+                placeholder="task id"
               />
             </label>
           </div>
@@ -225,6 +241,7 @@ export default function EventsPage() {
                     <th>Path</th>
                     <th>Status</th>
                     <th>Action</th>
+                    <th>Task</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -254,6 +271,9 @@ export default function EventsPage() {
                           </span>
                         </td>
                         <td>{event.action}</td>
+                        <td className="font-mono text-[10px]">
+                          {event.task_id ?? '-'}
+                        </td>
                       </tr>
                     )
                   })}

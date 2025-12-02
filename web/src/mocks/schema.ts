@@ -218,6 +218,12 @@ export const tasksListResponseSchema = z
 export const taskDetailResponseSchema = taskSchema
   .extend({
     logs: z.array(taskLogEntrySchema),
+    events_hint: z
+      .object({
+        task_id: z.string(),
+      })
+      .optional()
+      .nullable(),
   })
   .passthrough()
 

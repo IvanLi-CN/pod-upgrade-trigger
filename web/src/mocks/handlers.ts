@@ -113,12 +113,24 @@ const handlers = [
     const perPage = Number(params.get('per_page') ?? params.get('limit')) || 50
     const page = Number(params.get('page')) || 1
     const requestId = params.get('request_id') || ''
+    const taskId = params.get('task_id') || ''
     const pathPrefix = params.get('path_prefix') || ''
     const status = params.get('status') || ''
     const action = params.get('action') || ''
 
     let events = runtime.cloneData().events
     if (requestId) events = events.filter((e) => e.request_id.includes(requestId))
+    if (taskId) {
+      events = events.filter((e) => {
+        if ((e as any).task_id === taskId) return true
+        const meta = (e as any).meta
+        if (meta && typeof meta === 'object' && 'task_id' in meta) {
+          const value = (meta as any).task_id
+          if (typeof value === 'string' && value === taskId) return true
+        }
+        return false
+      })
+    }
     if (pathPrefix) events = events.filter((e) => (e.path ?? '').startsWith(pathPrefix))
     if (status) events = events.filter((e) => String(e.status).startsWith(status))
     if (action) events = events.filter((e) => e.action.startsWith(action))
@@ -208,6 +220,7 @@ const handlers = [
     const response: TaskDetailResponse = {
       ...task,
       logs,
+      events_hint: { task_id: task.task_id },
     }
 
     validateMockResponse(taskDetailResponseSchema, response, {
@@ -310,7 +323,12 @@ const handlers = [
     const response: TaskDetailResponse = {
       ...updated,
       logs,
+      events_hint: { task_id: updated.task_id },
     }
+
+    validateMockResponse(taskDetailResponseSchema, response, {
+      path: `/api/tasks/${taskId}/stop`,
+    })
 
     return HttpResponse.json(response, { headers: JSON_HEADERS })
   }),
@@ -366,7 +384,12 @@ const handlers = [
     const response: TaskDetailResponse = {
       ...updated,
       logs,
+      events_hint: { task_id: updated.task_id },
     }
+
+    validateMockResponse(taskDetailResponseSchema, response, {
+      path: `/api/tasks/${taskId}/force-stop`,
+    })
 
     return HttpResponse.json(response, { headers: JSON_HEADERS })
   }),
@@ -410,7 +433,12 @@ const handlers = [
     const response: TaskDetailResponse = {
       ...retryTask,
       logs,
+      events_hint: { task_id: retryTask.task_id },
     }
+
+    validateMockResponse(taskDetailResponseSchema, response, {
+      path: `/api/tasks/${taskId}/retry`,
+    })
 
     return HttpResponse.json(response, { headers: JSON_HEADERS })
   }),

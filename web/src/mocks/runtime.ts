@@ -26,6 +26,7 @@ export type MockEvent = {
   action: string
   duration_ms: number
   meta: unknown
+  task_id?: string | null
   created_at: number
 }
 
@@ -188,10 +189,15 @@ function summarizeUnits(units: TaskUnitSummary[]): TaskSummaryCounts {
   return summary
 }
 
-function buildEvents(now: number, profile: MockProfile): MockEvent[] {
+function buildEvents(now: number, profile: MockProfile, tasks: Task[]): MockEvent[] {
   if (profile === 'empty-state') return []
 
   const baseTs = now - 3600
+  const nightlyTask = tasks.find((task) =>
+    (task.summary ?? '').includes('nightly manual upgrade'),
+  )
+  const nightlyTaskId = nightlyTask?.task_id ?? null
+
   const common: MockEvent[] = [
     {
       id: 1,
@@ -202,7 +208,12 @@ function buildEvents(now: number, profile: MockProfile): MockEvent[] {
       status: 200,
       action: 'manual-trigger',
       duration_ms: 320,
-      meta: { caller: 'seed', reason: 'daily maintenance' },
+      meta: {
+        caller: 'seed',
+        reason: 'daily maintenance',
+        ...(nightlyTaskId ? { task_id: nightlyTaskId } : {}),
+      },
+      task_id: nightlyTaskId,
       created_at: baseTs + 120,
     },
     {
@@ -759,7 +770,7 @@ function buildInitialData(profile: MockProfile): RuntimeData {
   const taskSeed = buildTasks(now, profile)
   return {
     now,
-    events: buildEvents(now, profile),
+    events: buildEvents(now, profile, taskSeed.tasks),
     services: buildServices(profile),
     webhooks: buildWebhooks(now, profile),
     locks: buildLocks(now, profile),

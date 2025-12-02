@@ -1,6 +1,6 @@
 import { Icon } from '@iconify/react'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import type { Task, TaskStatus, TaskDetailResponse, TasksListResponse } from '../domain/tasks'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
@@ -777,6 +777,14 @@ export default function TasksPage() {
                         <Icon icon="mdi:restart" className="text-lg" />
                         重试
                       </button>
+                    ) : null}
+                    {drawerTask.events_hint?.task_id ? (
+                      <Link
+                        to={`/events?task_id=${encodeURIComponent(drawerTask.events_hint.task_id)}`}
+                        className="btn btn-link btn-xs text-[11px]"
+                      >
+                        查看关联事件
+                      </Link>
                     ) : null}
                   </div>
                   {mockEnabled ? (

@@ -160,4 +160,32 @@ test.describe('Tasks page (mock)', () => {
     await expect(firstRow.locator('td').nth(1)).toHaveText('pending')
     await expect(firstRow.locator('td').nth(6)).toContainText('retry')
   })
+
+  test('opens related events from task drawer', async ({ page }) => {
+    await page.goto('/tasks?mock=enabled&mock=profile=happy-path')
+    await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+
+    await expect(page.getByText('任务中心')).toBeVisible()
+
+    const rows = page.locator('table tbody tr')
+    await expect(rows.first()).toBeVisible()
+
+    const manualRow = rows.filter({ hasText: 'nightly manual upgrade' }).first()
+    await expect(manualRow).toBeVisible()
+
+    await manualRow.click()
+
+    const link = page.getByRole('link', { name: '查看关联事件' })
+    await expect(link).toBeVisible()
+    await link.click()
+
+    await expect(page).toHaveURL(/\/events\?/)
+    const url = page.url()
+    expect(url).toContain('task_id=')
+
+    await expect(page.getByText('事件与审计')).toBeVisible()
+
+    const eventRows = page.locator('table tbody tr')
+    await expect(eventRows.first()).toBeVisible()
+  })
 })

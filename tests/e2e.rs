@@ -25,6 +25,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_task_prune_retention().await?;
     scenario_manual_api().await?;
     scenario_scheduler_loop().await?;
+    scenario_events_task_filter().await?;
     scenario_error_paths().await?;
     scenario_static_assets().await?;
     scenario_cli_maintenance().await?;
@@ -598,6 +599,46 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
         .filter(|row| row.action == "scheduler")
         .collect();
     assert_eq!(scheduler_events.len(), 2);
+    Ok(())
+}
+
+async fn scenario_events_task_filter() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    let mut trigger_cmd = env.command();
+    trigger_cmd.arg("trigger-units").arg("svc-alpha.service");
+    let trigger_output = env.run_command(trigger_cmd)?;
+    assert!(
+        trigger_output.status.success(),
+        "trigger-units svc-alpha.service failed: status={} stdout={} stderr={}",
+        trigger_output.status,
+        trigger_output.stdout,
+        trigger_output.stderr
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find_map(|row| row.meta.get("task_id").and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "cli-trigger events should include a task_id in meta"
+    );
+
+    let path = format!("/api/events?task_id={task_id}");
+    let response = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(response.status, 200, "/api/events?task_id status");
+    let body = response.json_body()?;
+    let events = body["events"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !events.is_empty(),
+        "/api/events?task_id filter should return at least one event"
+    );
+
     Ok(())
 }
 
