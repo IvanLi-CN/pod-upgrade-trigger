@@ -3702,6 +3702,7 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
         caller: request.caller.clone(),
         reason: request.reason.clone(),
         task_id,
+        request_id: Some(ctx.request_id.clone()),
     };
 
     let payload = serde_json::to_value(&response).map_err(|e| e.to_string())?;
@@ -3836,6 +3837,7 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
         "reason": request.reason,
         "image": request.image,
         "task_id": task_id,
+        "request_id": ctx.request_id,
     });
 
     respond_json(
@@ -3932,6 +3934,8 @@ struct ManualTriggerResponse {
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 // --- Task domain types (backend representation mirroring web/src/domain/tasks.ts) ---

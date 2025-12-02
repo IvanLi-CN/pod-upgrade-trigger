@@ -30,6 +30,7 @@ type ManualTriggerResponse = {
   caller?: string | null
   reason?: string | null
   task_id?: string | null
+  request_id?: string | null
 }
 
 type ServiceTriggerResponse = {
@@ -41,6 +42,7 @@ type ServiceTriggerResponse = {
   reason?: string | null
   image?: string | null
   task_id?: string | null
+  request_id?: string | null
 }
 
 type ManualHistoryEntry = {

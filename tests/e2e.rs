@@ -497,6 +497,15 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let trigger_json = trigger.json_body()?;
     assert_eq!(trigger_json["dry_run"], Value::from(true));
     assert_eq!(trigger_json["triggered"].as_array().unwrap().len(), 3);
+    // Manual trigger response should echo a non-empty request_id for UI navigation.
+    let trigger_request_id = trigger_json["request_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !trigger_request_id.is_empty(),
+        "manual trigger response must include request_id"
+    );
     let non_discovery: Vec<_> = env
         .read_mock_log()?
         .into_iter()
@@ -524,6 +533,15 @@ async fn scenario_manual_api() -> AnyResult<()> {
     assert_eq!(service.status, 202);
     let service_json = service.json_body()?;
     assert_eq!(service_json["status"], Value::from("pending"));
+    // Per-service trigger should also return a non-empty request_id.
+    let service_request_id = service_json["request_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !service_request_id.is_empty(),
+        "manual service response must include request_id"
+    );
 
     let log_lines = env.read_mock_log()?;
     assert!(

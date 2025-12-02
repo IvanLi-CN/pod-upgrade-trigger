@@ -64,4 +64,35 @@ test.describe('Manual triggers', () => {
     await expect(page.getByText('触发失败')).toBeVisible()
     await expect(page.getByText('暂无手动触发记录。')).toBeVisible()
   })
+
+  test('history entry links to Events view with request_id filter', async ({ page }) => {
+    await openManualPage(page)
+
+    await page.getByLabel('Dry run').check()
+    await page.getByPlaceholder('who is triggering').fill('ui-e2e-history')
+    await page.getByPlaceholder('short free-form reason').fill('history-to-events')
+    await page.getByRole('button', { name: '触发全部' }).click()
+
+    await expect(page.getByText('触发成功')).toBeVisible()
+
+    const historyEntry = page.getByRole('button', {
+      name: /trigger-all \(\d+\)/,
+    }).first()
+    await expect(historyEntry).toBeVisible()
+
+    await historyEntry.click()
+
+    await expect(page).toHaveURL(/\/events\?request_id=/)
+    await expect(page.getByText('事件与审计')).toBeVisible()
+
+    const rows = page.locator('table tbody tr')
+    await expect(rows.first()).toBeVisible()
+
+    const reqCell = rows.first().locator('td').nth(1)
+    const requestId = (await reqCell.textContent())?.trim() ?? ''
+    expect(requestId).not.toEqual('')
+
+    const filterValue = await page.getByLabel('Request ID').inputValue()
+    expect(filterValue.trim()).toEqual(requestId)
+  })
 })
