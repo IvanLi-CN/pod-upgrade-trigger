@@ -1175,6 +1175,12 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
     let debug_payload_stats = path_stats(Path::new(&debug_payload_path));
     let web_dist_stats = path_stats(&web_dist);
 
+    let task_retention_secs = task_retention_secs_from_env();
+    let task_retention_env_override = env::var(ENV_TASK_RETENTION_SECS)
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
     let response = json!({
         "env": {
             "PODUP_STATE_DIR": state_dir,
@@ -1186,6 +1192,11 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
             "interval_secs": scheduler_interval_secs,
             "min_interval_secs": scheduler_min_interval_secs,
             "max_iterations": scheduler_max_iterations,
+        },
+        "tasks": {
+            "task_retention_secs": task_retention_secs,
+            "default_state_retention_secs": DEFAULT_STATE_RETENTION_SECS,
+            "env_override": task_retention_env_override,
         },
         "systemd": {
             "auto_update_unit": auto_update_unit,

@@ -343,6 +343,34 @@ export default function TasksPage() {
     }
   }
 
+  const handleExport = () => {
+    if (!drawerTask) return
+    try {
+      const payload = drawerTask
+      const blob = new Blob([JSON.stringify(payload, null, 2)], {
+        type: 'application/json;charset=utf-8;',
+      })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.setAttribute('download', `task-${payload.task_id}.json`)
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      const message =
+        err && typeof err === 'object' && 'message' in err && err.message
+          ? String(err.message)
+          : '导出任务日志失败'
+      pushToast({
+        variant: 'error',
+        title: '导出任务日志失败',
+        message,
+      })
+    }
+  }
+
   return (
     <div className="space-y-6">
       <section className="card bg-base-100 shadow">
@@ -756,6 +784,16 @@ export default function TasksPage() {
                       >
                         <Icon icon="mdi:stop-circle-outline" className="text-lg" />
                         停止
+                      </button>
+                    ) : null}
+                    {drawerTask ? (
+                      <button
+                        type="button"
+                        className="btn btn-xs btn-outline"
+                        onClick={handleExport}
+                      >
+                        <Icon icon="mdi:download" className="text-lg" />
+                        导出 JSON
                       </button>
                     ) : null}
                     {drawerTask.status === 'running' && drawerTask.can_force_stop ? (

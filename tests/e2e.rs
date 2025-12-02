@@ -23,6 +23,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_github_webhook().await?;
     scenario_rate_limit_and_prune().await?;
     scenario_task_prune_retention().await?;
+    scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
     scenario_scheduler_loop().await?;
     scenario_events_task_filter().await?;
@@ -599,6 +600,36 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
         .filter(|row| row.action == "scheduler")
         .collect();
     assert_eq!(scheduler_events.len(), 2);
+    Ok(())
+}
+
+async fn scenario_settings_tasks_retention() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    let response = env.send_request(HttpRequest::get("/api/settings"))?;
+    assert_eq!(response.status, 200);
+    let json = response.json_body()?;
+    let tasks = json
+        .get("tasks")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let effective = tasks["task_retention_secs"].as_u64().unwrap_or(0);
+    let default = tasks["default_state_retention_secs"].as_u64().unwrap_or(0);
+    let env_override = tasks["env_override"].as_bool().unwrap_or(false);
+
+    assert_eq!(
+        effective, 86_400,
+        "expected default task_retention_secs to match DEFAULT_STATE_RETENTION_SECS (86400)"
+    );
+    assert_eq!(
+        default, 86_400,
+        "default_state_retention_secs should reflect DEFAULT_STATE_RETENTION_SECS (86400)"
+    );
+    assert!(
+        !env_override,
+        "env_override should be false when PODUP_TASK_RETENTION_SECS is not set"
+    );
+
     Ok(())
 }
 

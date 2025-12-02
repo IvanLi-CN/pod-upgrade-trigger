@@ -34,6 +34,11 @@ type SettingsResponse = {
     dev_open_admin?: boolean
     mode?: string
   }
+  tasks?: {
+    task_retention_secs?: number
+    default_state_retention_secs?: number
+    env_override?: boolean
+  }
 }
 
 export default function SettingsPage() {
@@ -58,6 +63,7 @@ export default function SettingsPage() {
   const scheduler = settings?.scheduler
   const systemd = settings?.systemd
   const forward = settings?.forward_auth
+  const tasks = settings?.tasks
 
   return (
     <div className="space-y-6">
@@ -122,6 +128,18 @@ export default function SettingsPage() {
                   {typeof scheduler?.max_iterations === 'number'
                     ? scheduler?.max_iterations
                     : '∞'}
+                </code>
+              </li>
+              <li>
+                Task retention (tasks table):{' '}
+                <code>{tasks?.task_retention_secs ?? '--'}</code> seconds
+              </li>
+              <li>
+                Retention source:{' '}
+                <code>
+                  {tasks?.env_override
+                    ? 'PODUP_TASK_RETENTION_SECS'
+                    : 'DEFAULT_STATE_RETENTION_SECS'}
                 </code>
               </li>
             </ul>

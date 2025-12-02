@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import { expect, test } from '@playwright/test'
 
 async function openTasksPage(page: Parameters<typeof test>[0]['page']) {
@@ -187,5 +188,33 @@ test.describe('Tasks page (mock)', () => {
 
     const eventRows = page.locator('table tbody tr')
     await expect(eventRows.first()).toBeVisible()
+  })
+
+  test('exports task detail as JSON', async ({ page }) => {
+    const rows = await openTasksPage(page)
+
+    const manualRow = rows
+      .filter({ hasText: 'nightly manual upgrade' })
+      .first()
+    await expect(manualRow).toBeVisible()
+
+    await manualRow.click()
+
+    const exportButton = page.getByRole('button', { name: '导出 JSON' })
+    await expect(exportButton).toBeVisible()
+
+    const [download] = await Promise.all([
+      page.waitForEvent('download'),
+      exportButton.click(),
+    ])
+
+    const downloadPath = await download.path()
+    if (!downloadPath) {
+      throw new Error('Download path is not available')
+    }
+
+    const content = fs.readFileSync(downloadPath, 'utf-8')
+    expect(content).toContain('"task_id"')
+    expect(content).toContain('"logs"')
   })
 })
