@@ -122,6 +122,27 @@
 - 展示层级：
   - 概要项：时间 + action + 状态 + 简短说明（例如 “image pull success”、“restart unit failed”）；
   - 详细项：展开后可以查看完整 `meta` JSON，用于问题排查。
+- 命令级输出记录（新增约定）：
+  - 需求：在任务详情中能够看到“原始执行的命令及其所有输出”，便于直接复制到终端重现问题。
+  - 针对与任务强相关的外部命令（当前至少包括）：
+    - 镜像拉取：`podman pull <image>`（手动服务 / GitHub Webhook / Scheduler 等）；
+    - 单元操作：`systemctl --user start|restart <unit>`；
+    - 任务停止：`systemctl --user stop|kill <unit>`。
+  - 这些命令的执行结果统一通过 `task_logs.meta` 结构化记录，不新增表结构，推荐 JSON 形态：
+    - `type: "command"`：用于前端快速识别“命令输出型”日志；
+    - `command: string`：可复制的完整命令行（例如 `"podman pull ghcr.io/muety/wakapi:latest"`）；
+    - `argv?: string[]`：拆分后的参数数组，便于后续程序化处理（可选）；
+    - `stdout?: string`：命令的标准输出完整内容（必要时可裁剪并在 JSON 中标记 `truncated`）；
+    - `stderr?: string`：命令的标准错误输出；
+    - `exit?: string`：退出码的字符串表示，例如 `"exit=0"`、`"exit=42"`；
+    - 其他字段（可选）：如 `attempt`、`unit`、`image` 等维持与现有 meta 一致。
+  - Task 详情接口 `GET /api/tasks/:id` 在保持 `TaskLogEntry` 现有字段不变的前提下，只在 `meta` 中增加上述结构。旧数据（无 `command` 字段）仍然合法。
+  - 前端渲染约定：
+    - 时间线上仍以 `action` + `status` + `summary` 作为概览；
+    - 当 `meta.type === "command"` 或 `meta` 中同时存在 `command` 与 `stdout` / `stderr` 时，在日志项内提供可折叠区域展示：
+      - 一行只读的 `command` 文本（支持一键复制）；
+      - 受高度限制的 `stdout` / `stderr` 文本框（滚动查看完整内容，必要时在 JSON 中用 `truncated` 标记被截断的输出）。
+    - 未携带命令信息的历史日志仍按当前行为展示，不需要特殊处理。
 - 原始系统日志（systemd/journal）：
   - 当前版本不直接暴露；
   - 后续如需接入，需单独设计过滤与脱敏策略。
