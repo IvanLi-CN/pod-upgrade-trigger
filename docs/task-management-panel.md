@@ -143,6 +143,7 @@
       - 一行只读的 `command` 文本（支持一键复制）；
       - 受高度限制的 `stdout` / `stderr` 文本框（滚动查看完整内容，必要时在 JSON 中用 `truncated` 标记被截断的输出）。
     - 未携带命令信息的历史日志仍按当前行为展示，不需要特殊处理。
+  - 额外 UX 建议：对于处于 `running` 状态且被识别为命令型的日志项，前端可以在首次出现时默认展开一次“命令输出”折叠，以方便实时观察；用户手动收起后不再自动展开。
 - 原始系统日志（systemd/journal）：
   - 当前版本不直接暴露；
   - 后续如需接入，需单独设计过滤与脱敏策略。
@@ -154,6 +155,18 @@
   - 当任务进入终态（succeeded / failed / cancelled / skipped）后停止轮询。
 
 ---
+- 可选：任务日志 SSE 通道（仅在后端实现时启用）
+  - 为提升“任务中心”实时体验，后端可以（但不是必须）在 HTTP 接口之外提供一个基于 SSE 的增量日志通道：
+    - `GET /sse/task-logs?task_id=<id>`；
+    - `event: log`：`data` 为完整 `TaskLogEntry` JSON，同一 `id` 可以多次出现，表示该日志被更新（例如 stdout/stderr 被追加、status 从 `running` 变为 `succeeded`）；
+    - `event: end`：当该任务不再处于 `running` 状态时发送一次，前端应关闭对应的 `EventSource`。
+  - 推荐前端行为（当前前端 mock 已遵循）：
+    - 初次打开任务详情时仍调用 `GET /api/tasks/:id` 获取完整快照（包含当前 `logs`）；
+    - 如检测到 SSE 端点可用（或在 mock 模式下），并行建立 `/sse/task-logs?task_id=...` 的 `EventSource`：
+      - 每收到一条 `event: log`，按 `id` 将本地日志数组中的对应条目覆盖/追加；
+      - 收到 `event: end` 或任务进入终态后关闭 SSE；
+    - 若后端未实现该 SSE 端点，前端可以退回纯 HTTP 轮询模式，不影响基本功能。
+
 
 ### 4.3 任务控制（停止等）
 

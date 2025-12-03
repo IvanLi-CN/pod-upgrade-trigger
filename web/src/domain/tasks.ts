@@ -160,6 +160,44 @@ export type TaskLogEntry = {
   meta?: unknown
 }
 
+/**
+ * Structured metadata for command-style task logs.
+ *
+ * This is a loose front-end view over the JSON stored in task_logs.meta.
+ * Backends may attach additional fields; the type guard below only relies
+ * on a small, backward-compatible subset.
+ */
+export type CommandMeta = {
+  type?: string
+  command?: string
+  argv?: string[]
+  stdout?: string
+  stderr?: string
+  exit?: string
+}
+
+/**
+ * Heuristically determines whether a TaskLogEntry.meta payload looks like
+ * command-style metadata.
+ *
+ * The check is intentionally relaxed: we only require that meta is an object
+ * and that it exposes a non-empty command, stdout or stderr field. Older
+ * log entries without these fields will simply return false.
+ */
+export function isCommandMeta(meta: unknown): meta is CommandMeta {
+  if (!meta || typeof meta !== 'object') return false
+
+  const candidate = meta as { [key: string]: unknown }
+  const hasCommand =
+    typeof candidate.command === 'string' && candidate.command.trim().length > 0
+  const hasStdout =
+    typeof candidate.stdout === 'string' && candidate.stdout.trim().length > 0
+  const hasStderr =
+    typeof candidate.stderr === 'string' && candidate.stderr.trim().length > 0
+
+  return hasCommand || hasStdout || hasStderr
+}
+
 export type TasksListResponse = {
   tasks: Task[]
   total: number

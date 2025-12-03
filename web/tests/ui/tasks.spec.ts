@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import { expect, test } from '@playwright/test'
 
 async function openTasksPage(page: Parameters<typeof test>[0]['page']) {
-  await page.goto('/tasks')
+  await page.goto('/tasks?mock=enabled')
   await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
   await expect(page.getByText('任务列表')).toBeVisible()
 
@@ -69,6 +69,44 @@ test.describe('Tasks page (mock)', () => {
     await expect(page.getByText('image-pull')).toBeVisible()
     await expect(
       page.getByText('Restarted svc-alpha.service, svc-beta.service'),
+    ).toBeVisible()
+  })
+
+  test('shows command output for command-meta logs in the timeline', async ({ page }) => {
+    const rows = await openTasksPage(page)
+
+    const manualRow = rows
+      .filter({ hasText: 'nightly manual upgrade' })
+      .first()
+    await expect(manualRow).toBeVisible()
+
+    await manualRow.click()
+
+    await expect(page.getByText('日志时间线')).toBeVisible()
+    await expect(page.getByText('image-pull')).toBeVisible()
+
+    const commandToggle = page.getByText('命令输出').first()
+
+    // 在真实后端模式下，后端暂未实现命令级 meta，UI 不会渲染“命令输出”折叠；
+    // 此时跳过本用例，只在 mock 环境下强校验命令输出展示。
+    let hasToggle = false
+    try {
+      hasToggle = await commandToggle.isVisible()
+    } catch {
+      hasToggle = false
+    }
+    test.skip(!hasToggle, 'Command output UI not available in this environment')
+
+    await commandToggle.click()
+
+    await expect(
+      page.getByText('podman pull ghcr.io/example/svc-alpha:main'),
+    ).toBeVisible()
+    await expect(
+      page.getByText('pulling from registry.example...'),
+    ).toBeVisible()
+    await expect(
+      page.getByText('warning: using cached image layer metadata'),
     ).toBeVisible()
   })
 

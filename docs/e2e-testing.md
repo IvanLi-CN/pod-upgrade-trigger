@@ -343,3 +343,25 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
   - 失败时上传 `ui-e2e-http.log`、Playwright 报告等 artifacts。
 
 完成上述用例与脚本后，即可认为“前端 UI 自动化 E2E 测试”初版完成，后续新增功能应在对应模块下补充或扩展用例。EOF
+
+#### E. Tasks 任务中心命令日志（tasks.spec.ts）
+
+1. **任务列表与详情抽屉**
+   - 使用 Playwright 在 mock 模式下访问 `/tasks?mock=enabled`：
+     - 断言任务列表加载成功，`nightly manual upgrade` 等种子任务出现；
+     - 点击任务行后，右侧抽屉展示类型、状态、起止时间、摘要、触发来源与 unit 状态。
+
+2. **命令级日志与命令输出折叠**
+   - 在 mock 模式下，某些日志携带结构化命令 meta（见 docs/task-management-panel.md 4.2.2）：
+     - `action = "image-pull"`，`meta.command = "podman pull ..."`，包含 stdout/stderr/exit 等字段；
+     - `action = "restart-unit"`，`meta.command = "systemctl --user restart ..."`。
+   - UI E2E 用例会在时间线中定位这些日志：
+     - 展开“命令输出”折叠，断言页面包含完整 command 文本；
+     - 在 mock 场景下，stdout/stderr 文本（例如 `pulling from registry.example...`、warning 行）可见。
+   - 当真实后端暂未实现命令 meta 或 `/sse/task-logs` 时，该用例可以按环境跳过，以避免 CI 误报；但在 mock happy-path 场景下应保持强校验。
+
+3. **停止 / 强制停止 / 重试**
+   - 通过 stop/force-stop/retry 按钮驱动 `/api/tasks/:id/stop`、`/force-stop`、`/retry`：
+     - 断言任务状态从 running 变为 cancelled/failed，或创建新的 retry 任务；
+     - 断言时间线中追加对应日志（如 `task-cancelled`、`task-force-killed`）。
+
