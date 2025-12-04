@@ -1157,28 +1157,224 @@ fn handle_task_logs_sse(ctx: &RequestContext) -> Result<(), String> {
         }
     };
 
-    let mut body = String::new();
-    for log in &detail.logs {
-        if let Ok(payload) = serde_json::to_string(log) {
-            body.push_str("event: log\n");
-            body.push_str("data: ");
-            body.push_str(&payload);
-            body.push_str("\n\n");
+    // Common audit metadata that will be enriched by the chosen mode.
+    let mut metadata = json!({
+        "task_id": task_id.clone(),
+        "logs_sent": 0_u64,
+    });
+
+    // Fast path: for non-running tasks we keep the original snapshot behaviour.
+    if detail.task.status != "running" {
+        let mut body = String::new();
+        for log in &detail.logs {
+            if let Ok(payload) = serde_json::to_string(log) {
+                body.push_str("event: log\n");
+                body.push_str("data: ");
+                body.push_str(&payload);
+                body.push_str("\n\n");
+            }
+        }
+        body.push_str("event: end\n");
+        body.push_str("data: done\n\n");
+
+        metadata["logs_sent"] = Value::from(detail.logs.len() as u64);
+        metadata["mode"] = Value::from("snapshot");
+        metadata["response_size"] = Value::from(body.len() as u64);
+
+        let result = send_sse_stream(&body);
+        log_audit_event(ctx, 200, "tasks-sse", metadata);
+        return result;
+    }
+
+    // Streaming path for running tasks: poll for updates and push incremental log events.
+    const POLL_INTERVAL_MS: u64 = 750;
+    const MAX_STREAM_SECS: u64 = 600;
+
+    let started_at = Instant::now();
+    let mut stdout = io::stdout().lock();
+
+    let mut response_size: u64 = 0;
+    let mut logs_sent: u64 = 0;
+    let mut reason = String::from("completed");
+    let mut last_status = detail.task.status.clone();
+
+    // Write HTTP + SSE headers once and then keep the connection open.
+    {
+        let header_result: io::Result<()> = (|| {
+            write!(stdout, "HTTP/1.1 200 OK\r\n")?;
+            stdout.write_all(b"Content-Type: text/event-stream\r\n")?;
+            stdout.write_all(b"Cache-Control: no-cache\r\n")?;
+            stdout.write_all(b"Connection: keep-alive\r\n")?;
+            stdout.write_all(b"\r\n")?;
+            stdout.flush()
+        })();
+
+        match header_result {
+            Ok(()) => {}
+            Err(err)
+                if err.kind() == io::ErrorKind::BrokenPipe
+                    || err.kind() == io::ErrorKind::ConnectionReset =>
+            {
+                // Client disconnected before we could start streaming.
+                reason = String::from("client-disconnect");
+                metadata["mode"] = Value::from("streaming");
+                metadata["logs_sent"] = Value::from(0_u64);
+                metadata["response_size"] = Value::from(0_u64);
+                metadata["reason"] = Value::from(reason.clone());
+                metadata["status"] = Value::from(last_status);
+                log_audit_event(ctx, 200, "tasks-sse", metadata);
+                return Ok(());
+            }
+            Err(err) => {
+                metadata["mode"] = Value::from("streaming");
+                metadata["logs_sent"] = Value::from(0_u64);
+                metadata["response_size"] = Value::from(0_u64);
+                metadata["reason"] = Value::from("io-error");
+                metadata["status"] = Value::from(last_status);
+                log_audit_event(ctx, 200, "tasks-sse", metadata);
+                return Err(err.to_string());
+            }
         }
     }
-    body.push_str("event: end\n");
-    body.push_str("data: done\n\n");
 
-    let mut metadata = json!({
-        "task_id": task_id,
-        "logs_sent": detail.logs.len() as u64,
-        "mode": "snapshot",
-    });
-    metadata["response_size"] = Value::from(body.len() as u64);
+    // Helper closure to write a single chunk to the SSE stream while handling
+    // common connection error cases.
+    let mut write_chunk = |chunk: &str, response_size: &mut u64| -> Result<bool, String> {
+        match stdout.write_all(chunk.as_bytes()) {
+            Ok(()) => {
+                *response_size = response_size.saturating_add(chunk.len() as u64);
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::BrokenPipe
+                    || err.kind() == io::ErrorKind::ConnectionReset =>
+            {
+                // Client went away; treat as graceful disconnect.
+                reason = String::from("client-disconnect");
+                return Ok(false);
+            }
+            Err(err) => {
+                reason = String::from("io-error");
+                return Err(err.to_string());
+            }
+        }
 
-    let result = send_sse_stream(&body);
+        if let Err(err) = stdout.flush() {
+            if err.kind() == io::ErrorKind::BrokenPipe
+                || err.kind() == io::ErrorKind::ConnectionReset
+            {
+                reason = String::from("client-disconnect");
+                return Ok(false);
+            }
+            reason = String::from("io-error");
+            return Err(err.to_string());
+        }
+
+        Ok(true)
+    };
+
+    let mut seen_logs: HashMap<i64, String> = HashMap::new();
+    let mut current_detail = detail;
+    let mut result_error: Option<String> = None;
+
+    // Streaming loop: always send new/changed logs, then decide whether to continue.
+    'stream: loop {
+        for log in &current_detail.logs {
+            if let Ok(payload) = serde_json::to_string(log) {
+                let changed = match seen_logs.get(&log.id) {
+                    Some(previous) if previous == &payload => false,
+                    _ => true,
+                };
+
+                if !changed {
+                    continue;
+                }
+
+                seen_logs.insert(log.id, payload.clone());
+
+                let chunk = format!("event: log\ndata: {}\n\n", payload);
+                match write_chunk(&chunk, &mut response_size) {
+                    Ok(true) => {
+                        logs_sent = logs_sent.saturating_add(1);
+                    }
+                    Ok(false) => {
+                        // Client disconnected; stop streaming.
+                        break 'stream;
+                    }
+                    Err(err) => {
+                        result_error = Some(err);
+                        break 'stream;
+                    }
+                }
+            }
+        }
+
+        last_status = current_detail.task.status.clone();
+
+        if last_status != "running" {
+            let chunk = "event: end\ndata: done\n\n";
+            match write_chunk(chunk, &mut response_size) {
+                Ok(true) | Ok(false) => {
+                    // Completed normally or client disconnected while sending end.
+                }
+                Err(err) => {
+                    result_error = Some(err);
+                }
+            }
+            reason = String::from("completed");
+            break 'stream;
+        }
+
+        if started_at.elapsed() >= Duration::from_secs(MAX_STREAM_SECS) {
+            let chunk = "event: end\ndata: timeout\n\n";
+            match write_chunk(chunk, &mut response_size) {
+                Ok(true) | Ok(false) => {}
+                Err(err) => {
+                    result_error = Some(err);
+                }
+            }
+            reason = String::from("timeout");
+            break 'stream;
+        }
+
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+
+        match load_task_detail_record(&task_id) {
+            Ok(Some(next)) => {
+                current_detail = next;
+            }
+            Ok(None) => {
+                let chunk = "event: end\ndata: gone\n\n";
+                match write_chunk(chunk, &mut response_size) {
+                    Ok(true) | Ok(false) => {}
+                    Err(err) => {
+                        result_error = Some(err);
+                    }
+                }
+                reason = String::from("task-missing");
+                break 'stream;
+            }
+            Err(err) => {
+                reason = String::from("load-error");
+                result_error = Some(err);
+                break 'stream;
+            }
+        }
+    }
+
+    // Finalize audit metadata for streaming mode.
+    metadata["mode"] = Value::from("streaming");
+    metadata["logs_sent"] = Value::from(logs_sent);
+    metadata["response_size"] = Value::from(response_size);
+    metadata["reason"] = Value::from(reason);
+    metadata["status"] = Value::from(last_status);
+
     log_audit_event(ctx, 200, "tasks-sse", metadata);
-    result
+
+    if let Some(err) = result_error {
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {

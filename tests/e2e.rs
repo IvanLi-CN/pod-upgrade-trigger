@@ -805,9 +805,10 @@ async fn scenario_task_logs_sse() -> AnyResult<()> {
     );
 
     let body = sse_response.body_text();
+    let log_event_count = body.matches("event: log").count();
     assert!(
-        body.contains("event: log"),
-        "SSE stream should include at least one log event, got: {body}"
+        log_event_count >= 2,
+        "SSE stream should include multiple log events (got {log_event_count}): {body}"
     );
     assert!(
         body.contains("event: end"),
