@@ -73,7 +73,20 @@ test.describe('Tasks page (mock)', () => {
   })
 
   test('shows command output for command-meta logs in the timeline', async ({ page }) => {
-    const rows = await openTasksPage(page)
+    // 对于命令输出用例，我们需要在 mock happy-path 的初始快照上，
+    // 并且保证任务列表与 runtime 内部数据一致。
+    await page.goto('/tasks?mock=enabled&mock=profile=happy-path')
+    await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+
+    // 先重置 mock 数据，再刷新页面让 /api/tasks 与 runtime 同步。
+    await resetMockData(page)
+
+    await page.reload()
+    await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+    await expect(page.getByText('任务列表')).toBeVisible()
+
+    const rows = page.locator('table tbody tr')
+    await expect(rows.first()).toBeVisible()
 
     const manualRow = rows
       .filter({ hasText: 'nightly manual upgrade' })
@@ -82,31 +95,39 @@ test.describe('Tasks page (mock)', () => {
 
     await manualRow.click()
 
-    await expect(page.getByText('日志时间线')).toBeVisible()
-    await expect(page.getByText('image-pull')).toBeVisible()
+    const logsTimelineSection = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(logsTimelineSection).toBeVisible()
 
-    const commandToggle = page.getByText('命令输出').first()
+    const imagePullLabel = logsTimelineSection.getByText('image-pull').first()
+    await imagePullLabel.scrollIntoViewIfNeeded()
+    await expect(imagePullLabel).toBeVisible()
 
-    // 在真实后端模式下，后端暂未实现命令级 meta，UI 不会渲染“命令输出”折叠；
-    // 此时跳过本用例，只在 mock 环境下强校验命令输出展示。
-    let hasToggle = false
-    try {
-      hasToggle = await commandToggle.isVisible()
-    } catch {
-      hasToggle = false
-    }
-    test.skip(!hasToggle, 'Command output UI not available in this environment')
+    const commandToggle = logsTimelineSection
+      .getByRole('button', { name: '命令输出' })
+      .first()
+    await commandToggle.scrollIntoViewIfNeeded()
+    await expect(
+      commandToggle,
+      'command output toggle not visible in image-pull log card',
+    ).toBeVisible()
 
     await commandToggle.click()
 
     await expect(
-      page.getByText('podman pull ghcr.io/example/svc-alpha:main'),
+      logsTimelineSection.getByText(
+        'podman pull ghcr.io/example/svc-alpha:main',
+      ),
     ).toBeVisible()
     await expect(
-      page.getByText('pulling from registry.example...'),
+      logsTimelineSection.getByText('pulling from registry.example...'),
     ).toBeVisible()
     await expect(
-      page.getByText('warning: using cached image layer metadata'),
+      logsTimelineSection.getByText(
+        'warning: using cached image layer metadata',
+      ),
     ).toBeVisible()
   })
 
