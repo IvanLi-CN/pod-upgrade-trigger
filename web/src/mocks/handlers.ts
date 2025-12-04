@@ -93,6 +93,61 @@ const handlers = [
     })
   }),
 
+  http.get('/sse/task-logs', async ({ request }) => {
+    const url = new URL(request.url)
+    const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
+    if (failure) return failure
+    await withLatency()
+
+    const taskId = url.searchParams.get('task_id')
+    if (!taskId) {
+      return HttpResponse.json({ error: 'missing task_id' }, { status: 400 })
+    }
+
+    const task = runtime.getTask(taskId)
+    if (!task) {
+      return HttpResponse.json({ error: 'task not found' }, { status: 404 })
+    }
+
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder()
+        const sent = new Map<number, string>()
+
+        const pushLogs = () => {
+          const currentLogs = runtime.getTaskLogs(taskId)
+          for (const log of currentLogs) {
+            const payload = JSON.stringify(log)
+            const previous = sent.get(log.id)
+            if (previous === payload) continue
+            controller.enqueue(encoder.encode(`event: log\ndata: ${payload}\n\n`))
+            sent.set(log.id, payload)
+          }
+
+          const currentTask = runtime.getTask(taskId)
+          if (!currentTask || currentTask.status !== 'running') {
+            controller.enqueue(encoder.encode('event: end\ndata: done\n\n'))
+            if (unsubscribe) unsubscribe()
+            controller.close()
+          }
+        }
+
+        pushLogs()
+
+        const unsubscribe = runtime.subscribe(pushLogs)
+      },
+    })
+
+    return new HttpResponse(stream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream',
+        Connection: 'keep-alive',
+        'Cache-Control': 'no-cache',
+      },
+    })
+  }),
+
   http.get('/api/settings', async ({ request }) => {
     const url = new URL(request.url)
     const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
@@ -122,10 +177,10 @@ const handlers = [
     if (requestId) events = events.filter((e) => e.request_id.includes(requestId))
     if (taskId) {
       events = events.filter((e) => {
-        if ((e as any).task_id === taskId) return true
-        const meta = (e as any).meta
+        if (e.task_id === taskId) return true
+        const meta = e.meta
         if (meta && typeof meta === 'object' && 'task_id' in meta) {
-          const value = (meta as any).task_id
+          const value = (meta as { task_id?: unknown }).task_id
           if (typeof value === 'string' && value === taskId) return true
         }
         return false

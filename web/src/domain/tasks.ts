@@ -160,6 +160,64 @@ export type TaskLogEntry = {
   meta?: unknown
 }
 
+/**
+ * Structured metadata for command-style task logs.
+ *
+ * This is a loose front-end view over the JSON stored in task_logs.meta.
+ * Backends may attach additional fields; the type guard below only relies
+ * on a small, backward-compatible subset.
+ */
+export type CommandMeta = {
+  type?: string
+  command?: string
+  argv?: string[]
+  stdout?: string
+  stderr?: string
+  exit?: string
+   ok?: string[]
+   units?: string[]
+}
+
+/**
+ * Heuristically determines whether a TaskLogEntry.meta payload looks like
+ * command-style metadata.
+ *
+ * The check is intentionally relaxed: we only require that meta is an object
+ * and that it either declares a `type: "command"` (case-insensitive) field,
+ * or exposes a non-empty command, stdout or stderr field. Older log entries
+ * without these fields will simply return false.
+ */
+export function isCommandMeta(meta: unknown): meta is CommandMeta {
+  if (!meta) return false
+
+  // Accept stringified JSON payloads by attempting a best-effort parse.
+  if (typeof meta === 'string') {
+    try {
+      const parsed = JSON.parse(meta) as unknown
+      return isCommandMeta(parsed)
+    } catch {
+      return false
+    }
+  }
+
+  if (typeof meta !== 'object') return false
+
+  const candidate = meta as { [key: string]: unknown }
+
+  const type =
+    typeof candidate.type === 'string' ? candidate.type.trim().toLowerCase() : ''
+  const hasCommandType = type === 'command'
+
+  const hasCommand =
+    typeof candidate.command === 'string' && candidate.command.trim().length > 0
+  const hasStdout =
+    typeof candidate.stdout === 'string' && candidate.stdout.trim().length > 0
+  const hasStderr =
+    typeof candidate.stderr === 'string' && candidate.stderr.trim().length > 0
+
+  return hasCommandType || hasCommand || hasStdout || hasStderr
+}
+
 export type TasksListResponse = {
   tasks: Task[]
   total: number

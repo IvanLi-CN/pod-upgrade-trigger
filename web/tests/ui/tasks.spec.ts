@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import { expect, test } from '@playwright/test'
 
 async function openTasksPage(page: Parameters<typeof test>[0]['page']) {
-  await page.goto('/tasks')
+  await page.goto('/tasks?mock=enabled')
   await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
   await expect(page.getByText('任务列表')).toBeVisible()
 
@@ -69,6 +69,65 @@ test.describe('Tasks page (mock)', () => {
     await expect(page.getByText('image-pull')).toBeVisible()
     await expect(
       page.getByText('Restarted svc-alpha.service, svc-beta.service'),
+    ).toBeVisible()
+  })
+
+  test('shows command output for command-meta logs in the timeline', async ({ page }) => {
+    // 对于命令输出用例，我们需要在 mock happy-path 的初始快照上，
+    // 并且保证任务列表与 runtime 内部数据一致。
+    await page.goto('/tasks?mock=enabled&mock=profile=happy-path')
+    await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+
+    // 先重置 mock 数据，再刷新页面让 /api/tasks 与 runtime 同步。
+    await resetMockData(page)
+
+    await page.reload()
+    await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+    await expect(page.getByText('任务列表')).toBeVisible()
+
+    const rows = page.locator('table tbody tr')
+    await expect(rows.first()).toBeVisible()
+
+    const manualRow = rows
+      .filter({ hasText: 'nightly manual upgrade' })
+      .first()
+    await expect(manualRow).toBeVisible()
+
+    await manualRow.click()
+
+    const logsTimelineSection = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(logsTimelineSection).toBeVisible()
+
+    const imagePullLabel = logsTimelineSection.getByText('image-pull').first()
+    await imagePullLabel.scrollIntoViewIfNeeded()
+    await expect(imagePullLabel).toBeVisible()
+
+    const commandToggle = logsTimelineSection
+      .getByRole('button', { name: '命令输出' })
+      .first()
+    await commandToggle.scrollIntoViewIfNeeded()
+    await expect(
+      commandToggle,
+      'command output toggle not visible in image-pull log card',
+    ).toBeVisible()
+
+    await commandToggle.click()
+
+    await expect(
+      logsTimelineSection.getByText(
+        'podman pull ghcr.io/example/svc-alpha:main',
+      ),
+    ).toBeVisible()
+    await expect(
+      logsTimelineSection.getByText('pulling from registry.example...'),
+    ).toBeVisible()
+    await expect(
+      logsTimelineSection.getByText(
+        'warning: using cached image layer metadata',
+      ),
     ).toBeVisible()
   })
 

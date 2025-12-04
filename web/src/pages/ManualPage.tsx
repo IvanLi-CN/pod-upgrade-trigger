@@ -4,7 +4,14 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
-import type { Task, TaskStatus, TaskDetailResponse, TasksListResponse } from '../domain/tasks'
+import type {
+  Task,
+  TaskStatus,
+  TaskDetailResponse,
+  TasksListResponse,
+  TaskLogEntry,
+} from '../domain/tasks'
+import { isCommandMeta } from '../domain/tasks'
 
 type ManualService = {
   slug: string
@@ -422,6 +429,7 @@ const TASK_DETAIL_POLL_INTERVAL_MS = 3000
 
 function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
   const { status: appStatus, getJson } = useApi()
+  const { pushToast } = useToast()
   const [activeTab, setActiveTab] = useState<'list' | 'detail'>(
     initialTaskId ? 'detail' : 'list',
   )
@@ -436,8 +444,11 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
     initialTaskId ?? null,
   )
   const [detail, setDetail] = useState<TaskDetailResponse | null>(null)
+  const [detailLogs, setDetailLogs] = useState<TaskLogEntry[] | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
+  const [expandedCommandLogs, setExpandedCommandLogs] = useState<Record<number, boolean>>({})
+  const detailStatus = detail?.status
 
   // Keep drawer focused on the latest task when parent updates initialTaskId
   useEffect(() => {
@@ -488,6 +499,7 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
   useEffect(() => {
     if (!selectedTaskId) {
       setDetail(null)
+      setDetailLogs(null)
       setDetailError(null)
       return
     }
@@ -505,6 +517,7 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
         )
         if (cancelled) return
         setDetail(data)
+        setDetailLogs(Array.isArray(data.logs) ? data.logs : [])
         if (data.status === 'running') {
           timeoutId = window.setTimeout(loadDetail, TASK_DETAIL_POLL_INTERVAL_MS)
         }
@@ -532,9 +545,91 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
     }
   }, [getJson, selectedTaskId])
 
+  // 当新的命令型日志进入 running 状态时，默认展开一次命令输出。
+  useEffect(() => {
+    if (!detailLogs || detailLogs.length === 0) return
+    setExpandedCommandLogs((prev) => {
+      let changed = false
+      const next = { ...prev }
+      for (const log of detailLogs) {
+        if (next[log.id] !== undefined) continue
+        if (log.status !== 'running') continue
+        if (!isCommandMeta(log.meta)) continue
+        next[log.id] = true
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [detailLogs])
+
+  useEffect(() => {
+    if (!selectedTaskId) return
+    if (detailStatus !== 'running') return
+    if (typeof EventSource === 'undefined') return
+
+    let cancelled = false
+    const url = `/sse/task-logs?task_id=${encodeURIComponent(selectedTaskId)}`
+    let source: EventSource
+    try {
+      source = new EventSource(url)
+    } catch {
+      // 创建失败时静默降级为仅依赖 HTTP 轮询。
+      return
+    }
+
+    const handleLog = (event: MessageEvent) => {
+      if (cancelled) return
+      try {
+        const payload = JSON.parse(event.data) as TaskLogEntry
+        setDetailLogs((prev) => {
+          if (!prev || prev.length === 0) return [payload]
+          const index = prev.findIndex((entry) => entry.id === payload.id)
+          if (index === -1) return [...prev, payload]
+          const next = prev.slice()
+          next[index] = payload
+          return next
+        })
+      } catch {
+        // ignore malformed mock payload
+      }
+    }
+
+    const handleEnd = () => {
+      if (!cancelled) {
+        source.close()
+      }
+    }
+
+    source.addEventListener('log', handleLog)
+    source.addEventListener('end', handleEnd)
+    source.onerror = () => {
+      if (!cancelled) {
+        source.close()
+      }
+    }
+
+    return () => {
+      cancelled = true
+      source.removeEventListener('log', handleLog)
+      source.removeEventListener('end', handleEnd)
+      source.close()
+    }
+  }, [detailStatus, selectedTaskId])
+
   const formatTs = (ts?: number | null) => {
     if (!ts || ts <= 0) return '--'
     return new Date(ts * 1000).toLocaleString()
+  }
+
+  const formatTimeWithMs = (ts?: number | null) => {
+    if (!ts || ts <= 0) return '--'
+    const d = new Date(ts * 1000)
+    const pad = (value: number, width = 2) => String(value).padStart(width, '0')
+    const hh = pad(d.getHours())
+    const mm = pad(d.getMinutes())
+    const ss = pad(d.getSeconds())
+    const ms = pad(d.getMilliseconds(), 3)
+    return `${hh}:${mm}:${ss}.${ms}`
   }
 
   const formatDuration = (task: Task) => {
@@ -601,6 +696,24 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
     const maxPage = Math.ceil(total / TASKS_PAGE_SIZE)
     return `第 ${page} / ${maxPage} 页`
   })()
+
+  const handleCopyCommand = async (command?: string) => {
+    if (!command) return
+    try {
+      await navigator.clipboard.writeText(command)
+      pushToast({
+        variant: 'success',
+        title: '已复制',
+        message: command,
+      })
+    } catch {
+      pushToast({
+        variant: 'warning',
+        title: '复制失败',
+        message: '浏览器未允许访问剪贴板。',
+      })
+    }
+  }
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end bg-base-300/40">
@@ -877,44 +990,167 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                     <h3 className="text-xs font-semibold uppercase tracking-wide text-base-content/70">
                       日志时间线
                     </h3>
-                    {detail.logs.length === 0 ? (
-                      <p className="text-[11px] text-base-content/60">
-                        暂无可用日志。
-                      </p>
-                    ) : (
-                      <div className="space-y-1">
-                        {detail.logs.map((log) => (
-                          <div
-                            key={log.id}
-                            className="flex flex-col gap-1 rounded border border-base-200 bg-base-100 px-2 py-1 text-[11px]"
-                          >
-                            <div className="flex flex-wrap items-center justify-between gap-2">
-                              <div className="flex items-center gap-2">
-                                <span className="font-mono text-[11px]">
-                                  {log.action}
-                                </span>
-                                <span
-                                  className={`badge badge-xs ${statusBadgeClass(log.status)}`}
-                                >
-                                  {log.status}
-                                </span>
-                                {log.unit ? (
-                                  <span className="badge badge-ghost badge-xs">
-                                    {log.unit}
-                                  </span>
+                    {(() => {
+                      const logs = detailLogs ?? detail.logs
+                      if (logs.length === 0) {
+                        return (
+                          <p className="text-[11px] text-base-content/60">
+                            暂无可用日志。
+                          </p>
+                        )
+                      }
+                      return (
+                        <div className="space-y-1">
+                          {logs.map((log) => {
+                            const commandMeta = isCommandMeta(log.meta) ? log.meta : null
+
+                            const combinedLines =
+                              commandMeta && (commandMeta.stdout || commandMeta.stderr)
+                                ? [
+                                    ...(commandMeta.stdout
+                                      ? commandMeta.stdout.split('\n').map((text) => ({
+                                          stream: 'stdout' as const,
+                                          text,
+                                        }))
+                                      : []),
+                                    ...(commandMeta.stderr
+                                      ? commandMeta.stderr.split('\n').map((text) => ({
+                                          stream: 'stderr' as const,
+                                          text,
+                                        }))
+                                      : []),
+                                  ].filter((entry) => entry.text.length > 0)
+                                : []
+
+                            return (
+                              <div
+                                key={log.id}
+                                className="flex flex-col gap-1 rounded border border-base-200 bg-base-100 px-2 py-1 text-[11px]"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-mono text-[11px]">
+                                      {log.action}
+                                    </span>
+                                    <span
+                                      className={`badge badge-xs ${statusBadgeClass(log.status)}`}
+                                    >
+                                      {log.status}
+                                    </span>
+                                    {log.unit ? (
+                                      <span className="badge badge-ghost badge-xs">
+                                        {log.unit}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                  <div className="flex items-center gap-2 text-[10px] text-base-content/60">
+                                    {commandMeta?.exit ? (
+                                      <span className="badge badge-outline badge-xs font-mono">
+                                        {commandMeta.exit}
+                                      </span>
+                                    ) : null}
+                                    <span>{formatTs(log.ts)}</span>
+                                  </div>
+                                </div>
+                                <p className="text-[11px] text-base-content/80">
+                                  {log.summary}
+                                </p>
+                                {commandMeta ? (
+                                  <div className="mt-1 border-t border-base-200 pt-1">
+                                    <button
+                                      type="button"
+                                      className="flex w-full items-center justify-between text-[11px] text-base-content/70"
+                                      onClick={() =>
+                                        setExpandedCommandLogs((prev) => ({
+                                          ...prev,
+                                          [log.id]: !prev[log.id],
+                                        }))
+                                      }
+                                    >
+                                      <span className="flex items-center gap-1">
+                                        <Icon
+                                          icon={
+                                            expandedCommandLogs[log.id]
+                                              ? 'mdi:chevron-down'
+                                              : 'mdi:chevron-right'
+                                          }
+                                          className="text-xs"
+                                        />
+                                        <span>命令输出</span>
+                                      </span>
+                                    </button>
+                                    {expandedCommandLogs[log.id] ? (
+                                      <div className="mt-1 space-y-1">
+                                        {commandMeta.command ? (
+                                          <div className="flex items-start gap-2">
+                                            <code className="flex-1 overflow-x-auto rounded bg-base-200 px-2 py-1 font-mono text-[11px]">
+                                              {commandMeta.command}
+                                            </code>
+                                            <button
+                                              type="button"
+                                              className="btn btn-ghost btn-xs"
+                                              onClick={() =>
+                                                handleCopyCommand(commandMeta.command)
+                                              }
+                                            >
+                                              <Icon
+                                                icon="mdi:content-copy"
+                                                className="text-base"
+                                              />
+                                            </button>
+                                          </div>
+                                        ) : null}
+                                        {combinedLines.length > 0 ? (
+                                          <div className="space-y-0.5">
+                                            <span className="text-[10px] uppercase tracking-wide text-base-content/60">
+                                              stdout / stderr
+                                            </span>
+                                            <div className="max-h-32 overflow-auto rounded bg-base-200 p-2 font-mono text-[11px]">
+                                              {combinedLines.length === 0 ? (
+                                                <span className="text-[10px] text-base-content/60">
+                                                  （无输出）
+                                                </span>
+                                              ) : (
+                                              <div className="space-y-0.5">
+                                                {combinedLines.map((entry, index) => (
+                                                  <div
+                                                    key={`${log.id}-${entry.stream}-${index}`}
+                                                    className="flex items-baseline gap-2"
+                                                  >
+                                                    <span
+                                                      className={`badge badge-xs ${
+                                                        entry.stream === 'stderr'
+                                                          ? 'badge-error'
+                                                          : 'badge-neutral'
+                                                      }`}
+                                                    >
+                                                      {entry.stream === 'stderr'
+                                                        ? 'ERR'
+                                                        : 'OUT'}
+                                                    </span>
+                                                    <span className="text-[10px] text-base-content/60 tabular-nums">
+                                                      {formatTimeWithMs(log.ts)}
+                                                    </span>
+                                                    <span className="flex-1 whitespace-pre-wrap break-words">
+                                                      {entry.text}
+                                                    </span>
+                                                  </div>
+                                                ))}
+                                                </div>
+                                              )}
+                                            </div>
+                                          </div>
+                                        ) : null}
+                                      </div>
+                                    ) : null}
+                                  </div>
                                 ) : null}
                               </div>
-                              <span className="text-[10px] text-base-content/60">
-                                {formatTs(log.ts)}
-                              </span>
-                            </div>
-                            <p className="text-[11px] text-base-content/80">
-                              {log.summary}
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                            )
+                          })}
+                        </div>
+                      )
+                    })()}
                   </section>
                 </>
               ) : null}

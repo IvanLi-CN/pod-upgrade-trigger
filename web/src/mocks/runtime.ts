@@ -487,7 +487,7 @@ function buildTasks(
         ts: baseTs + 602,
         level: 'info',
         action: 'task-created',
-        status: 'running',
+        status: 'succeeded',
         summary: 'Manual task accepted from UI',
         unit: null,
         meta: { caller: 'ops-nightly', reason: 'nightly rollout' },
@@ -496,10 +496,18 @@ function buildTasks(
         ts: baseTs + 608,
         level: 'info',
         action: 'image-pull',
-        status: 'running',
-        summary: 'Pulling latest images for svc-alpha, svc-beta',
+        status: 'succeeded',
+        summary: 'Pulled latest images for svc-alpha, svc-beta',
         unit: null,
-        meta: { units: ['svc-alpha.service', 'svc-beta.service'] },
+        meta: {
+          type: 'command',
+          command: 'podman pull ghcr.io/example/svc-alpha:main',
+          argv: ['podman', 'pull', 'ghcr.io/example/svc-alpha:main'],
+          stdout: 'pulling from registry.example...\ncomplete',
+          stderr: 'warning: using cached image layer metadata',
+          exit: 'exit=0',
+          units: ['svc-alpha.service', 'svc-beta.service'],
+        },
       },
       {
         ts: baseTs + 620,
@@ -508,7 +516,15 @@ function buildTasks(
         status: 'succeeded',
         summary: 'Restarted svc-alpha.service, svc-beta.service',
         unit: null,
-        meta: { ok: ['svc-alpha.service', 'svc-beta.service'] },
+        meta: {
+          type: 'command',
+          command: 'systemctl --user restart svc-alpha.service',
+          argv: ['systemctl', '--user', 'restart', 'svc-alpha.service'],
+          stdout: 'restarted svc-alpha.service\nreloaded dependencies',
+          stderr: '',
+          exit: 'exit=0',
+          ok: ['svc-alpha.service', 'svc-beta.service'],
+        },
       },
     ],
   )
@@ -553,7 +569,7 @@ function buildTasks(
         ts: baseTs + 1201,
         level: 'info',
         action: 'task-created',
-        status: 'running',
+        status: 'succeeded',
         summary: 'Github webhook accepted for svc-beta',
         unit: 'svc-beta.service',
         meta: { slug: 'svc-beta' },
@@ -762,6 +778,67 @@ function buildTasks(
 
   tasks.sort((a, b) => b.created_at - a.created_at)
 
+  // Ensure that in the happy-path profile the nightly manual task exposes
+  // fully-populated command metadata for its image-pull and restart-unit
+  // logs. In some environments we observed only units/ok being preserved
+  // in meta, which prevents the UI from rendering the command output
+  // section used in tests and by operators.
+  if (profile === 'happy-path') {
+    const nightly = tasks.find(
+      (task) =>
+        task.kind === 'manual' &&
+        typeof task.summary === 'string' &&
+        task.summary.includes('nightly manual upgrade'),
+    )
+    if (nightly) {
+      const nightlyLogs = taskLogs[nightly.task_id]
+      if (Array.isArray(nightlyLogs) && nightlyLogs.length > 0) {
+        taskLogs[nightly.task_id] = nightlyLogs.map((log) => {
+          if (log.action === 'task-created') {
+            return {
+              ...log,
+              status: 'succeeded',
+              meta: { caller: 'ops-nightly', reason: 'nightly rollout' },
+            }
+          }
+          if (log.action === 'image-pull') {
+            return {
+              ...log,
+              status: 'succeeded',
+              summary: 'Pulled latest images for svc-alpha, svc-beta',
+              meta: {
+                type: 'command',
+                command: 'podman pull ghcr.io/example/svc-alpha:main',
+                argv: ['podman', 'pull', 'ghcr.io/example/svc-alpha:main'],
+                stdout: 'pulling from registry.example...\ncomplete',
+                stderr: 'warning: using cached image layer metadata',
+                exit: 'exit=0',
+                units: ['svc-alpha.service', 'svc-beta.service'],
+              },
+            }
+          }
+          if (log.action === 'restart-unit') {
+            return {
+              ...log,
+              status: 'succeeded',
+              summary: 'Restarted svc-alpha.service, svc-beta.service',
+              meta: {
+                type: 'command',
+                command: 'systemctl --user restart svc-alpha.service',
+                argv: ['systemctl', '--user', 'restart', 'svc-alpha.service'],
+                stdout: 'restarted svc-alpha.service\nreloaded dependencies',
+                stderr: '',
+                exit: 'exit=0',
+                ok: ['svc-alpha.service', 'svc-beta.service'],
+              },
+            }
+          }
+          return log
+        })
+      }
+    }
+  }
+
   return { tasks, taskLogs }
 }
 
@@ -948,6 +1025,23 @@ class RuntimeStore {
     this.#notify()
   }
 
+  updateTaskLog(taskId: string, logId: number, patch: Partial<TaskLogEntry>) {
+    const current = this.#data.taskLogs[taskId] ?? []
+    this.#data.taskLogs[taskId] = current.map((log) =>
+      log.id === logId
+        ? {
+            ...log,
+            ...patch,
+            meta: {
+              ...(log.meta && typeof log.meta === 'object' ? (log.meta as object) : {}),
+              ...(patch.meta && typeof patch.meta === 'object' ? (patch.meta as object) : {}),
+            },
+          }
+        : log,
+    )
+    this.#notify()
+  }
+
   getTaskLogs(taskId: string): TaskLogEntry[] {
     return this.#data.taskLogs[taskId] ?? []
   }
@@ -1069,23 +1163,145 @@ class RuntimeStore {
     }
 
     this.#data.tasks = [task, ...this.#data.tasks]
-    this.#data.taskLogs[task_id] = [
-      {
-        id: 1,
-        ts: now,
+
+    const logs: TaskLogEntry[] = []
+
+    logs.push({
+      id: 1,
+      ts: now,
+      level: 'info',
+      action: 'task-created',
+      status: 'running',
+      summary: 'Task created from UI request',
+      unit: null,
+      meta: {
+        source: input.source,
+        caller: input.caller ?? null,
+        reason: input.reason ?? null,
+        kind: input.kind,
+      },
+    })
+
+    this.#data.taskLogs[task_id] = logs
+    this.#notify()
+
+    // For manual-style tasks, append synthetic command-level logs over time so
+    // that the UI can observe the timeline and command output evolving,
+    // similar to a real backend streaming logs.
+    if (input.kind === 'manual' && input.units.length > 0) {
+      const firstUnit = input.units[0]
+      const unitBase =
+        typeof firstUnit === 'string' && firstUnit.endsWith('.service')
+          ? firstUnit.slice(0, -'.service'.length)
+          : firstUnit
+      const joinedUnits = input.units.join(', ')
+
+      const imagePullBase: Omit<TaskLogEntry, 'id'> = {
+        ts: now + 2,
         level: 'info',
-        action: 'task-created',
+        action: 'image-pull',
         status: 'running',
-        summary: 'Task created from UI request',
+        summary: `Pulling latest image for ${joinedUnits}`,
         unit: null,
         meta: {
-          source: input.source,
-          caller: input.caller ?? null,
-          reason: input.reason ?? null,
-          kind: input.kind,
+          type: 'command',
+          command: `podman pull ghcr.io/example/${unitBase}:main`,
+          argv: ['podman', 'pull', `ghcr.io/example/${unitBase}:main`],
+          stdout: `pulling ghcr.io/example/${unitBase}:main from registry.example...`,
+          stderr: '',
+          exit: 'exit=0',
+          units: input.units,
         },
-      },
-    ]
+      }
+      const restartLog: Omit<TaskLogEntry, 'id'> = {
+        ts: now + 8,
+        level: 'info',
+        action: 'restart-unit',
+        status: 'succeeded',
+        summary: `Restarted ${joinedUnits}`,
+        unit: null,
+        meta: {
+          type: 'command',
+          command: `systemctl --user restart ${firstUnit}`,
+          argv: ['systemctl', '--user', 'restart', firstUnit],
+          stdout: `restarted ${firstUnit}\nreloaded dependent units`,
+          stderr: '',
+          exit: 'exit=0',
+          ok: input.units,
+        },
+      }
+
+      // 使用较短的前端延迟模拟“逐步出现”的日志与命令输出。
+      setTimeout(() => {
+        this.appendTaskLog(task_id, imagePullBase)
+      }, 400)
+
+      // 追加 stdout 第二行
+      setTimeout(() => {
+        const existingLogs = this.getTaskLogs(task_id)
+        const imagePullEntry = existingLogs.find((log) => log.action === 'image-pull')
+        if (imagePullEntry) {
+          const meta = (imagePullEntry.meta && typeof imagePullEntry.meta === 'object'
+            ? (imagePullEntry.meta as { stdout?: string })
+            : { stdout: undefined }) as { stdout?: string }
+          const nextStdout = `${meta.stdout ?? ''}\nlayer download complete`
+          this.updateTaskLog(task_id, imagePullEntry.id, {
+            meta: { ...(imagePullEntry.meta as object), stdout: nextStdout },
+          })
+        }
+      }, 800)
+
+      // 完整 stdout + stderr
+      setTimeout(() => {
+        const existingLogs = this.getTaskLogs(task_id)
+        const imagePullEntry = existingLogs.find((log) => log.action === 'image-pull')
+        if (imagePullEntry) {
+          const meta = (imagePullEntry.meta && typeof imagePullEntry.meta === 'object'
+            ? (imagePullEntry.meta as { stdout?: string })
+            : { stdout: undefined }) as { stdout?: string }
+          const nextStdout = `${meta.stdout ?? ''}\nimage up to date`
+          this.updateTaskLog(task_id, imagePullEntry.id, {
+            status: 'succeeded',
+            meta: {
+              ...(imagePullEntry.meta as object),
+              stdout: nextStdout,
+              stderr: 'warning: using cached image layers metadata',
+            },
+          })
+        }
+      }, 1200)
+
+      setTimeout(() => {
+        this.appendTaskLog(task_id, restartLog)
+        // 同时将任务标记为成功结束，更新汇总信息。
+        const finishedAt = restartLog.ts
+        const currentLogs = this.getTaskLogs(task_id)
+        const createdLog = currentLogs.find((log) => log.action === 'task-created')
+        if (createdLog) {
+          this.updateTaskLog(task_id, createdLog.id, { status: 'succeeded' })
+        }
+        const unitsDone: TaskUnitSummary[] = input.units.map((unitName) => ({
+          unit: unitName,
+          status: 'succeeded',
+          phase: 'done',
+          started_at: now,
+          finished_at: finishedAt,
+          duration_ms: (finishedAt - now) * 1000,
+          message: 'Task completed successfully (mock runtime)',
+        }))
+        const unit_counts = summarizeUnits(unitsDone)
+        this.updateTask(task_id, {
+          status: 'succeeded',
+          finished_at: finishedAt,
+          summary: `${input.units.length}/${input.units.length} units succeeded · manual trigger`,
+          units: unitsDone,
+          unit_counts,
+          can_stop: false,
+          can_force_stop: false,
+          can_retry: true,
+        })
+      }, 1500)
+    }
 
     this.#notify()
     return task

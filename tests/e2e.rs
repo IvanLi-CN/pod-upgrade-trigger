@@ -27,6 +27,8 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_manual_api().await?;
     scenario_scheduler_loop().await?;
     scenario_events_task_filter().await?;
+    scenario_task_command_logs().await?;
+    scenario_task_logs_sse().await?;
     scenario_error_paths().await?;
     scenario_static_assets().await?;
     scenario_cli_maintenance().await?;
@@ -660,6 +662,163 @@ async fn scenario_events_task_filter() -> AnyResult<()> {
     assert!(
         !events.is_empty(),
         "/api/events?task_id filter should return at least one event"
+    );
+
+    Ok(())
+}
+
+async fn scenario_task_command_logs() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    // Trigger a github webhook that will cause podman pull to fail so we can
+    // assert command-level task logs.
+    let payload = github_registry_payload("koha", "svc-alpha", "main");
+    let signature = env.github_signature(&payload);
+    let request = HttpRequest::post("/github-package-update/svc-alpha")
+        .header("x-github-event", "registry_package")
+        .header("x-github-delivery", "cmd-logs")
+        .header("x-hub-signature-256", &signature)
+        .body(payload.clone());
+
+    let response = env.send_request_with_env(request, |cmd| {
+        cmd.env("MOCK_PODMAN_FAIL", "1");
+    })?;
+    assert_eq!(
+        response.status,
+        202,
+        "github webhook with failing podman should still be accepted: {}",
+        response.body_text()
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find(|row| row.action == "github-webhook")
+        .and_then(|row| row.meta.get("task_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "github-webhook events should include a task_id in meta"
+    );
+
+    let path = format!("/api/tasks/{task_id}");
+    let detail_resp = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(
+        detail_resp.status, 200,
+        "/api/tasks/:id should succeed but got {}",
+        detail_resp.status
+    );
+    let body = detail_resp.json_body()?;
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !logs.is_empty(),
+        "task detail logs should not be empty for github webhook task"
+    );
+
+    let image_pull_log = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("image-pull")))
+        .cloned()
+        .expect("expected at least one image-pull task log entry");
+    let meta = image_pull_log
+        .get("meta")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    assert_eq!(
+        meta.get("type").and_then(|v| v.as_str()),
+        Some("command"),
+        "image-pull meta.type should be 'command'"
+    );
+
+    let command = meta.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        command.contains("podman pull"),
+        "image-pull meta.command should contain 'podman pull', got: {command}"
+    );
+
+    let stderr = meta.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !stderr.is_empty(),
+        "image-pull meta.stderr should be populated"
+    );
+    assert!(
+        stderr.contains("simulated podman pull failure"),
+        "image-pull meta.stderr should include mock failure message, got: {stderr}"
+    );
+
+    let exit = meta.get("exit").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !exit.is_empty(),
+        "image-pull meta.exit should be a non-empty string"
+    );
+
+    Ok(())
+}
+
+async fn scenario_task_logs_sse() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    // Trigger a github webhook that will produce command-level task logs.
+    let payload = github_registry_payload("koha", "svc-alpha", "main");
+    let signature = env.github_signature(&payload);
+    let request = HttpRequest::post("/github-package-update/svc-alpha")
+        .header("x-github-event", "registry_package")
+        .header("x-github-delivery", "sse-logs")
+        .header("x-hub-signature-256", &signature)
+        .body(payload.clone());
+
+    let response = env.send_request_with_env(request, |cmd| {
+        // Force podman pull failure so command meta (including stderr/exit)
+        // is populated in task logs.
+        cmd.env("MOCK_PODMAN_FAIL", "1");
+    })?;
+    assert_eq!(
+        response.status,
+        202,
+        "github webhook for SSE logs should still be accepted: {}",
+        response.body_text()
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find(|row| row.action == "github-webhook")
+        .and_then(|row| row.meta.get("task_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "github-webhook events should include a task_id in meta for SSE scenario"
+    );
+
+    let path = format!("/sse/task-logs?task_id={task_id}");
+    let sse_response = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(
+        sse_response.status, 200,
+        "/sse/task-logs should return 200 for existing task"
+    );
+
+    let body = sse_response.body_text();
+    let log_event_count = body.matches("event: log").count();
+    assert!(
+        log_event_count >= 2,
+        "SSE stream should include multiple log events (got {log_event_count}): {body}"
+    );
+    assert!(
+        body.contains("event: end"),
+        "SSE stream should include an end event, got: {body}"
+    );
+    assert!(
+        body.contains("data: {") && body.contains("\"command\""),
+        "SSE log data should contain JSON with a command field, got: {body}"
     );
 
     Ok(())

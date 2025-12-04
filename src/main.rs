@@ -42,6 +42,7 @@ const DEFAULT_MANUAL_UNIT: &str = "podman-auto-update.service";
 const DEFAULT_REGISTRY_HOST: &str = "ghcr.io";
 const PULL_RETRY_ATTEMPTS: u8 = 3;
 const PULL_RETRY_DELAY_SECS: u64 = 5;
+const COMMAND_OUTPUT_MAX_LEN: usize = 32_768;
 const DEFAULT_SCHEDULER_INTERVAL_SECS: u64 = 900;
 const DEFAULT_STATE_RETENTION_SECS: u64 = 86_400; // 24 hours
 const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
@@ -1021,6 +1022,8 @@ fn handle_connection() -> Result<(), String> {
         respond_json(&ctx, status, reason, &payload, "health-check", None)?;
     } else if ctx.method == "GET" && ctx.path == "/sse/hello" {
         handle_hello_sse(&ctx)?;
+    } else if ctx.path == "/sse/task-logs" {
+        handle_task_logs_sse(&ctx)?;
     } else if ctx.path == "/api/config" {
         handle_config_api(&ctx)?;
     } else if ctx.path == "/api/settings" {
@@ -1078,6 +1081,300 @@ fn handle_hello_sse(ctx: &RequestContext) -> Result<(), String> {
 
     log_message("200 sse hello handshake");
     respond_sse(ctx, "hello", &payload.to_string(), "sse-hello", None)
+}
+
+fn handle_task_logs_sse(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-sse",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "tasks-sse")? {
+        return Ok(());
+    }
+
+    let mut task_id_param: Option<String> = None;
+    if let Some(q) = &ctx.query {
+        for (key, value) in url::form_urlencoded::parse(q.as_bytes()) {
+            if key == "task_id" {
+                let candidate = value.into_owned();
+                if !candidate.trim().is_empty() {
+                    task_id_param = Some(candidate);
+                    break;
+                }
+            }
+        }
+    }
+
+    let task_id = match task_id_param {
+        Some(id) => id,
+        None => {
+            let payload = json!({ "error": "missing task_id" });
+            respond_json(
+                ctx,
+                400,
+                "BadRequest",
+                &payload,
+                "tasks-sse",
+                Some(json!({ "reason": "task-id" })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let detail = match load_task_detail_record(&task_id) {
+        Ok(Some(detail)) => detail,
+        Ok(None) => {
+            let payload = json!({ "error": "task not found" });
+            respond_json(
+                ctx,
+                404,
+                "NotFound",
+                &payload,
+                "tasks-sse",
+                Some(json!({ "task_id": task_id })),
+            )?;
+            return Ok(());
+        }
+        Err(err) => {
+            let payload = json!({ "error": "failed to load task" });
+            respond_json(
+                ctx,
+                500,
+                "InternalServerError",
+                &payload,
+                "tasks-sse",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Common audit metadata that will be enriched by the chosen mode.
+    let mut metadata = json!({
+        "task_id": task_id.clone(),
+        "logs_sent": 0_u64,
+    });
+
+    // Fast path: for non-running tasks we keep the original snapshot behaviour.
+    if detail.task.status != "running" {
+        let mut body = String::new();
+        for log in &detail.logs {
+            if let Ok(payload) = serde_json::to_string(log) {
+                body.push_str("event: log\n");
+                body.push_str("data: ");
+                body.push_str(&payload);
+                body.push_str("\n\n");
+            }
+        }
+        body.push_str("event: end\n");
+        body.push_str("data: done\n\n");
+
+        metadata["logs_sent"] = Value::from(detail.logs.len() as u64);
+        metadata["mode"] = Value::from("snapshot");
+        metadata["response_size"] = Value::from(body.len() as u64);
+
+        let result = send_sse_stream(&body);
+        log_audit_event(ctx, 200, "tasks-sse", metadata);
+        return result;
+    }
+
+    // Streaming path for running tasks: poll for updates and push incremental log events.
+    const POLL_INTERVAL_MS: u64 = 750;
+    const MAX_STREAM_SECS: u64 = 600;
+
+    let started_at = Instant::now();
+    let mut stdout = io::stdout().lock();
+
+    let mut response_size: u64 = 0;
+    let mut logs_sent: u64 = 0;
+    let mut reason = String::from("completed");
+    let mut last_status = detail.task.status.clone();
+
+    // Write HTTP + SSE headers once and then keep the connection open.
+    {
+        let header_result: io::Result<()> = (|| {
+            write!(stdout, "HTTP/1.1 200 OK\r\n")?;
+            stdout.write_all(b"Content-Type: text/event-stream\r\n")?;
+            stdout.write_all(b"Cache-Control: no-cache\r\n")?;
+            stdout.write_all(b"Connection: keep-alive\r\n")?;
+            stdout.write_all(b"\r\n")?;
+            stdout.flush()
+        })();
+
+        match header_result {
+            Ok(()) => {}
+            Err(err)
+                if err.kind() == io::ErrorKind::BrokenPipe
+                    || err.kind() == io::ErrorKind::ConnectionReset =>
+            {
+                // Client disconnected before we could start streaming.
+                reason = String::from("client-disconnect");
+                metadata["mode"] = Value::from("streaming");
+                metadata["logs_sent"] = Value::from(0_u64);
+                metadata["response_size"] = Value::from(0_u64);
+                metadata["reason"] = Value::from(reason.clone());
+                metadata["status"] = Value::from(last_status);
+                log_audit_event(ctx, 200, "tasks-sse", metadata);
+                return Ok(());
+            }
+            Err(err) => {
+                metadata["mode"] = Value::from("streaming");
+                metadata["logs_sent"] = Value::from(0_u64);
+                metadata["response_size"] = Value::from(0_u64);
+                metadata["reason"] = Value::from("io-error");
+                metadata["status"] = Value::from(last_status);
+                log_audit_event(ctx, 200, "tasks-sse", metadata);
+                return Err(err.to_string());
+            }
+        }
+    }
+
+    // Helper closure to write a single chunk to the SSE stream while handling
+    // common connection error cases.
+    let mut write_chunk = |chunk: &str, response_size: &mut u64| -> Result<bool, String> {
+        match stdout.write_all(chunk.as_bytes()) {
+            Ok(()) => {
+                *response_size = response_size.saturating_add(chunk.len() as u64);
+            }
+            Err(err)
+                if err.kind() == io::ErrorKind::BrokenPipe
+                    || err.kind() == io::ErrorKind::ConnectionReset =>
+            {
+                // Client went away; treat as graceful disconnect.
+                reason = String::from("client-disconnect");
+                return Ok(false);
+            }
+            Err(err) => {
+                reason = String::from("io-error");
+                return Err(err.to_string());
+            }
+        }
+
+        if let Err(err) = stdout.flush() {
+            if err.kind() == io::ErrorKind::BrokenPipe
+                || err.kind() == io::ErrorKind::ConnectionReset
+            {
+                reason = String::from("client-disconnect");
+                return Ok(false);
+            }
+            reason = String::from("io-error");
+            return Err(err.to_string());
+        }
+
+        Ok(true)
+    };
+
+    let mut seen_logs: HashMap<i64, String> = HashMap::new();
+    let mut current_detail = detail;
+    let mut result_error: Option<String> = None;
+
+    // Streaming loop: always send new/changed logs, then decide whether to continue.
+    'stream: loop {
+        for log in &current_detail.logs {
+            if let Ok(payload) = serde_json::to_string(log) {
+                let changed = match seen_logs.get(&log.id) {
+                    Some(previous) if previous == &payload => false,
+                    _ => true,
+                };
+
+                if !changed {
+                    continue;
+                }
+
+                seen_logs.insert(log.id, payload.clone());
+
+                let chunk = format!("event: log\ndata: {}\n\n", payload);
+                match write_chunk(&chunk, &mut response_size) {
+                    Ok(true) => {
+                        logs_sent = logs_sent.saturating_add(1);
+                    }
+                    Ok(false) => {
+                        // Client disconnected; stop streaming.
+                        break 'stream;
+                    }
+                    Err(err) => {
+                        result_error = Some(err);
+                        break 'stream;
+                    }
+                }
+            }
+        }
+
+        last_status = current_detail.task.status.clone();
+
+        if last_status != "running" {
+            let chunk = "event: end\ndata: done\n\n";
+            match write_chunk(chunk, &mut response_size) {
+                Ok(true) | Ok(false) => {
+                    // Completed normally or client disconnected while sending end.
+                }
+                Err(err) => {
+                    result_error = Some(err);
+                }
+            }
+            reason = String::from("completed");
+            break 'stream;
+        }
+
+        if started_at.elapsed() >= Duration::from_secs(MAX_STREAM_SECS) {
+            let chunk = "event: end\ndata: timeout\n\n";
+            match write_chunk(chunk, &mut response_size) {
+                Ok(true) | Ok(false) => {}
+                Err(err) => {
+                    result_error = Some(err);
+                }
+            }
+            reason = String::from("timeout");
+            break 'stream;
+        }
+
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+
+        match load_task_detail_record(&task_id) {
+            Ok(Some(next)) => {
+                current_detail = next;
+            }
+            Ok(None) => {
+                let chunk = "event: end\ndata: gone\n\n";
+                match write_chunk(chunk, &mut response_size) {
+                    Ok(true) | Ok(false) => {}
+                    Err(err) => {
+                        result_error = Some(err);
+                    }
+                }
+                reason = String::from("task-missing");
+                break 'stream;
+            }
+            Err(err) => {
+                reason = String::from("load-error");
+                result_error = Some(err);
+                break 'stream;
+            }
+        }
+    }
+
+    // Finalize audit metadata for streaming mode.
+    metadata["mode"] = Value::from("streaming");
+    metadata["logs_sent"] = Value::from(logs_sent);
+    metadata["response_size"] = Value::from(response_size);
+    metadata["reason"] = Value::from(reason);
+    metadata["status"] = Value::from(last_status);
+
+    log_audit_event(ctx, 200, "tasks-sse", metadata);
+
+    if let Some(err) = result_error {
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
@@ -2367,8 +2664,16 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     None => "Task · cancelled by user".to_string(),
                 };
 
+                let command = format!("systemctl --user stop {runner_unit}");
+                let argv = ["systemctl", "--user", "stop", runner_unit.as_str()];
+                let extra_meta = json!({ "via": "stop", "runner_unit": runner_unit });
+                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
+                let meta_str =
+                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
+
                 let task_id_db = task_id.to_string();
                 let new_summary_db = new_summary.clone();
+                let meta_str_db = meta_str.clone();
 
                 let update_result = with_db(|pool| async move {
                     let mut tx = pool.begin().await?;
@@ -2396,10 +2701,6 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     .execute(&mut *tx)
                     .await?;
 
-                    let meta = json!({ "via": "stop", "runner_unit": runner_unit });
-                    let meta_str =
-                        serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
-
                     sqlx::query(
                         "INSERT INTO task_logs \
                          (task_id, ts, level, action, status, summary, unit, meta) \
@@ -2412,7 +2713,7 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     .bind("cancelled")
                     .bind("Task cancelled via /stop API")
                     .bind(Option::<String>::None)
-                    .bind(meta_str)
+                    .bind(meta_str_db)
                     .execute(&mut *tx)
                     .await?;
 
@@ -2471,15 +2772,17 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
             }
             Ok(result) => {
                 let exit = exit_code_string(&result.status);
-                let stderr = result.stderr.clone();
 
                 let task_id_db = task_id.to_string();
-                let meta = json!({
+                let command = format!("systemctl --user stop {runner_unit}");
+                let argv = ["systemctl", "--user", "stop", runner_unit.as_str()];
+                let extra_meta = json!({
                     "runner_unit": runner_unit,
                     "exit": exit,
-                    "stderr": stderr,
                 });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
+                let meta_str =
+                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
                 let _ = with_db(|pool| async move {
                     sqlx::query(
@@ -2854,8 +3157,22 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                     None => "Task · force-stopped".to_string(),
                 };
 
+                let command = format!("systemctl --user kill --signal=SIGKILL {runner_unit}");
+                let argv = [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "--signal=SIGKILL",
+                    runner_unit.as_str(),
+                ];
+                let extra_meta = json!({ "via": "force-stop", "runner_unit": runner_unit });
+                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
+                let meta_str =
+                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
+
                 let task_id_db = task_id.to_string();
                 let new_summary_db = new_summary.clone();
+                let meta_str_db = meta_str.clone();
 
                 let update_result = with_db(|pool| async move {
                     let mut tx = pool.begin().await?;
@@ -2883,10 +3200,6 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                     .execute(&mut *tx)
                     .await?;
 
-                    let meta = json!({ "via": "force-stop", "runner_unit": runner_unit });
-                    let meta_str =
-                        serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
-
                     sqlx::query(
                         "INSERT INTO task_logs \
                          (task_id, ts, level, action, status, summary, unit, meta) \
@@ -2899,7 +3212,7 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                     .bind("failed")
                     .bind("Task force-stopped via /force-stop API")
                     .bind(Option::<String>::None)
-                    .bind(meta_str)
+                    .bind(meta_str_db)
                     .execute(&mut *tx)
                     .await?;
 
@@ -2958,15 +3271,23 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
             }
             Ok(result) => {
                 let exit = exit_code_string(&result.status);
-                let stderr = result.stderr.clone();
 
                 let task_id_db = task_id.to_string();
-                let meta = json!({
+                let command = format!("systemctl --user kill --signal=SIGKILL {runner_unit}");
+                let argv = [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "--signal=SIGKILL",
+                    runner_unit.as_str(),
+                ];
+                let extra_meta = json!({
                     "runner_unit": runner_unit,
                     "exit": exit,
-                    "stderr": stderr,
                 });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
+                let meta_str =
+                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
                 let _ = with_db(|pool| async move {
                     sqlx::query(
@@ -7219,6 +7540,7 @@ fn apply_rate_limits(
 
 struct CommandExecResult {
     status: ExitStatus,
+    stdout: String,
     stderr: String,
 }
 
@@ -7228,17 +7550,81 @@ impl CommandExecResult {
     }
 }
 
+fn truncate_command_output(text: &str) -> (String, bool) {
+    if text.len() <= COMMAND_OUTPUT_MAX_LEN {
+        return (text.to_string(), false);
+    }
+
+    let mut truncated = String::new();
+    for ch in text.chars().take(COMMAND_OUTPUT_MAX_LEN) {
+        truncated.push(ch);
+    }
+    (truncated, true)
+}
+
+fn build_command_meta(
+    command: &str,
+    argv: &[&str],
+    result: &CommandExecResult,
+    extra_meta: Option<Value>,
+) -> Value {
+    let (stdout, truncated_stdout) = truncate_command_output(&result.stdout);
+    let (stderr, truncated_stderr) = truncate_command_output(&result.stderr);
+    let exit = format!("exit={}", exit_code_string(&result.status));
+
+    let mut meta = json!({
+        "type": "command",
+        "command": command,
+        "argv": argv,
+        "exit": exit,
+    });
+
+    if !stdout.is_empty() {
+        meta["stdout"] = Value::String(stdout);
+        if truncated_stdout {
+            meta["truncated_stdout"] = Value::Bool(true);
+        }
+    }
+
+    if !stderr.is_empty() {
+        meta["stderr"] = Value::String(stderr);
+        if truncated_stderr {
+            meta["truncated_stderr"] = Value::Bool(true);
+        }
+    }
+
+    if let Some(extra) = extra_meta {
+        match extra {
+            Value::Object(map) => {
+                if let Some(obj) = meta.as_object_mut() {
+                    for (k, v) in map {
+                        // Preserve explicit command fields when keys collide.
+                        obj.entry(k).or_insert(v);
+                    }
+                }
+            }
+            other => {
+                meta["extra"] = other;
+            }
+        }
+    }
+
+    meta
+}
+
 fn run_quiet_command(mut command: Command) -> Result<CommandExecResult, String> {
     let output = command
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| e.to_string())?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     Ok(CommandExecResult {
         status: output.status,
+        stdout,
         stderr,
     })
 }
@@ -7309,7 +7695,9 @@ fn kill_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
     })
 }
 
-fn pull_container_image(image: &str) -> Result<(), String> {
+fn pull_container_image(image: &str) -> Result<CommandExecResult, String> {
+    let mut last_result: Option<CommandExecResult> = None;
+
     for attempt in 1..=PULL_RETRY_ATTEMPTS {
         let result = run_quiet_command({
             let mut cmd = Command::new("podman");
@@ -7317,22 +7705,17 @@ fn pull_container_image(image: &str) -> Result<(), String> {
             cmd
         })?;
         if result.success() {
-            return Ok(());
+            return Ok(result);
         }
 
-        if attempt == PULL_RETRY_ATTEMPTS {
-            let mut message = exit_code_string(&result.status);
-            if !result.stderr.is_empty() {
-                message.push_str(": ");
-                message.push_str(&result.stderr);
-            }
-            return Err(message);
-        }
+        last_result = Some(result);
 
-        thread::sleep(Duration::from_secs(PULL_RETRY_DELAY_SECS));
+        if attempt < PULL_RETRY_ATTEMPTS {
+            thread::sleep(Duration::from_secs(PULL_RETRY_DELAY_SECS));
+        }
     }
 
-    Err("unreachable".into())
+    Ok(last_result.expect("PULL_RETRY_ATTEMPTS must be >= 1"))
 }
 
 fn prune_images_silently() {
@@ -7479,10 +7862,48 @@ fn run_background_task(
 
     let _guard = guard;
 
-    if let Err(err) = pull_container_image(image) {
+    let pull_result = match pull_container_image(image) {
+        Ok(res) => res,
+        Err(err) => {
+            log_message(&format!(
+                "500 github-image-pull-failed unit={unit} image={image} event={event} delivery={delivery} path={path} err={err}"
+            ));
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Image pull failed for github webhook task",
+                "image-pull",
+                "error",
+                json!({ "error": err, "image": image, "event": event, "delivery": delivery, "path": path }),
+            );
+            return Ok(());
+        }
+    };
+
+    if !pull_result.success() {
+        let mut error_message = exit_code_string(&pull_result.status);
+        if !pull_result.stderr.is_empty() {
+            error_message.push_str(": ");
+            error_message.push_str(&pull_result.stderr);
+        }
+
         log_message(&format!(
-            "500 github-image-pull-failed unit={unit} image={image} event={event} delivery={delivery} path={path} err={err}"
+            "500 github-image-pull-failed unit={unit} image={image} event={event} delivery={delivery} path={path} err={error_message}"
         ));
+
+        let command = format!("podman pull {image}");
+        let argv = ["podman", "pull", image];
+        let extra_meta = json!({
+            "error": error_message,
+            "image": image,
+            "event": event,
+            "delivery": delivery,
+            "path": path,
+        });
+        let meta = build_command_meta(&command, &argv, &pull_result, Some(extra_meta));
+
         update_task_state_with_unit(
             task_id,
             "failed",
@@ -7491,10 +7912,13 @@ fn run_background_task(
             "Image pull failed for github webhook task",
             "image-pull",
             "error",
-            json!({ "error": err, "image": image, "event": event, "delivery": delivery, "path": path }),
+            meta,
         );
         return Ok(());
     }
+
+    let restart_command = format!("systemctl --user restart {unit}");
+    let restart_argv = ["systemctl", "--user", "restart", unit];
 
     match restart_unit(unit) {
         Ok(result) if result.success() => {
@@ -7502,6 +7926,15 @@ fn run_background_task(
                 "202 github-triggered unit={unit} image={image} event={event} delivery={delivery} path={path}"
             ));
             prune_images_silently();
+            let extra_meta = json!({
+                "status": "ok",
+                "image": image,
+                "event": event,
+                "delivery": delivery,
+                "path": path,
+            });
+            let meta =
+                build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
             update_task_state_with_unit(
                 task_id,
                 "succeeded",
@@ -7510,7 +7943,7 @@ fn run_background_task(
                 "Github webhook task completed successfully",
                 "restart-unit",
                 "info",
-                json!({ "status": "ok", "image": image, "event": event, "delivery": delivery, "path": path }),
+                meta,
             );
         }
         Ok(result) => {
@@ -7523,6 +7956,14 @@ fn run_background_task(
                 message.push_str(&result.stderr);
             }
             log_message(&message);
+            let extra_meta = json!({
+                "image": image,
+                "event": event,
+                "delivery": delivery,
+                "path": path,
+            });
+            let meta =
+                build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
             update_task_state_with_unit(
                 task_id,
                 "failed",
@@ -7531,20 +7972,14 @@ fn run_background_task(
                 "Restart unit failed for github webhook task",
                 "restart-unit",
                 "error",
-                json!({
-                    "exit": exit_code_string(&result.status),
-                    "stderr": result.stderr,
-                    "image": image,
-                    "event": event,
-                    "delivery": delivery,
-                    "path": path,
-                }),
+                meta,
             );
         }
         Err(err) => {
             log_message(&format!(
                 "500 github-restart-error unit={unit} image={image} event={event} delivery={delivery} path={path} err={err}"
             ));
+            // For unexpected errors, fall back to a non-command meta payload.
             update_task_state_with_unit(
                 task_id,
                 "failed",
@@ -7750,11 +8185,47 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
 fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Result<(), String> {
     let unit_owned = unit.to_string();
     if let Some(image) = image {
-        if let Err(err) = pull_container_image(image) {
+        let pull_result = match pull_container_image(image) {
+            Ok(res) => res,
+            Err(err) => {
+                log_message(&format!(
+                    "500 manual-service-image-pull-failed unit={unit_owned} image={image} err={err}"
+                ));
+                let meta = json!({ "unit": unit_owned, "image": image, "error": err });
+                update_task_state_with_unit(
+                    task_id,
+                    "failed",
+                    &unit_owned,
+                    "failed",
+                    "Manual service image pull failed",
+                    "image-pull",
+                    "error",
+                    meta,
+                );
+                return Ok(());
+            }
+        };
+
+        if !pull_result.success() {
+            let mut error_message = exit_code_string(&pull_result.status);
+            if !pull_result.stderr.is_empty() {
+                error_message.push_str(": ");
+                error_message.push_str(&pull_result.stderr);
+            }
+
             log_message(&format!(
-                "500 manual-service-image-pull-failed unit={unit_owned} image={image} err={err}"
+                "500 manual-service-image-pull-failed unit={unit_owned} image={image} err={error_message}"
             ));
-            let meta = json!({ "unit": unit_owned, "image": image, "error": err });
+
+            let command = format!("podman pull {image}");
+            let argv = ["podman", "pull", image];
+            let extra_meta = json!({
+                "unit": unit_owned,
+                "image": image,
+                "error": error_message,
+            });
+            let meta = build_command_meta(&command, &argv, &pull_result, Some(extra_meta));
+
             update_task_state_with_unit(
                 task_id,
                 "failed",
@@ -7814,15 +8285,19 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
 
 fn run_auto_update_task(task_id: &str, unit: &str) -> Result<(), String> {
     let unit_owned = unit.to_string();
+    let command = format!("systemctl --user start {unit_owned}");
+    let argv = ["systemctl", "--user", "start", unit];
+
     match start_auto_update_unit(&unit_owned) {
         Ok(result) if result.success() => {
             log_message(&format!(
                 "202 auto-update-start unit={unit_owned} task_id={task_id}"
             ));
-            let meta = json!({
+            let extra_meta = json!({
                 "unit": unit_owned,
                 "stderr": result.stderr,
             });
+            let meta = build_command_meta(&command, &argv, &result, Some(extra_meta));
             update_task_state_with_unit(
                 task_id,
                 "succeeded",
@@ -7841,11 +8316,11 @@ fn run_auto_update_task(task_id: &str, unit: &str) -> Result<(), String> {
                 "500 auto-update-failed unit={unit_owned} task_id={task_id} exit={exit} stderr={}",
                 result.stderr
             ));
-            let meta = json!({
+            let extra_meta = json!({
                 "unit": unit_owned,
-                "stderr": result.stderr,
                 "exit": exit,
             });
+            let meta = build_command_meta(&command, &argv, &result, Some(extra_meta));
             update_task_state_with_unit(
                 task_id,
                 "failed",
@@ -8572,6 +9047,7 @@ fn write_payload_response(
 }
 
 fn write_sse_event(event: &str, data: &str) -> io::Result<()> {
+    // Single-event SSE helper used by /sse/hello.
     let mut stdout = io::stdout().lock();
     write!(stdout, "HTTP/1.1 200 OK\r\n")?;
     stdout.write_all(b"Content-Type: text/event-stream\r\n")?;
@@ -8586,6 +9062,19 @@ fn write_sse_event(event: &str, data: &str) -> io::Result<()> {
         writeln!(stdout, "data: {line}")?;
     }
     stdout.write_all(b"\n")?;
+    stdout.flush()
+}
+
+fn write_sse_stream(body: &str) -> io::Result<()> {
+    // Multi-event SSE helper used by /sse/task-logs to emit a precomputed
+    // stream of events in a single HTTP response.
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "HTTP/1.1 200 OK\r\n")?;
+    stdout.write_all(b"Content-Type: text/event-stream\r\n")?;
+    stdout.write_all(b"Cache-Control: no-cache\r\n")?;
+    stdout.write_all(b"Connection: keep-alive\r\n")?;
+    stdout.write_all(b"\r\n")?;
+    stdout.write_all(body.as_bytes())?;
     stdout.flush()
 }
 
@@ -8640,6 +9129,19 @@ fn send_head_response(
 
 fn send_sse_event(event: &str, data: &str) -> Result<(), String> {
     match write_sse_event(event, data) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.kind() == io::ErrorKind::BrokenPipe
+                || err.kind() == io::ErrorKind::ConnectionReset =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn send_sse_stream(body: &str) -> Result<(), String> {
+    match write_sse_stream(body) {
         Ok(()) => Ok(()),
         Err(err)
             if err.kind() == io::ErrorKind::BrokenPipe

@@ -122,6 +122,28 @@
 - 展示层级：
   - 概要项：时间 + action + 状态 + 简短说明（例如 “image pull success”、“restart unit failed”）；
   - 详细项：展开后可以查看完整 `meta` JSON，用于问题排查。
+- 命令级输出记录（新增约定）：
+  - 需求：在任务详情中能够看到“原始执行的命令及其所有输出”，便于直接复制到终端重现问题。
+  - 针对与任务强相关的外部命令（当前至少包括）：
+    - 镜像拉取：`podman pull <image>`（手动服务 / GitHub Webhook / Scheduler 等）；
+    - 单元操作：`systemctl --user start|restart <unit>`；
+    - 任务停止：`systemctl --user stop|kill <unit>`。
+  - 这些命令的执行结果统一通过 `task_logs.meta` 结构化记录，不新增表结构，推荐 JSON 形态：
+    - `type: "command"`：用于前端快速识别“命令输出型”日志；
+    - `command: string`：可复制的完整命令行（例如 `"podman pull ghcr.io/muety/wakapi:latest"`）；
+    - `argv?: string[]`：拆分后的参数数组，便于后续程序化处理（可选）；
+    - `stdout?: string`：命令的标准输出完整内容（必要时可裁剪并在 JSON 中标记 `truncated`）；
+    - `stderr?: string`：命令的标准错误输出；
+    - `exit?: string`：退出码的字符串表示，例如 `"exit=0"`、`"exit=42"`；
+    - 其他字段（可选）：如 `attempt`、`unit`、`image` 等维持与现有 meta 一致。
+  - Task 详情接口 `GET /api/tasks/:id` 在保持 `TaskLogEntry` 现有字段不变的前提下，只在 `meta` 中增加上述结构。旧数据（无 `command` 字段）仍然合法。
+  - 前端渲染约定：
+    - 时间线上仍以 `action` + `status` + `summary` 作为概览；
+    - 当 `meta.type === "command"` 或 `meta` 中同时存在 `command` 与 `stdout` / `stderr` 时，在日志项内提供可折叠区域展示：
+      - 一行只读的 `command` 文本（支持一键复制）；
+      - 受高度限制的 `stdout` / `stderr` 文本框（滚动查看完整内容，必要时在 JSON 中用 `truncated` 标记被截断的输出）。
+    - 未携带命令信息的历史日志仍按当前行为展示，不需要特殊处理。
+  - 额外 UX 建议：对于处于 `running` 状态且被识别为命令型的日志项，前端可以在首次出现时默认展开一次“命令输出”折叠，以方便实时观察；用户手动收起后不再自动展开。
 - 原始系统日志（systemd/journal）：
   - 当前版本不直接暴露；
   - 后续如需接入，需单独设计过滤与脱敏策略。
@@ -133,6 +155,22 @@
   - 当任务进入终态（succeeded / failed / cancelled / skipped）后停止轮询。
 
 ---
+- 任务日志 SSE 通道（后端已实现并默认启用，用于实时日志流）
+  - 当前服务已经在生产路径中实现基于 SSE 的任务日志流接口，强烈建议部署环境开启并保持可用；即便 SSE 临时不可用（如网络或代理不透传 SSE），前端仍可退回 HTTP 轮询保证功能可用。
+  - 接口与事件形态：
+    - `GET /sse/task-logs?task_id=<id>`；
+    - `event: log`：`data` 为完整 `TaskLogEntry` JSON，同一 `id` 可以多次出现，表示该日志被更新（例如 stdout/stderr 被追加、status 从 `running` 变为 `succeeded`）；
+    - `event: end`：当任务进入终态，或因超时、任务丢失、客户端断开等原因结束流式传输时发送一次，前端应关闭对应的 `EventSource`。
+  - 按任务状态区分两种模式：
+    - 非 `running` 任务（快照模式）：服务端在建立 SSE 连接后，一次性发送当前所有 `TaskLogEntry` 的 `event: log` 事件，并在末尾发送一次 `event: end`，可视为通过 SSE 返回日志快照。
+    - `running` 任务（流式模式）：服务端写入一次 HTTP+SSE 头并保持连接，周期性调用 `load_task_detail_record(task_id)` 等内部查询，仅在发现新增或变更的 `TaskLogEntry`（按 `id` 判断 JSON 是否变更）时发送 `event: log`，直到任务进入终态或达到最大流式时长后发送 `event: end` 结束。
+  - 推荐前端行为（当前实现已遵循）：
+    - 初次打开任务详情时仍调用 `GET /api/tasks/:id` 获取完整快照（包含当前 `logs`）；
+    - 对于 `status === "running"` 的任务，并行建立 `/sse/task-logs?task_id=...` 的 `EventSource`：
+      - 每收到一条 `event: log`，按 `id` 将本地日志数组中的对应条目覆盖/追加；
+      - 收到 `event: end` 或前端检测到任务进入终态后关闭 SSE；
+    - 当 SSE 连接异常或不可用时，前端可以退回纯 HTTP 轮询模式，保障任务详情与日志仍然可用。
+
 
 ### 4.3 任务控制（停止等）
 
