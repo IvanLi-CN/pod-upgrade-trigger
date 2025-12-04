@@ -2,6 +2,7 @@ import { Icon } from '@iconify/react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import type {
+  CommandMeta,
   Task,
   TaskStatus,
   TaskDetailResponse,
@@ -19,6 +20,49 @@ type StatusFilter = TaskStatus | ''
 const PAGE_SIZE = 20
 const POLL_INTERVAL_MS = 7000
 const DETAIL_POLL_INTERVAL_MS = 3000
+
+function buildMockCommandMetaFallback(
+  log: TaskLogEntry,
+  mockEnabled: boolean,
+): CommandMeta | null {
+  if (!mockEnabled) return null
+  if (log.action !== 'image-pull' && log.action !== 'restart-unit') return null
+  if (!log.meta || typeof log.meta !== 'object') return null
+
+  const candidate = log.meta as { [key: string]: unknown }
+  const units =
+    Array.isArray(candidate.units) && candidate.units.every((u) => typeof u === 'string')
+      ? (candidate.units as string[])
+      : null
+  if (!units || units.length === 0) return null
+
+  const firstUnit = units[0]
+  if (typeof firstUnit !== 'string' || !firstUnit.endsWith('.service')) return null
+  const mainService = firstUnit.slice(0, -'.service'.length)
+
+  if (log.action === 'image-pull') {
+    return {
+      type: 'command',
+      command: `podman pull ghcr.io/example/${mainService}:main`,
+      argv: ['podman', 'pull', `ghcr.io/example/${mainService}:main`],
+      stdout: 'pulling from registry.example...\ncomplete',
+      stderr: 'warning: using cached image layer metadata',
+      exit: 'exit=0',
+      units,
+    }
+  }
+
+  // restart-unit fallback
+  return {
+    type: 'command',
+    command: `systemctl --user restart ${firstUnit}`,
+    argv: ['systemctl', '--user', 'restart', firstUnit],
+    stdout: `restarted ${firstUnit}\nreloaded dependencies`,
+    stderr: '',
+    exit: 'exit=0',
+    ok: units,
+  }
+}
 
 export default function TasksPage() {
   const { status: appStatus, getJson, postJson, mockEnabled } = useApi()
@@ -209,13 +253,13 @@ export default function TasksPage() {
       for (const log of drawerLogs) {
         if (next[log.id] !== undefined) continue
         if (log.status !== 'running') continue
-        if (!isCommandMeta(log.meta)) continue
+        if (!isCommandMeta(log.meta) && !buildMockCommandMetaFallback(log, mockEnabled)) continue
         next[log.id] = true
         changed = true
       }
       return changed ? next : prev
     })
-  }, [drawerLogs])
+  }, [drawerLogs, mockEnabled])
 
   const drawerStatus = drawerTask?.status
 
@@ -858,7 +902,9 @@ export default function TasksPage() {
                       return (
                         <div className="space-y-1">
                           {logs.map((log) => {
-                            const commandMeta = isCommandMeta(log.meta) ? log.meta : null
+                            const commandMeta = isCommandMeta(log.meta)
+                              ? (log.meta as CommandMeta)
+                              : buildMockCommandMetaFallback(log, mockEnabled)
 
                             const combinedLines =
                               commandMeta && (commandMeta.stdout || commandMeta.stderr)

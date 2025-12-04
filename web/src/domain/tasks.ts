@@ -174,6 +174,8 @@ export type CommandMeta = {
   stdout?: string
   stderr?: string
   exit?: string
+   ok?: string[]
+   units?: string[]
 }
 
 /**
@@ -181,13 +183,31 @@ export type CommandMeta = {
  * command-style metadata.
  *
  * The check is intentionally relaxed: we only require that meta is an object
- * and that it exposes a non-empty command, stdout or stderr field. Older
- * log entries without these fields will simply return false.
+ * and that it either declares a `type: "command"` (case-insensitive) field,
+ * or exposes a non-empty command, stdout or stderr field. Older log entries
+ * without these fields will simply return false.
  */
 export function isCommandMeta(meta: unknown): meta is CommandMeta {
-  if (!meta || typeof meta !== 'object') return false
+  if (!meta) return false
+
+  // Accept stringified JSON payloads by attempting a best-effort parse.
+  if (typeof meta === 'string') {
+    try {
+      const parsed = JSON.parse(meta) as unknown
+      return isCommandMeta(parsed)
+    } catch {
+      return false
+    }
+  }
+
+  if (typeof meta !== 'object') return false
 
   const candidate = meta as { [key: string]: unknown }
+
+  const type =
+    typeof candidate.type === 'string' ? candidate.type.trim().toLowerCase() : ''
+  const hasCommandType = type === 'command'
+
   const hasCommand =
     typeof candidate.command === 'string' && candidate.command.trim().length > 0
   const hasStdout =
@@ -195,7 +215,7 @@ export function isCommandMeta(meta: unknown): meta is CommandMeta {
   const hasStderr =
     typeof candidate.stderr === 'string' && candidate.stderr.trim().length > 0
 
-  return hasCommand || hasStdout || hasStderr
+  return hasCommandType || hasCommand || hasStdout || hasStderr
 }
 
 export type TasksListResponse = {

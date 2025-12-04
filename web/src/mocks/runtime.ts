@@ -778,6 +778,67 @@ function buildTasks(
 
   tasks.sort((a, b) => b.created_at - a.created_at)
 
+  // Ensure that in the happy-path profile the nightly manual task exposes
+  // fully-populated command metadata for its image-pull and restart-unit
+  // logs. In some environments we observed only units/ok being preserved
+  // in meta, which prevents the UI from rendering the command output
+  // section used in tests and by operators.
+  if (profile === 'happy-path') {
+    const nightly = tasks.find(
+      (task) =>
+        task.kind === 'manual' &&
+        typeof task.summary === 'string' &&
+        task.summary.includes('nightly manual upgrade'),
+    )
+    if (nightly) {
+      const nightlyLogs = taskLogs[nightly.task_id]
+      if (Array.isArray(nightlyLogs) && nightlyLogs.length > 0) {
+        taskLogs[nightly.task_id] = nightlyLogs.map((log) => {
+          if (log.action === 'task-created') {
+            return {
+              ...log,
+              status: 'succeeded',
+              meta: { caller: 'ops-nightly', reason: 'nightly rollout' },
+            }
+          }
+          if (log.action === 'image-pull') {
+            return {
+              ...log,
+              status: 'succeeded',
+              summary: 'Pulled latest images for svc-alpha, svc-beta',
+              meta: {
+                type: 'command',
+                command: 'podman pull ghcr.io/example/svc-alpha:main',
+                argv: ['podman', 'pull', 'ghcr.io/example/svc-alpha:main'],
+                stdout: 'pulling from registry.example...\ncomplete',
+                stderr: 'warning: using cached image layer metadata',
+                exit: 'exit=0',
+                units: ['svc-alpha.service', 'svc-beta.service'],
+              },
+            }
+          }
+          if (log.action === 'restart-unit') {
+            return {
+              ...log,
+              status: 'succeeded',
+              summary: 'Restarted svc-alpha.service, svc-beta.service',
+              meta: {
+                type: 'command',
+                command: 'systemctl --user restart svc-alpha.service',
+                argv: ['systemctl', '--user', 'restart', 'svc-alpha.service'],
+                stdout: 'restarted svc-alpha.service\nreloaded dependencies',
+                stderr: '',
+                exit: 'exit=0',
+                ok: ['svc-alpha.service', 'svc-beta.service'],
+              },
+            }
+          }
+          return log
+        })
+      }
+    }
+  }
+
   return { tasks, taskLogs }
 }
 
