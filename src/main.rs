@@ -1022,6 +1022,8 @@ fn handle_connection() -> Result<(), String> {
         respond_json(&ctx, status, reason, &payload, "health-check", None)?;
     } else if ctx.method == "GET" && ctx.path == "/sse/hello" {
         handle_hello_sse(&ctx)?;
+    } else if ctx.path == "/sse/task-logs" {
+        handle_task_logs_sse(&ctx)?;
     } else if ctx.path == "/api/config" {
         handle_config_api(&ctx)?;
     } else if ctx.path == "/api/settings" {
@@ -1079,6 +1081,104 @@ fn handle_hello_sse(ctx: &RequestContext) -> Result<(), String> {
 
     log_message("200 sse hello handshake");
     respond_sse(ctx, "hello", &payload.to_string(), "sse-hello", None)
+}
+
+fn handle_task_logs_sse(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "tasks-sse",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "tasks-sse")? {
+        return Ok(());
+    }
+
+    let mut task_id_param: Option<String> = None;
+    if let Some(q) = &ctx.query {
+        for (key, value) in url::form_urlencoded::parse(q.as_bytes()) {
+            if key == "task_id" {
+                let candidate = value.into_owned();
+                if !candidate.trim().is_empty() {
+                    task_id_param = Some(candidate);
+                    break;
+                }
+            }
+        }
+    }
+
+    let task_id = match task_id_param {
+        Some(id) => id,
+        None => {
+            let payload = json!({ "error": "missing task_id" });
+            respond_json(
+                ctx,
+                400,
+                "BadRequest",
+                &payload,
+                "tasks-sse",
+                Some(json!({ "reason": "task-id" })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let detail = match load_task_detail_record(&task_id) {
+        Ok(Some(detail)) => detail,
+        Ok(None) => {
+            let payload = json!({ "error": "task not found" });
+            respond_json(
+                ctx,
+                404,
+                "NotFound",
+                &payload,
+                "tasks-sse",
+                Some(json!({ "task_id": task_id })),
+            )?;
+            return Ok(());
+        }
+        Err(err) => {
+            let payload = json!({ "error": "failed to load task" });
+            respond_json(
+                ctx,
+                500,
+                "InternalServerError",
+                &payload,
+                "tasks-sse",
+                Some(json!({ "task_id": task_id, "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let mut body = String::new();
+    for log in &detail.logs {
+        if let Ok(payload) = serde_json::to_string(log) {
+            body.push_str("event: log\n");
+            body.push_str("data: ");
+            body.push_str(&payload);
+            body.push_str("\n\n");
+        }
+    }
+    body.push_str("event: end\n");
+    body.push_str("data: done\n\n");
+
+    let mut metadata = json!({
+        "task_id": task_id,
+        "logs_sent": detail.logs.len() as u64,
+        "mode": "snapshot",
+    });
+    metadata["response_size"] = Value::from(body.len() as u64);
+
+    let result = send_sse_stream(&body);
+    log_audit_event(ctx, 200, "tasks-sse", metadata);
+    result
 }
 
 fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
@@ -8739,6 +8839,7 @@ fn write_payload_response(
 }
 
 fn write_sse_event(event: &str, data: &str) -> io::Result<()> {
+    // Single-event SSE helper used by /sse/hello.
     let mut stdout = io::stdout().lock();
     write!(stdout, "HTTP/1.1 200 OK\r\n")?;
     stdout.write_all(b"Content-Type: text/event-stream\r\n")?;
@@ -8753,6 +8854,19 @@ fn write_sse_event(event: &str, data: &str) -> io::Result<()> {
         writeln!(stdout, "data: {line}")?;
     }
     stdout.write_all(b"\n")?;
+    stdout.flush()
+}
+
+fn write_sse_stream(body: &str) -> io::Result<()> {
+    // Multi-event SSE helper used by /sse/task-logs to emit a precomputed
+    // stream of events in a single HTTP response.
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "HTTP/1.1 200 OK\r\n")?;
+    stdout.write_all(b"Content-Type: text/event-stream\r\n")?;
+    stdout.write_all(b"Cache-Control: no-cache\r\n")?;
+    stdout.write_all(b"Connection: keep-alive\r\n")?;
+    stdout.write_all(b"\r\n")?;
+    stdout.write_all(body.as_bytes())?;
     stdout.flush()
 }
 
@@ -8807,6 +8921,19 @@ fn send_head_response(
 
 fn send_sse_event(event: &str, data: &str) -> Result<(), String> {
     match write_sse_event(event, data) {
+        Ok(()) => Ok(()),
+        Err(err)
+            if err.kind() == io::ErrorKind::BrokenPipe
+                || err.kind() == io::ErrorKind::ConnectionReset =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn send_sse_stream(body: &str) -> Result<(), String> {
+    match write_sse_stream(body) {
         Ok(()) => Ok(()),
         Err(err)
             if err.kind() == io::ErrorKind::BrokenPipe
