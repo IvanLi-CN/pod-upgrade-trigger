@@ -217,13 +217,22 @@ export default function TasksPage() {
     })
   }, [drawerLogs])
 
+  const drawerStatus = drawerTask?.status
+
   useEffect(() => {
-    if (!selectedTaskId || !mockEnabled) return
+    if (!selectedTaskId) return
+    if (drawerStatus !== 'running') return
+    if (typeof EventSource === 'undefined') return
 
     let cancelled = false
-    const source = new EventSource(
-      `/sse/task-logs?task_id=${encodeURIComponent(selectedTaskId)}`,
-    )
+    const url = `/sse/task-logs?task_id=${encodeURIComponent(selectedTaskId)}`
+    let source: EventSource
+    try {
+      source = new EventSource(url)
+    } catch {
+      // 创建失败时静默降级为仅依赖 HTTP 轮询。
+      return
+    }
 
     const handleLog = (event: MessageEvent) => {
       if (cancelled) return
@@ -262,7 +271,7 @@ export default function TasksPage() {
       source.removeEventListener('end', handleEnd)
       source.close()
     }
-  }, [mockEnabled, selectedTaskId])
+  }, [drawerStatus, selectedTaskId])
 
   const pageLabel = useMemo(() => {
     if (!total || total <= PAGE_SIZE) return `第 ${page} 页`

@@ -428,7 +428,7 @@ const TASKS_POLL_INTERVAL_MS = 7000
 const TASK_DETAIL_POLL_INTERVAL_MS = 3000
 
 function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
-  const { status: appStatus, getJson, mockEnabled } = useApi()
+  const { status: appStatus, getJson } = useApi()
   const { pushToast } = useToast()
   const [activeTab, setActiveTab] = useState<'list' | 'detail'>(
     initialTaskId ? 'detail' : 'list',
@@ -448,6 +448,7 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
   const [expandedCommandLogs, setExpandedCommandLogs] = useState<Record<number, boolean>>({})
+  const detailStatus = detail?.status
 
   // Keep drawer focused on the latest task when parent updates initialTaskId
   useEffect(() => {
@@ -562,12 +563,19 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
   }, [detailLogs])
 
   useEffect(() => {
-    if (!selectedTaskId || !mockEnabled) return
+    if (!selectedTaskId) return
+    if (detailStatus !== 'running') return
+    if (typeof EventSource === 'undefined') return
 
     let cancelled = false
-    const source = new EventSource(
-      `/sse/task-logs?task_id=${encodeURIComponent(selectedTaskId)}`,
-    )
+    const url = `/sse/task-logs?task_id=${encodeURIComponent(selectedTaskId)}`
+    let source: EventSource
+    try {
+      source = new EventSource(url)
+    } catch {
+      // 创建失败时静默降级为仅依赖 HTTP 轮询。
+      return
+    }
 
     const handleLog = (event: MessageEvent) => {
       if (cancelled) return
@@ -606,7 +614,7 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
       source.removeEventListener('end', handleEnd)
       source.close()
     }
-  }, [mockEnabled, selectedTaskId])
+  }, [detailStatus, selectedTaskId])
 
   const formatTs = (ts?: number | null) => {
     if (!ts || ts <= 0) return '--'
