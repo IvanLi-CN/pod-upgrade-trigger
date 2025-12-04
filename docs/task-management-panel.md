@@ -155,17 +155,21 @@
   - 当任务进入终态（succeeded / failed / cancelled / skipped）后停止轮询。
 
 ---
-- 可选：任务日志 SSE 通道（仅在后端实现时启用）
-  - 为提升“任务中心”实时体验，后端可以（但不是必须）在 HTTP 接口之外提供一个基于 SSE 的增量日志通道：
+- 任务日志 SSE 通道（后端已实现并默认启用，用于实时日志流）
+  - 当前服务已经在生产路径中实现基于 SSE 的任务日志流接口，强烈建议部署环境开启并保持可用；即便 SSE 临时不可用（如网络或代理不透传 SSE），前端仍可退回 HTTP 轮询保证功能可用。
+  - 接口与事件形态：
     - `GET /sse/task-logs?task_id=<id>`；
     - `event: log`：`data` 为完整 `TaskLogEntry` JSON，同一 `id` 可以多次出现，表示该日志被更新（例如 stdout/stderr 被追加、status 从 `running` 变为 `succeeded`）；
-    - `event: end`：当该任务不再处于 `running` 状态时发送一次，前端应关闭对应的 `EventSource`。
-  - 推荐前端行为（当前前端 mock 已遵循）：
+    - `event: end`：当任务进入终态，或因超时、任务丢失、客户端断开等原因结束流式传输时发送一次，前端应关闭对应的 `EventSource`。
+  - 按任务状态区分两种模式：
+    - 非 `running` 任务（快照模式）：服务端在建立 SSE 连接后，一次性发送当前所有 `TaskLogEntry` 的 `event: log` 事件，并在末尾发送一次 `event: end`，可视为通过 SSE 返回日志快照。
+    - `running` 任务（流式模式）：服务端写入一次 HTTP+SSE 头并保持连接，周期性调用 `load_task_detail_record(task_id)` 等内部查询，仅在发现新增或变更的 `TaskLogEntry`（按 `id` 判断 JSON 是否变更）时发送 `event: log`，直到任务进入终态或达到最大流式时长后发送 `event: end` 结束。
+  - 推荐前端行为（当前实现已遵循）：
     - 初次打开任务详情时仍调用 `GET /api/tasks/:id` 获取完整快照（包含当前 `logs`）；
-    - 如检测到 SSE 端点可用（或在 mock 模式下），并行建立 `/sse/task-logs?task_id=...` 的 `EventSource`：
+    - 对于 `status === "running"` 的任务，并行建立 `/sse/task-logs?task_id=...` 的 `EventSource`：
       - 每收到一条 `event: log`，按 `id` 将本地日志数组中的对应条目覆盖/追加；
-      - 收到 `event: end` 或任务进入终态后关闭 SSE；
-    - 若后端未实现该 SSE 端点，前端可以退回纯 HTTP 轮询模式，不影响基本功能。
+      - 收到 `event: end` 或前端检测到任务进入终态后关闭 SSE；
+    - 当 SSE 连接异常或不可用时，前端可以退回纯 HTTP 轮询模式，保障任务详情与日志仍然可用。
 
 
 ### 4.3 任务控制（停止等）
