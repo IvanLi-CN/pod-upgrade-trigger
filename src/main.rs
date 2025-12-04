@@ -2668,8 +2668,8 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                 let argv = ["systemctl", "--user", "stop", runner_unit.as_str()];
                 let extra_meta = json!({ "via": "stop", "runner_unit": runner_unit });
                 let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
-                let meta_str = serde_json::to_string(&meta_value)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let meta_str =
+                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
                 let task_id_db = task_id.to_string();
                 let new_summary_db = new_summary.clone();
@@ -2780,8 +2780,7 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     "runner_unit": runner_unit,
                     "exit": exit,
                 });
-                let meta_value =
-                    build_command_meta(&command, &argv, &result, Some(extra_meta));
+                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
                 let meta_str =
                     serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
@@ -3159,11 +3158,17 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                 };
 
                 let command = format!("systemctl --user kill --signal=SIGKILL {runner_unit}");
-                let argv = ["systemctl", "--user", "kill", "--signal=SIGKILL", runner_unit.as_str()];
+                let argv = [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "--signal=SIGKILL",
+                    runner_unit.as_str(),
+                ];
                 let extra_meta = json!({ "via": "force-stop", "runner_unit": runner_unit });
                 let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
-                let meta_str = serde_json::to_string(&meta_value)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let meta_str =
+                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
                 let task_id_db = task_id.to_string();
                 let new_summary_db = new_summary.clone();
@@ -3269,13 +3274,18 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
 
                 let task_id_db = task_id.to_string();
                 let command = format!("systemctl --user kill --signal=SIGKILL {runner_unit}");
-                let argv = ["systemctl", "--user", "kill", "--signal=SIGKILL", runner_unit.as_str()];
+                let argv = [
+                    "systemctl",
+                    "--user",
+                    "kill",
+                    "--signal=SIGKILL",
+                    runner_unit.as_str(),
+                ];
                 let extra_meta = json!({
                     "runner_unit": runner_unit,
                     "exit": exit,
                 });
-                let meta_value =
-                    build_command_meta(&command, &argv, &result, Some(extra_meta));
+                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
                 let meta_str =
                     serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
@@ -7923,7 +7933,8 @@ fn run_background_task(
                 "delivery": delivery,
                 "path": path,
             });
-            let meta = build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
+            let meta =
+                build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
             update_task_state_with_unit(
                 task_id,
                 "succeeded",
@@ -7951,7 +7962,8 @@ fn run_background_task(
                 "delivery": delivery,
                 "path": path,
             });
-            let meta = build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
+            let meta =
+                build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
             update_task_state_with_unit(
                 task_id,
                 "failed",

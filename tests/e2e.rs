@@ -685,7 +685,8 @@ async fn scenario_task_command_logs() -> AnyResult<()> {
         cmd.env("MOCK_PODMAN_FAIL", "1");
     })?;
     assert_eq!(
-        response.status, 202,
+        response.status,
+        202,
         "github webhook with failing podman should still be accepted: {}",
         response.body_text()
     );
@@ -778,7 +779,8 @@ async fn scenario_task_logs_sse() -> AnyResult<()> {
         cmd.env("MOCK_PODMAN_FAIL", "1");
     })?;
     assert_eq!(
-        response.status, 202,
+        response.status,
+        202,
         "github webhook for SSE logs should still be accepted: {}",
         response.body_text()
     );
