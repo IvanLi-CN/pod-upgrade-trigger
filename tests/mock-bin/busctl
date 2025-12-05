@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log="$(dirname "$0")/log.txt"
+mkdir -p "$(dirname "$log")"
+
+echo "busctl $*" >> "$log"
+
+# Default stub: always succeed and print a minimal fake reply so callers that
+# inspect stdout won't panic. The production code only checks exit status.
+if [[ "$*" =~ StartUnit ]]; then
+  # Mimic the object-path style output of a real StartUnit call.
+  echo 'o "/org/freedesktop/systemd1/job/1"'
+elif [[ "$*" =~ RestartUnit ]]; then
+  echo 'o "/org/freedesktop/systemd1/job/2"'
+elif [[ "$*" =~ StopUnit ]]; then
+  echo 'o "/org/freedesktop/systemd1/job/3"'
+else
+  echo 'o "/org/freedesktop/systemd1/job/4"'
+fi
+
+exit 0
+

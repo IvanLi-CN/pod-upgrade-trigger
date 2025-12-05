@@ -7,6 +7,13 @@ echo "systemctl $*" >> "$log"
 
 if [[ "$*" =~ --user\ (start|restart)\ (.+) ]]; then
   unit="${BASH_REMATCH[2]}"
+  # Optional: simulate the "user scope bus" error that happens inside the
+  # container when talking to the user instance of systemd.
+  if [[ "${MOCK_SYSTEMCTL_BUS_ERROR_UNIT:-}" == "$unit" ]]; then
+    echo "Failed to connect to user scope bus via local transport: No data available" >&2
+    exit 1
+  fi
+
   fail_raw="${MOCK_SYSTEMCTL_FAIL:-}"
   if [[ -n "$fail_raw" ]]; then
     IFS=',' read -ra FAILS <<< "$fail_raw"
