@@ -7701,11 +7701,7 @@ fn run_systemctl_user_with_dbus_fallback(
         "kill" => {
             // KillUnit(s name, s who, i32 signal) → -
             // Use "all" + SIGKILL to mirror `systemctl --user kill --signal=SIGKILL`.
-            cmd.arg("KillUnit")
-                .arg("ssi")
-                .arg(unit)
-                .arg("all")
-                .arg("9");
+            cmd.arg("KillUnit").arg("ssi").arg(unit).arg("all").arg("9");
         }
         _ => {
             // Unknown verb: keep original behaviour.
@@ -8816,7 +8812,10 @@ mod tests {
         // Simulate the exact error message seen in the container when
         // `systemctl --user` cannot talk to the user scope bus, and verify
         // that we fall back to a direct D-Bus call via `busctl --user`.
-        set_env("MOCK_SYSTEMCTL_BUS_ERROR_UNIT", "podman-auto-update.service");
+        set_env(
+            "MOCK_SYSTEMCTL_BUS_ERROR_UNIT",
+            "podman-auto-update.service",
+        );
 
         let result =
             start_auto_update_unit("podman-auto-update.service").expect("start should not error");
