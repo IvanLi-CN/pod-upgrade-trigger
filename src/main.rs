@@ -7629,6 +7629,89 @@ fn run_quiet_command(mut command: Command) -> Result<CommandExecResult, String> 
     })
 }
 
+/// Detects the specific "user scope bus" failure that happens when running
+/// `systemctl --user` / `systemd-run --user` from inside the container, even
+/// though the per-user D-Bus is reachable.
+fn is_user_scope_bus_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("failed to connect to user scope bus")
+        || lower.contains("failed to connect to bus: no data available")
+}
+
+/// Run a `systemctl --user` operation, with a best-effort fallback to calling
+/// the user instance of systemd directly over D-Bus via `busctl --user`.
+///
+/// This specifically targets the container case where `systemctl --user`
+/// fails with:
+///   "Failed to connect to user scope bus via local transport: No data available"
+///
+/// while `busctl --user` can talk to `org.freedesktop.systemd1` just fine.
+fn run_systemctl_user_with_dbus_fallback(
+    verb: &str,
+    unit: &str,
+) -> Result<CommandExecResult, String> {
+    // Primary attempt: invoke systemctl as before.
+    let primary = run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user").arg(verb);
+        if verb == "kill" {
+            cmd.arg("--signal=SIGKILL");
+        }
+        cmd.arg(unit);
+        cmd
+    })?;
+
+    // If systemctl succeeded or failed for a "normal" reason, return immediately.
+    if primary.success() || !is_user_scope_bus_error(&primary.stderr) {
+        return Ok(primary);
+    }
+
+    // In the container, `systemctl --user` can fail with the "user scope bus"
+    // error even though `busctl --user` works (because the per-user D-Bus is
+    // mounted and DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR point there).
+    //
+    // In that case we try a direct D-Bus call to the user systemd instance,
+    // mirroring what `systemctl --user` would do, but without relying on the
+    // "local transport" logic that breaks in the container namespace.
+    log_message(&format!(
+        "warn systemd-user-fallback verb={verb} unit={unit} stderr={}",
+        primary.stderr
+    ));
+
+    let mut cmd = Command::new("busctl");
+    cmd.arg("--user")
+        .arg("call")
+        .arg("org.freedesktop.systemd1")
+        .arg("/org/freedesktop/systemd1")
+        .arg("org.freedesktop.systemd1.Manager");
+
+    match verb {
+        "start" => {
+            // StartUnit(s name, s mode) → o job
+            cmd.arg("StartUnit").arg("ss").arg(unit).arg("replace");
+        }
+        "restart" => {
+            // RestartUnit(s name, s mode) → o job
+            cmd.arg("RestartUnit").arg("ss").arg(unit).arg("replace");
+        }
+        "stop" => {
+            // StopUnit(s name, s mode) → o job
+            cmd.arg("StopUnit").arg("ss").arg(unit).arg("replace");
+        }
+        "kill" => {
+            // KillUnit(s name, s who, i32 signal) → -
+            // Use "all" + SIGKILL to mirror `systemctl --user kill --signal=SIGKILL`.
+            cmd.arg("KillUnit").arg("ssi").arg(unit).arg("all").arg("9");
+        }
+        _ => {
+            // Unknown verb: keep original behaviour.
+            return Ok(primary);
+        }
+    }
+
+    run_quiet_command(cmd)
+}
+
 fn podman_health() -> Result<(), String> {
     PODMAN_HEALTH
         .get_or_init(|| {
@@ -7659,40 +7742,21 @@ fn podman_health() -> Result<(), String> {
 }
 
 fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg("start").arg(unit);
-        cmd
-    })
+    run_systemctl_user_with_dbus_fallback("start", unit)
 }
 
 fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg("restart").arg(unit);
-        cmd
-    })
+    run_systemctl_user_with_dbus_fallback("restart", unit)
 }
 
 /// Best-effort graceful stop of a systemd unit backing a running task.
 fn stop_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg("stop").arg(unit);
-        cmd
-    })
+    run_systemctl_user_with_dbus_fallback("stop", unit)
 }
 
 /// Forcefully terminate a systemd unit backing a running task.
 fn kill_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user")
-            .arg("kill")
-            .arg("--signal=SIGKILL")
-            .arg(unit);
-        cmd
-    })
+    run_systemctl_user_with_dbus_fallback("kill", unit)
 }
 
 fn pull_container_image(image: &str) -> Result<CommandExecResult, String> {
@@ -8739,6 +8803,42 @@ mod tests {
             log_contents.contains("systemctl --user stop webhook-task-abc123"),
             "expected stop of webhook-task-abc123, got log:\n{log_contents}"
         );
+    }
+
+    #[test]
+    fn systemctl_user_bus_error_falls_back_to_busctl() {
+        init_test_db_with_systemctl_mock();
+
+        // Simulate the exact error message seen in the container when
+        // `systemctl --user` cannot talk to the user scope bus, and verify
+        // that we fall back to a direct D-Bus call via `busctl --user`.
+        set_env(
+            "MOCK_SYSTEMCTL_BUS_ERROR_UNIT",
+            "podman-auto-update.service",
+        );
+
+        let result =
+            start_auto_update_unit("podman-auto-update.service").expect("start should not error");
+        assert!(
+            result.success(),
+            "expected busctl fallback to succeed, got status={}",
+            exit_code_string(&result.status)
+        );
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let log_path = format!("{manifest_dir}/tests/mock-bin/log.txt");
+        let log_contents = fs::read_to_string(&log_path).expect("mock log should exist");
+
+        assert!(
+            log_contents.contains("systemctl --user start podman-auto-update.service"),
+            "expected systemctl invocation, got log:\n{log_contents}"
+        );
+        assert!(
+            log_contents.contains("busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StartUnit ss podman-auto-update.service replace"),
+            "expected busctl StartUnit fallback, got log:\n{log_contents}"
+        );
+
+        remove_env("MOCK_SYSTEMCTL_BUS_ERROR_UNIT");
     }
 
     #[test]
