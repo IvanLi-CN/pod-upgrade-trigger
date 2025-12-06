@@ -20,6 +20,7 @@ type ManualService = {
   display_name: string
   default_image?: string | null
   github_path?: string
+  is_auto_update?: boolean
 }
 
 type ManualServicesResponse = {
@@ -159,34 +160,77 @@ export default function ManualPage() {
     params: { dryRun: boolean; image?: string; caller?: string; reason?: string },
   ) => {
     try {
-      const response = await postJson<ServiceTriggerResponse>(
-        `/api/manual/services/${encodeURIComponent(service.slug)}`,
-        {
-          dry_run: params.dryRun,
-          image: params.image || undefined,
-          caller: params.caller?.trim() || undefined,
-          reason: params.reason?.trim() || undefined,
-        },
-      )
-      const ok =
-        response?.status === 'triggered' ||
-        response?.status === 'dry-run' ||
-        response?.status === 'pending'
-      pushToast({
-        variant: ok ? 'success' : 'warning',
-        title: ok ? '单元触发成功' : '单元触发失败',
-        message: `${service.unit} · status=${response?.status ?? 'unknown'}`,
-      })
-      pushHistory(response, `trigger-unit ${service.unit}`)
+      const isAutoUpdate = service.is_auto_update === true
 
-      if (!params.dryRun && response.task_id) {
+      if (isAutoUpdate) {
+        const response = await postJson<ServiceTriggerResponse>(
+          '/api/manual/auto-update/run',
+          {
+            dry_run: params.dryRun,
+            caller: params.caller?.trim() || undefined,
+            reason: params.reason?.trim() || undefined,
+          },
+        )
+
+        const status = response?.status ?? 'unknown'
+        const alreadyRunning = status === 'already-running'
+        const ok =
+          status === 'pending' ||
+          status === 'triggered' ||
+          status === 'dry-run' ||
+          alreadyRunning
+
         pushToast({
-          variant: 'info',
-          title: '已创建任务',
-          message: '已在当前页面打开任务抽屉以跟踪本次触发。',
+          variant: alreadyRunning ? 'info' : ok ? 'success' : 'warning',
+          title: alreadyRunning ? '已有 auto-update 在运行' : ok ? 'auto-update 执行已开始' : '单元触发失败',
+          message: `${service.unit} · status=${status}`,
         })
-        setTaskDrawerInitialTaskId(response.task_id)
-        setTaskDrawerVisible(true)
+        pushHistory(
+          response,
+          alreadyRunning
+            ? `auto-update-already-running ${service.unit}`
+            : `auto-update-run ${service.unit}`,
+        )
+
+        if (!params.dryRun && response.task_id) {
+          pushToast({
+            variant: 'info',
+            title: alreadyRunning ? '正在跟踪现有任务' : '已创建任务',
+            message: '已在当前页面打开任务抽屉以跟踪 auto-update 执行。',
+          })
+          setTaskDrawerInitialTaskId(response.task_id)
+          setTaskDrawerVisible(true)
+        }
+      } else {
+        const response = await postJson<ServiceTriggerResponse>(
+          `/api/manual/services/${encodeURIComponent(service.slug)}`,
+          {
+            dry_run: params.dryRun,
+            image: params.image || undefined,
+            caller: params.caller?.trim() || undefined,
+            reason: params.reason?.trim() || undefined,
+          },
+        )
+        const ok =
+          response?.status === 'triggered' ||
+          response?.status === 'dry-run' ||
+          response?.status === 'pending'
+        pushToast({
+          variant: ok ? 'success' : 'warning',
+          title: ok ? '单元触发成功' : '单元触发失败',
+          message: `${service.unit} · status=${response?.status ?? 'unknown'}`,
+        })
+        pushHistory(response, `trigger-unit ${service.unit}`)
+
+        if (!params.dryRun && response.task_id) {
+          pushToast({
+            variant: 'info',
+            title: '已创建任务',
+            message: '已在当前页面打开任务抽屉以跟踪本次触发。',
+          })
+          setTaskDrawerInitialTaskId(response.task_id)
+          setTaskDrawerVisible(true)
+        }
       }
     } catch (error) {
       const message =
