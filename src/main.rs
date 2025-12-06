@@ -8625,7 +8625,11 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let at = warning.get("at").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let at = warning
+                .get("at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let container = warning
                 .get("container")
                 .or_else(|| warning.get("container_name"))
@@ -8659,13 +8663,9 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
             };
 
             let summary = if !snippet.is_empty() {
-                format!(
-                    "[{event_type}] auto-update warning for {unit_desc}: {snippet}"
-                )
+                format!("[{event_type}] auto-update warning for {unit_desc}: {snippet}")
             } else {
-                format!(
-                    "[{event_type}] auto-update warning for {unit_desc} (see meta.error)"
-                )
+                format!("[{event_type}] auto-update warning for {unit_desc} (see meta.error)")
             };
 
             let detail_meta = json!({
@@ -9212,12 +9212,9 @@ mod tests {
         );
 
         let unit = "podman-auto-update.service";
-        let task_id = create_manual_auto_update_task(
-            unit,
-            "req-task-created-status",
-            "/auto-update-status",
-        )
-        .expect("manual auto-update task created");
+        let task_id =
+            create_manual_auto_update_task(unit, "req-task-created-status", "/auto-update-status")
+                .expect("manual auto-update task created");
 
         // Seed a log file that contains a dry-run-error and a summary entry,
         // matching the production podman-update-manager.ts format.
@@ -9257,8 +9254,7 @@ mod tests {
         );
         assert!(
             !detail.logs.iter().any(|log| {
-                log.action == "task-created"
-                    && (log.status == "running" || log.status == "pending")
+                log.action == "task-created" && (log.status == "running" || log.status == "pending")
             }),
             "task-created logs must not stay in running/pending for a completed task, logs={:#?}",
             detail.logs
