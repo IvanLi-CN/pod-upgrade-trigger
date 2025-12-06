@@ -6,6 +6,19 @@ mkdir -p "$(dirname "$log")"
 
 echo "busctl $*" >> "$log"
 
+# Allow tests to simulate failures for specific units by setting
+# MOCK_BUSCTL_FAIL=unitA,unitB,...
+if [[ -n "${MOCK_BUSCTL_FAIL:-}" ]]; then
+  IFS=',' read -ra FAILS <<< "${MOCK_BUSCTL_FAIL}"
+  for u in "${FAILS[@]}"; do
+    trimmed="${u//[[:space:]]/}"
+    if [[ -n "$trimmed" && "$*" == *"$trimmed"* ]]; then
+      echo "simulated busctl fail for $trimmed" >&2
+      exit 46
+    fi
+  done
+fi
+
 # Default stub: always succeed and print a minimal fake reply so callers that
 # inspect stdout won't panic. The production code only checks exit status.
 if [[ "$*" =~ StartUnit ]]; then
@@ -20,4 +33,3 @@ else
 fi
 
 exit 0
-
