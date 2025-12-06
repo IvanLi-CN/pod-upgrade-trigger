@@ -25,6 +25,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_task_prune_retention().await?;
     scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
+    scenario_manual_auto_update_failure().await?;
     scenario_scheduler_loop().await?;
     scenario_events_task_filter().await?;
     scenario_task_command_logs().await?;
@@ -191,10 +192,13 @@ async fn scenario_github_webhook() -> AnyResult<()> {
         "podman pull recorded"
     );
     assert!(
-        log_lines
-            .iter()
-            .any(|line| line.contains("systemctl --user restart svc-alpha.service")),
-        "systemctl restart recorded"
+        log_lines.iter().any(|line| {
+            line.contains("busctl --user call")
+                && line.contains("org.freedesktop.systemd1.Manager")
+                && line.contains("RestartUnit")
+                && line.contains("svc-alpha.service")
+        }),
+        "expected D-Bus RestartUnit call for svc-alpha.service"
     );
     let pool = env.connect_db().await?;
     let webhook_event = env
@@ -270,9 +274,13 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
 
     let log_lines = env.read_mock_log()?;
     assert!(
-        log_lines
-            .iter()
-            .any(|line| line.contains("systemctl --user start podman-auto-update.service"))
+        log_lines.iter().any(|line| {
+            line.contains("busctl --user call")
+                && line.contains("org.freedesktop.systemd1.Manager")
+                && line.contains("StartUnit")
+                && line.contains("podman-auto-update.service")
+        }),
+        "expected D-Bus StartUnit call for podman-auto-update.service"
     );
 
     let events = env.fetch_events(&pool).await?;
@@ -549,15 +557,76 @@ async fn scenario_manual_api() -> AnyResult<()> {
             .any(|line| line.contains("podman pull ghcr.io/koha/runner:main"))
     );
     assert!(
-        log_lines
-            .iter()
-            .any(|line| line.contains("systemctl --user restart svc-beta.service"))
+        log_lines.iter().any(|line| {
+            line.contains("busctl --user call")
+                && line.contains("org.freedesktop.systemd1.Manager")
+                && line.contains("RestartUnit")
+                && line.contains("svc-beta.service")
+        }),
+        "expected D-Bus RestartUnit call for svc-beta.service"
     );
 
     let pool = env.connect_db().await?;
     let events = env.fetch_events(&pool).await?;
     assert!(events.iter().any(|row| row.action == "manual-trigger"));
     assert!(events.iter().any(|row| row.action == "manual-service"));
+
+    Ok(())
+}
+
+async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    // Simulate a failure when starting the manual auto-update unit via D-Bus.
+    let body = json!({
+        "token": env.manual_token(),
+        "dry_run": false,
+        "caller": "ops",
+        "reason": "busctl-fail"
+    });
+    let response = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/podman-auto-update.service")
+            .header("content-type", "application/json")
+            .body(body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("MOCK_BUSCTL_FAIL", "podman-auto-update.service");
+        },
+    )?;
+    assert_eq!(response.status, 202, "manual auto-update API should accept the request even when unit start eventually fails");
+    let json = response.json_body()?;
+    assert_eq!(json["status"], Value::from("pending"));
+    let task_id = json["task_id"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !task_id.is_empty(),
+        "manual auto-update response must include task_id"
+    );
+
+    // The task should be marked as failed with an auto-update specific summary.
+    let detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{task_id}")))?;
+    assert_eq!(detail.status, 200);
+    let body = detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let summary = body["summary"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        summary.contains("Auto-update unit failed to start") || summary.contains("Auto-update unit error"),
+        "unexpected manual auto-update failure summary: {summary}"
+    );
+
+    // The underlying busctl failure should be visible in logs for debugging.
+    let log_lines = env.read_mock_log()?;
+    assert!(
+        log_lines.iter().any(|line| {
+            line.contains("busctl --user call")
+                && line.contains("StartUnit")
+                && line.contains("podman-auto-update.service")
+        }),
+        "expected busctl StartUnit invocation for failing manual auto-update unit"
+    );
 
     Ok(())
 }
@@ -584,9 +653,15 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
     assert!(
         log_lines
             .iter()
-            .filter(|line| line.contains("systemctl --user start podman-auto-update.service"))
+            .filter(|line| {
+                line.contains("busctl --user call")
+                    && line.contains("org.freedesktop.systemd1.Manager")
+                    && line.contains("StartUnit")
+                    && line.contains("podman-auto-update.service")
+            })
             .count()
-            >= 2
+            >= 2,
+        "expected at least two D-Bus StartUnit calls for podman-auto-update.service"
     );
 
     let pool = env.connect_db().await?;
@@ -858,7 +933,11 @@ async fn scenario_error_paths() -> AnyResult<()> {
     assert!(
         log_lines
             .iter()
-            .all(|line| !line.contains("systemctl --user restart svc-beta.service"))
+            .all(|line| {
+                !line.contains("busctl --user call")
+                    || !line.contains("RestartUnit")
+                    || !line.contains("svc-beta.service")
+            })
     );
 
     let invalid = HttpRequest::post("/github-package-update/svc-alpha")
@@ -940,14 +1019,22 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
 
     let log_lines = env.read_mock_log()?;
     assert!(
-        log_lines
-            .iter()
-            .any(|line| line.contains("systemctl --user restart svc-alpha.service"))
+        log_lines.iter().any(|line| {
+            line.contains("busctl --user call")
+                && line.contains("org.freedesktop.systemd1.Manager")
+                && line.contains("RestartUnit")
+                && line.contains("svc-alpha.service")
+        }),
+        "expected D-Bus RestartUnit call for svc-alpha.service"
     );
     assert!(
-        log_lines
-            .iter()
-            .any(|line| line.contains("systemctl --user start podman-auto-update.service"))
+        log_lines.iter().any(|line| {
+            line.contains("busctl --user call")
+                && line.contains("org.freedesktop.systemd1.Manager")
+                && line.contains("StartUnit")
+                && line.contains("podman-auto-update.service")
+        }),
+        "expected D-Bus StartUnit call for podman-auto-update.service"
     );
 
     env.clear_mock_log()?;

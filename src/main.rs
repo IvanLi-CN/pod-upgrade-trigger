@@ -7758,6 +7758,32 @@ fn podman_health() -> Result<(), String> {
 }
 
 fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
+    // Prefer talking to the user scope systemd instance via D-Bus so that we
+    // work in containerised environments where `systemctl --user` cannot reach
+    // the user bus directly but busctl can (for example when /run/user/$UID is
+    // bind-mounted into the container).
+    //
+    // If busctl is not available at all (e.g. on non-systemd dev hosts), fall
+    // back to the previous `systemctl --user start` behaviour.
+    if let Ok(result) = run_quiet_command({
+        let mut cmd = Command::new("busctl");
+        cmd.arg("--user")
+            .arg("call")
+            .arg("org.freedesktop.systemd1")
+            .arg("/org/freedesktop/systemd1")
+            .arg("org.freedesktop.systemd1.Manager")
+            .arg("StartUnit")
+            .arg("ss")
+            .arg(unit)
+            .arg("replace");
+        cmd
+    }) {
+        // Always return the busctl result to the caller; non-zero exit codes
+        // are treated as failures by the higher-level logic which will keep
+        // returning 500s and surfacing stderr in task logs.
+        return Ok(result);
+    }
+
     run_quiet_command({
         let mut cmd = Command::new("systemctl");
         cmd.arg("--user").arg("start").arg(unit);
@@ -7766,6 +7792,24 @@ fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
 }
 
 fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
+    // See start_auto_update_unit for rationale; use the same D-Bus path for
+    // restart operations, with a systemctl fallback when busctl is missing.
+    if let Ok(result) = run_quiet_command({
+        let mut cmd = Command::new("busctl");
+        cmd.arg("--user")
+            .arg("call")
+            .arg("org.freedesktop.systemd1")
+            .arg("/org/freedesktop/systemd1")
+            .arg("org.freedesktop.systemd1.Manager")
+            .arg("RestartUnit")
+            .arg("ss")
+            .arg(unit)
+            .arg("replace");
+        cmd
+    }) {
+        return Ok(result);
+    }
+
     run_quiet_command({
         let mut cmd = Command::new("systemctl");
         cmd.arg("--user").arg("restart").arg(unit);
