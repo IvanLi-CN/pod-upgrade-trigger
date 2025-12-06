@@ -122,6 +122,14 @@ export type Task = {
   can_force_stop: boolean
   can_retry: boolean
   /**
+   * Whether this task includes any warning/error-level log entries.
+   */
+  has_warnings?: boolean
+  /**
+   * Number of warning/error-level log entries, when known.
+   */
+  warning_count?: number | null
+  /**
    * Whether this task is expected to take noticeable time and thus
    * should default to drawer auto-open behaviour.
    */

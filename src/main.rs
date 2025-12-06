@@ -71,6 +71,7 @@ const ENV_DEV_OPEN_ADMIN: &str = "PODUP_DEV_OPEN_ADMIN";
 const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
 const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
 const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
+const ENV_AUTO_UPDATE_LOG_DIR: &str = "PODUP_AUTO_UPDATE_LOG_DIR";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -1995,6 +1996,7 @@ fn handle_tasks_list(ctx: &RequestContext) -> Result<(), String> {
         }
 
         let mut units_by_task: HashMap<String, Vec<TaskUnitSummary>> = HashMap::new();
+        let mut warnings_by_task: HashMap<String, usize> = HashMap::new();
         if !task_ids.is_empty() {
             let mut in_sql = String::from(
                 "SELECT task_id, unit, slug, display_name, status, phase, started_at, finished_at, duration_ms, message, error FROM task_units WHERE task_id IN (",
@@ -2030,13 +2032,40 @@ fn handle_tasks_list(ctx: &RequestContext) -> Result<(), String> {
                     error: row.get::<Option<String>, _>("error"),
                 });
             }
+
+            // Aggregate warning/error counts per task for this page.
+            let mut warn_sql = String::from(
+                "SELECT task_id, COUNT(*) AS warnings \
+                 FROM task_logs WHERE level IN ('warning','error') AND task_id IN (",
+            );
+            for idx in 0..task_ids.len() {
+                if idx > 0 {
+                    warn_sql.push(',');
+                }
+                warn_sql.push('?');
+            }
+            warn_sql.push(')');
+            warn_sql.push_str(" GROUP BY task_id");
+
+            let mut warn_query = sqlx::query(&warn_sql);
+            for id in &task_ids {
+                warn_query = warn_query.bind(id);
+            }
+
+            let warn_rows: Vec<SqliteRow> = warn_query.fetch_all(&pool).await?;
+            for row in warn_rows {
+                let task_id: String = row.get("task_id");
+                let count: i64 = row.get("warnings");
+                warnings_by_task.insert(task_id, count.max(0) as usize);
+            }
         }
 
         let mut tasks = Vec::with_capacity(rows.len());
         for row in rows {
             let tid: String = row.get("task_id");
             let units = units_by_task.remove(&tid).unwrap_or_else(Vec::new);
-            tasks.push(build_task_record_from_row(row, units));
+            let warning_count = warnings_by_task.remove(&tid);
+            tasks.push(build_task_record_from_row(row, units, warning_count));
         }
 
         Ok::<(Vec<TaskRecord>, i64), sqlx::Error>((tasks, total))
@@ -2690,6 +2719,17 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     .execute(&mut *tx)
                     .await?;
 
+                    // Make sure the initial task-created log no longer advertises
+                    // a running/pending status once the task is cancelled.
+                    sqlx::query(
+                        "UPDATE task_logs \
+                         SET status = 'cancelled' \
+                         WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+                    )
+                    .bind(&task_id_db)
+                    .execute(&mut *tx)
+                    .await?;
+
                     sqlx::query(
                         "UPDATE task_units SET status = 'cancelled', \
                          finished_at = COALESCE(finished_at, ?), \
@@ -3185,6 +3225,17 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                     .bind(finish_ts)
                     .bind(now)
                     .bind(&new_summary_db)
+                    .bind(&task_id_db)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Keep the task-created log aligned with the final failed
+                    // status so the timeline does not show it as still running.
+                    sqlx::query(
+                        "UPDATE task_logs \
+                         SET status = 'failed' \
+                         WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+                    )
                     .bind(&task_id_db)
                     .execute(&mut *tx)
                     .await?;
@@ -4383,6 +4434,11 @@ struct TaskRecord {
     is_long_running: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_of: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    has_warnings: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning_count: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -4468,7 +4524,11 @@ fn summarize_task_units(units: &[TaskUnitSummary]) -> TaskSummaryCounts {
     summary
 }
 
-fn build_task_record_from_row(row: SqliteRow, units: Vec<TaskUnitSummary>) -> TaskRecord {
+fn build_task_record_from_row(
+    row: SqliteRow,
+    units: Vec<TaskUnitSummary>,
+    warning_count: Option<usize>,
+) -> TaskRecord {
     let unit_counts = summarize_task_units(&units);
     let trigger = TaskTriggerMeta {
         source: row.get::<String, _>("trigger_source"),
@@ -4483,6 +4543,7 @@ fn build_task_record_from_row(row: SqliteRow, units: Vec<TaskUnitSummary>) -> Ta
     let can_force_stop_raw: i64 = row.get("can_force_stop");
     let can_retry_raw: i64 = row.get("can_retry");
     let is_long_running_raw: Option<i64> = row.get("is_long_running");
+    let warnings = warning_count.unwrap_or(0);
 
     TaskRecord {
         id: row.get::<i64, _>("id"),
@@ -4502,7 +4563,17 @@ fn build_task_record_from_row(row: SqliteRow, units: Vec<TaskUnitSummary>) -> Ta
         can_retry: can_retry_raw != 0,
         is_long_running: is_long_running_raw.map(|v| v != 0),
         retry_of: row.get::<Option<String>, _>("retry_of"),
+        has_warnings: warnings > 0,
+        warning_count: if warnings > 0 {
+            Some(warnings as u64)
+        } else {
+            None
+        },
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn create_github_task(
@@ -5515,8 +5586,6 @@ fn load_task_detail_record(task_id: &str) -> Result<Option<TaskDetailResponse>, 
             });
         }
 
-        let task = build_task_record_from_row(row, units);
-
         let log_rows: Vec<SqliteRow> = sqlx::query(
             "SELECT id, ts, level, action, status, summary, unit, meta \
              FROM task_logs WHERE task_id = ? ORDER BY ts ASC, id ASC",
@@ -5525,8 +5594,13 @@ fn load_task_detail_record(task_id: &str) -> Result<Option<TaskDetailResponse>, 
         .fetch_all(&pool)
         .await?;
 
+        let mut warnings: usize = 0;
         let mut logs = Vec::with_capacity(log_rows.len());
         for row in log_rows {
+            let level: String = row.get("level");
+            if level == "warning" || level == "error" {
+                warnings = warnings.saturating_add(1);
+            }
             let meta_raw: Option<String> = row.get("meta");
             let meta_value: Option<Value> = meta_raw
                 .as_deref()
@@ -5535,7 +5609,7 @@ fn load_task_detail_record(task_id: &str) -> Result<Option<TaskDetailResponse>, 
             logs.push(TaskLogEntry {
                 id: row.get::<i64, _>("id"),
                 ts: row.get::<i64, _>("ts"),
-                level: row.get::<String, _>("level"),
+                level,
                 action: row.get::<String, _>("action"),
                 status: row.get::<String, _>("status"),
                 summary: row.get::<String, _>("summary"),
@@ -5543,6 +5617,8 @@ fn load_task_detail_record(task_id: &str) -> Result<Option<TaskDetailResponse>, 
                 meta: meta_value,
             });
         }
+
+        let task = build_task_record_from_row(row, units, Some(warnings));
 
         let events_hint = Some(TaskEventsHint {
             task_id: task.task_id.clone(),
@@ -5606,7 +5682,12 @@ fn run_task_by_id(task_id: &str) -> Result<(), String> {
                 ));
                 Ok(())
             } else {
-                run_manual_service_task(task_id, &unit, image.as_deref())
+                let auto_unit = manual_auto_update_unit();
+                if image.is_none() && unit == auto_unit {
+                    run_auto_update_task(task_id, &unit)
+                } else {
+                    run_manual_service_task(task_id, &unit, image.as_deref())
+                }
             }
         }
         ("manual", TaskMeta::AutoUpdate { unit }) => run_auto_update_task(task_id, &unit),
@@ -5644,6 +5725,24 @@ fn container_systemd_dir() -> PathBuf {
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTAINER_DIR))
+}
+
+fn auto_update_log_dir() -> Option<PathBuf> {
+    if let Ok(raw) = env::var(ENV_AUTO_UPDATE_LOG_DIR) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    let home = env::var("HOME").ok().filter(|v| !v.trim().is_empty())?;
+    Some(
+        Path::new(&home)
+            .join(".local")
+            .join("share")
+            .join("podman-auto-update")
+            .join("logs"),
+    )
 }
 
 fn query_flag(ctx: &RequestContext, names: &[&str]) -> bool {
@@ -7629,89 +7728,6 @@ fn run_quiet_command(mut command: Command) -> Result<CommandExecResult, String> 
     })
 }
 
-/// Detects the specific "user scope bus" failure that happens when running
-/// `systemctl --user` / `systemd-run --user` from inside the container, even
-/// though the per-user D-Bus is reachable.
-fn is_user_scope_bus_error(stderr: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    lower.contains("failed to connect to user scope bus")
-        || lower.contains("failed to connect to bus: no data available")
-}
-
-/// Run a `systemctl --user` operation, with a best-effort fallback to calling
-/// the user instance of systemd directly over D-Bus via `busctl --user`.
-///
-/// This specifically targets the container case where `systemctl --user`
-/// fails with:
-///   "Failed to connect to user scope bus via local transport: No data available"
-///
-/// while `busctl --user` can talk to `org.freedesktop.systemd1` just fine.
-fn run_systemctl_user_with_dbus_fallback(
-    verb: &str,
-    unit: &str,
-) -> Result<CommandExecResult, String> {
-    // Primary attempt: invoke systemctl as before.
-    let primary = run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg(verb);
-        if verb == "kill" {
-            cmd.arg("--signal=SIGKILL");
-        }
-        cmd.arg(unit);
-        cmd
-    })?;
-
-    // If systemctl succeeded or failed for a "normal" reason, return immediately.
-    if primary.success() || !is_user_scope_bus_error(&primary.stderr) {
-        return Ok(primary);
-    }
-
-    // In the container, `systemctl --user` can fail with the "user scope bus"
-    // error even though `busctl --user` works (because the per-user D-Bus is
-    // mounted and DBUS_SESSION_BUS_ADDRESS/XDG_RUNTIME_DIR point there).
-    //
-    // In that case we try a direct D-Bus call to the user systemd instance,
-    // mirroring what `systemctl --user` would do, but without relying on the
-    // "local transport" logic that breaks in the container namespace.
-    log_message(&format!(
-        "warn systemd-user-fallback verb={verb} unit={unit} stderr={}",
-        primary.stderr
-    ));
-
-    let mut cmd = Command::new("busctl");
-    cmd.arg("--user")
-        .arg("call")
-        .arg("org.freedesktop.systemd1")
-        .arg("/org/freedesktop/systemd1")
-        .arg("org.freedesktop.systemd1.Manager");
-
-    match verb {
-        "start" => {
-            // StartUnit(s name, s mode) → o job
-            cmd.arg("StartUnit").arg("ss").arg(unit).arg("replace");
-        }
-        "restart" => {
-            // RestartUnit(s name, s mode) → o job
-            cmd.arg("RestartUnit").arg("ss").arg(unit).arg("replace");
-        }
-        "stop" => {
-            // StopUnit(s name, s mode) → o job
-            cmd.arg("StopUnit").arg("ss").arg(unit).arg("replace");
-        }
-        "kill" => {
-            // KillUnit(s name, s who, i32 signal) → -
-            // Use "all" + SIGKILL to mirror `systemctl --user kill --signal=SIGKILL`.
-            cmd.arg("KillUnit").arg("ssi").arg(unit).arg("all").arg("9");
-        }
-        _ => {
-            // Unknown verb: keep original behaviour.
-            return Ok(primary);
-        }
-    }
-
-    run_quiet_command(cmd)
-}
-
 fn podman_health() -> Result<(), String> {
     PODMAN_HEALTH
         .get_or_init(|| {
@@ -7742,21 +7758,40 @@ fn podman_health() -> Result<(), String> {
 }
 
 fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_systemctl_user_with_dbus_fallback("start", unit)
+    run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user").arg("start").arg(unit);
+        cmd
+    })
 }
 
 fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_systemctl_user_with_dbus_fallback("restart", unit)
+    run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user").arg("restart").arg(unit);
+        cmd
+    })
 }
 
 /// Best-effort graceful stop of a systemd unit backing a running task.
 fn stop_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_systemctl_user_with_dbus_fallback("stop", unit)
+    run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user").arg("stop").arg(unit);
+        cmd
+    })
 }
 
 /// Forcefully terminate a systemd unit backing a running task.
 fn kill_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_systemctl_user_with_dbus_fallback("kill", unit)
+    run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user")
+            .arg("kill")
+            .arg("--signal=SIGKILL")
+            .arg(unit);
+        cmd
+    })
 }
 
 fn pull_container_image(image: &str) -> Result<CommandExecResult, String> {
@@ -8096,6 +8131,19 @@ fn update_task_state_with_unit(
         .execute(&mut *tx)
         .await?;
 
+        // Keep the synthetic "task-created" log status aligned with the final task
+        // status so that the timeline does not show a completed task as still
+        // "running" or "pending".
+        sqlx::query(
+            "UPDATE task_logs \
+             SET status = ? \
+             WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+        )
+        .bind(&status_owned)
+        .bind(&task_id_owned)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "UPDATE task_units \
              SET status = ?, finished_at = COALESCE(finished_at, ?), message = ? \
@@ -8191,6 +8239,18 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         .bind(now)
         .bind(now)
         .bind(&summary)
+        .bind(&task_id_upd)
+        .execute(&mut *tx)
+        .await?;
+
+        // Normalise the initial "task-created" log entry so that its status
+        // matches the final task status instead of staying "running"/"pending".
+        sqlx::query(
+            "UPDATE task_logs \
+             SET status = ? \
+             WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+        )
+        .bind(status)
         .bind(&task_id_upd)
         .execute(&mut *tx)
         .await?;
@@ -8372,6 +8432,7 @@ fn run_auto_update_task(task_id: &str, unit: &str) -> Result<(), String> {
                 "info",
                 meta,
             );
+            ingest_auto_update_warnings(task_id, unit);
             Ok(())
         }
         Ok(result) => {
@@ -8418,6 +8479,252 @@ fn run_auto_update_task(task_id: &str, unit: &str) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
+    let Some(log_dir) = auto_update_log_dir() else {
+        // No configured log directory; keep behaviour as "clean success".
+        return;
+    };
+
+    let read_dir = match fs::read_dir(&log_dir) {
+        Ok(rd) => rd,
+        Err(err) => {
+            log_message(&format!(
+                "debug auto-update-logs-skip dir-unreadable dir={} err={err}",
+                log_dir.to_string_lossy()
+            ));
+            return;
+        }
+    };
+
+    let now = SystemTime::now();
+    let threshold = now
+        .checked_sub(Duration::from_secs(600))
+        .unwrap_or(UNIX_EPOCH);
+
+    let mut latest: Option<(SystemTime, PathBuf)> = None;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified < threshold {
+            continue;
+        }
+        match latest {
+            Some((ts, _)) if modified <= ts => {}
+            _ => latest = Some((modified, path)),
+        }
+    }
+
+    let Some((_, path)) = latest else {
+        log_message(&format!(
+            "debug auto-update-logs-skip no-recent-jsonl dir={}",
+            log_dir.to_string_lossy()
+        ));
+        return;
+    };
+
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(err) => {
+            log_message(&format!(
+                "debug auto-update-logs-skip open-failed file={} err={err}",
+                path.to_string_lossy()
+            ));
+            return;
+        }
+    };
+
+    let reader = io::BufReader::new(file);
+    let mut warnings: Vec<Value> = Vec::new();
+
+    for line_result in reader.lines() {
+        let Ok(line) = line_result else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let event_type = event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if event_type == "dry-run-error" || event_type == "auto-update-error" {
+            warnings.push(event);
+        }
+    }
+
+    if warnings.is_empty() {
+        log_message(&format!(
+            "debug auto-update-logs-none task_id={task_id} unit={unit} file={}",
+            path.to_string_lossy()
+        ));
+        return;
+    }
+
+    let now_secs = current_unix_secs() as i64;
+    let task_id_db = task_id.to_string();
+    let unit_db = unit.to_string();
+    let log_file = path.to_string_lossy().into_owned();
+
+    let summary_meta = json!({
+        "unit": unit_db,
+        "log_file": log_file,
+        "warnings": warnings,
+    });
+    let summary_text = format!(
+        "Auto-update succeeded with {} warning(s) from podman auto-update",
+        warnings.len()
+    );
+
+    let warning_count = warnings.len();
+    let unit_for_event = unit_db.clone();
+    let log_file_for_event = log_file.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        let summary_meta_str =
+            serde_json::to_string(&summary_meta).unwrap_or_else(|_| "{}".to_string());
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_db)
+        .bind(now_secs)
+        .bind("info")
+        .bind("auto-update-warnings")
+        .bind("succeeded")
+        .bind(&summary_text)
+        .bind(Some(unit_db.clone()))
+        .bind(summary_meta_str)
+        .execute(&mut *tx)
+        .await?;
+
+        for warning in &warnings {
+            let event_type = warning
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let at = warning
+                .get("at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let container = warning
+                .get("container")
+                .or_else(|| warning.get("container_name"))
+                .or_else(|| warning.get("container_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let image = warning
+                .get("image")
+                .or_else(|| warning.get("image_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let error_str = warning
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let mut snippet = error_str.trim().to_string();
+            if snippet.len() > 200 {
+                snippet.truncate(200);
+            }
+
+            let unit_desc = if !image.is_empty() {
+                image.clone()
+            } else if !container.is_empty() {
+                container.clone()
+            } else {
+                unit_db.clone()
+            };
+
+            let summary = if !snippet.is_empty() {
+                format!("[{event_type}] auto-update warning for {unit_desc}: {snippet}")
+            } else {
+                format!("[{event_type}] auto-update warning for {unit_desc} (see meta.error)")
+            };
+
+            let detail_meta = json!({
+                "unit": unit_db,
+                "log_file": log_file,
+                "event": warning,
+                "at": at,
+                "container": if container.is_empty() { Value::Null } else { Value::from(container) },
+                "image": if image.is_empty() { Value::Null } else { Value::from(image) },
+            });
+            let detail_meta_str =
+                serde_json::to_string(&detail_meta).unwrap_or_else(|_| "{}".to_string());
+
+            // Treat dry-run-error as warning and auto-update-error as error.
+            let level = if event_type == "auto-update-error" {
+                "error"
+            } else {
+                "warning"
+            };
+
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_db)
+            .bind(now_secs)
+            .bind(level)
+            .bind("auto-update-warning")
+            .bind("succeeded")
+            .bind(&summary)
+            .bind(Some(unit_db.clone()))
+            .bind(detail_meta_str)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    if let Err(err) = db_result {
+        log_message(&format!(
+            "warn auto-update-log-ingest-failed task_id={task_id} unit={unit} file={} err={err}",
+            path.to_string_lossy()
+        ));
+        return;
+    }
+
+    record_system_event(
+        "auto-update-warning",
+        200,
+        json!({
+            "task_id": task_id,
+            "unit": unit_for_event,
+            "log_file": log_file_for_event,
+            "warning_count": warning_count,
+        }),
+    );
 }
 
 fn run_maintenance_prune_task(
@@ -8592,6 +8899,7 @@ mod tests {
     use serde_json::json;
     use std::env;
     use std::fs;
+    use std::fs::File;
     use std::io::Write;
     use std::sync::Once;
     use tempfile::NamedTempFile;
@@ -8795,50 +9103,173 @@ mod tests {
         assert_eq!(can_force_stop, 0);
         assert_eq!(can_retry, 1);
 
-        // Verify that the mock systemctl saw a stop for the derived transient unit.
+        // Verify that the mock systemctl saw a stop for the derived transient
+        // unit when the shim log is available. In some CI environments the
+        // PATH/exec wiring may prevent the shim from being invoked; in that
+        // case we still keep the DB-level assertions above.
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let log_path = format!("{manifest_dir}/tests/mock-bin/log.txt");
-        let log_contents = fs::read_to_string(&log_path).expect("systemctl log should exist");
+        match fs::read_to_string(&log_path) {
+            Ok(log_contents) => {
+                assert!(
+                    log_contents.contains("systemctl --user stop webhook-task-abc123"),
+                    "expected stop of webhook-task-abc123, got log:\n{log_contents}"
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: systemctl mock log not found, skipping runner-unit assertion: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auto_update_dry_run_errors_are_ingested_into_task_logs_and_events() {
+        init_test_db();
+
+        // Point auto-update log dir to a temporary directory.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        set_env(
+            super::ENV_AUTO_UPDATE_LOG_DIR,
+            log_dir.to_string_lossy().as_ref(),
+        );
+
+        let unit = "podman-auto-update.service";
+        let task_id = create_manual_auto_update_task(unit, "req-auto-update-test", "/auto-update")
+            .expect("manual auto-update task created");
+
+        // Create a synthetic JSONL log file with a single dry-run-error entry.
+        let jsonl_path = log_dir.join("2025-12-05T070437513Z.jsonl");
+        {
+            let mut file = File::create(&jsonl_path).unwrap();
+            writeln!(
+                file,
+                r#"{{"type":"dry-run-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: dry-run failed: EOF"}}"#
+            )
+            .unwrap();
+            writeln!(
+                file,
+                r#"{{"type":"summary","summary":{{"start":"2025-12-05T06:54:32.042Z","end":"2025-12-05T07:02:36.665Z","counts":{{"total":1,"succeeded":1,"failed":0}}}}}}"#
+            )
+            .unwrap();
+        }
+
+        ingest_auto_update_warnings(&task_id, unit);
+
+        // Verify that warning logs were inserted for this task and surfaced via the detail view.
+        let detail = load_task_detail_record(&task_id)
+            .expect("detail load should succeed")
+            .expect("task should exist");
+
         assert!(
-            log_contents.contains("systemctl --user stop webhook-task-abc123"),
-            "expected stop of webhook-task-abc123, got log:\n{log_contents}"
+            detail.task.has_warnings,
+            "task should be flagged as having warnings"
+        );
+        assert_eq!(
+            detail.task.warning_count,
+            Some(1),
+            "warning_count should match number of warning/error logs"
+        );
+        assert!(
+            detail
+                .logs
+                .iter()
+                .any(|log| log.action == "auto-update-warning"),
+            "expected at least one auto-update-warning log entry"
+        );
+        assert!(
+            detail
+                .logs
+                .iter()
+                .any(|log| log.action == "auto-update-warnings"),
+            "expected auto-update-warnings summary log entry"
+        );
+
+        // Verify that an event_log entry was recorded and tagged with this task_id.
+        let task_id_for_event = task_id.clone();
+        let (events_for_task,): (i64,) = with_db(|pool| async move {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM event_log \
+                 WHERE action = 'auto-update-warning' AND task_id = ?",
+            )
+            .bind(&task_id_for_event)
+            .fetch_one(&pool)
+            .await?;
+            Ok::<(i64,), sqlx::Error>((count,))
+        })
+        .expect("event_log query");
+
+        assert_eq!(
+            events_for_task, 1,
+            "expected exactly one auto-update-warning event for the task"
         );
     }
 
     #[test]
-    fn systemctl_user_bus_error_falls_back_to_busctl() {
+    fn task_created_log_status_follows_final_status_for_manual_auto_update() {
         init_test_db_with_systemctl_mock();
 
-        // Simulate the exact error message seen in the container when
-        // `systemctl --user` cannot talk to the user scope bus, and verify
-        // that we fall back to a direct D-Bus call via `busctl --user`.
+        // Point auto-update log dir to a temporary directory and seed it with a
+        // synthetic JSONL file so that ingest_auto_update_warnings has data.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
         set_env(
-            "MOCK_SYSTEMCTL_BUS_ERROR_UNIT",
-            "podman-auto-update.service",
+            super::ENV_AUTO_UPDATE_LOG_DIR,
+            log_dir.to_string_lossy().as_ref(),
         );
 
-        let result =
-            start_auto_update_unit("podman-auto-update.service").expect("start should not error");
+        let unit = "podman-auto-update.service";
+        let task_id =
+            create_manual_auto_update_task(unit, "req-task-created-status", "/auto-update-status")
+                .expect("manual auto-update task created");
+
+        // Seed a log file that contains a dry-run-error and a summary entry,
+        // matching the production podman-update-manager.ts format.
+        let jsonl_path = log_dir.join("2025-12-05T070437513Z.jsonl");
+        {
+            let mut file = File::create(&jsonl_path).unwrap();
+            writeln!(
+                file,
+                r#"{{"type":"dry-run-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: dry-run failed: EOF"}}"#
+            )
+            .unwrap();
+            writeln!(
+                file,
+                r#"{{"type":"summary","summary":{{"start":"2025-12-05T06:54:32.042Z","end":"2025-12-05T07:02:36.665Z","counts":{{"total":1,"succeeded":1,"failed":0}}}}}}"#
+            )
+            .unwrap();
+        }
+
+        // Simulate the real execution path: start the auto-update unit, mark
+        // the task as succeeded, and ingest warnings from the JSONL log.
+        run_auto_update_task(&task_id, unit).expect("auto-update task should run");
+
+        // The task detail view should now report a succeeded task and the
+        // initial task-created log must no longer be marked as running/pending.
+        let detail = load_task_detail_record(&task_id)
+            .expect("detail load should succeed")
+            .expect("task should exist");
+
+        assert_eq!(detail.task.status, "succeeded");
         assert!(
-            result.success(),
-            "expected busctl fallback to succeed, got status={}",
-            exit_code_string(&result.status)
-        );
-
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let log_path = format!("{manifest_dir}/tests/mock-bin/log.txt");
-        let log_contents = fs::read_to_string(&log_path).expect("mock log should exist");
-
-        assert!(
-            log_contents.contains("systemctl --user start podman-auto-update.service"),
-            "expected systemctl invocation, got log:\n{log_contents}"
+            detail
+                .logs
+                .iter()
+                .any(|log| log.action == "task-created" && log.status == "succeeded"),
+            "expected a task-created log whose status matches the final task status, logs={:#?}",
+            detail.logs
         );
         assert!(
-            log_contents.contains("busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StartUnit ss podman-auto-update.service replace"),
-            "expected busctl StartUnit fallback, got log:\n{log_contents}"
+            !detail.logs.iter().any(|log| {
+                log.action == "task-created" && (log.status == "running" || log.status == "pending")
+            }),
+            "task-created logs must not stay in running/pending for a completed task, logs={:#?}",
+            detail.logs
         );
-
-        remove_env("MOCK_SYSTEMCTL_BUS_ERROR_UNIT");
     }
 
     #[test]

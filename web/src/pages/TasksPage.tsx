@@ -8,6 +8,7 @@ import type {
   TaskDetailResponse,
   TasksListResponse,
   TaskLogEntry,
+  TaskLogLevel,
 } from '../domain/tasks'
 import { isCommandMeta } from '../domain/tasks'
 import { useApi } from '../hooks/useApi'
@@ -368,7 +369,12 @@ export default function TasksPage() {
     }
   }
 
-  const statusBadgeClass = (status: TaskStatus) => {
+  const statusBadgeClass = (status: TaskStatus, level?: TaskLogLevel) => {
+    // For log timeline entries we prefer the log level over the raw status so
+    // that warning/error entries are immediately visible even when the task as
+    // a whole succeeded.
+    if (level === 'warning') return 'badge-warning'
+    if (level === 'error') return 'badge-error'
     switch (status) {
       case 'running':
         return 'badge-info'
@@ -383,6 +389,13 @@ export default function TasksPage() {
       default:
         return 'badge-warning'
     }
+  }
+
+  const logStatusLabel = (log: TaskLogEntry) => {
+    if (log.level === 'warning' || log.level === 'error') {
+      return log.level
+    }
+    return log.status
   }
 
   const unitSummaryText = (task: Task) => {
@@ -701,11 +714,19 @@ export default function TasksPage() {
                       </span>
                     </td>
                     <td>
-                      <span
-                        className={`badge badge-xs ${statusBadgeClass(task.status)}`}
-                      >
-                        {task.status}
-                      </span>
+                      <div className="flex items-center gap-1">
+                        <span
+                          className={`badge badge-xs ${statusBadgeClass(task.status)}`}
+                        >
+                          {task.status}
+                        </span>
+                        {task.has_warnings ? (
+                          <span className="badge badge-warning badge-xs gap-1">
+                            <Icon icon="mdi:alert-outline" className="text-[11px]" />
+                            <span>{task.warning_count ?? 0}</span>
+                          </span>
+                        ) : null}
+                      </div>
                     </td>
                     <td className="max-w-xs truncate text-[11px]">
                       {unitSummaryText(task)}
@@ -800,6 +821,12 @@ export default function TasksPage() {
                         >
                           {drawerTask.status}
                         </span>
+                        {drawerTask.has_warnings ? (
+                          <span className="badge badge-warning badge-xs gap-1">
+                            <Icon icon="mdi:alert-outline" className="text-[11px]" />
+                            <span>{drawerTask.warning_count ?? 0}</span>
+                          </span>
+                        ) : null}
                       </div>
                       <div className="flex flex-wrap items-center gap-2 text-[11px] text-base-content/60">
                         <span>
@@ -935,9 +962,12 @@ export default function TasksPage() {
                                       {log.action}
                                     </span>
                                     <span
-                                      className={`badge badge-xs ${statusBadgeClass(log.status)}`}
+                                      className={`badge badge-xs ${statusBadgeClass(
+                                        log.status,
+                                        log.level,
+                                      )}`}
                                     >
-                                      {log.status}
+                                      {logStatusLabel(log)}
                                     </span>
                                     {log.unit ? (
                                       <span className="badge badge-ghost badge-xs">

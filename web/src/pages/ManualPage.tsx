@@ -10,6 +10,7 @@ import type {
   TaskDetailResponse,
   TasksListResponse,
   TaskLogEntry,
+  TaskLogLevel,
 } from '../domain/tasks'
 import { isCommandMeta } from '../domain/tasks'
 
@@ -662,7 +663,12 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
     }
   }
 
-  const statusBadgeClass = (status: TaskStatus) => {
+  const statusBadgeClass = (status: TaskStatus, level?: TaskLogLevel) => {
+    // For timeline entries we prefer the log level over the underlying status
+    // when deciding badge colour, so that warning/error logs are visually
+    // distinct even if the task as a whole succeeded.
+    if (level === 'warning') return 'badge-warning'
+    if (level === 'error') return 'badge-error'
     switch (status) {
       case 'running':
         return 'badge-info'
@@ -677,6 +683,13 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
       default:
         return 'badge-warning'
     }
+  }
+
+  const logStatusLabel = (log: TaskLogEntry) => {
+    if (log.level === 'warning' || log.level === 'error') {
+      return log.level
+    }
+    return log.status
   }
 
   const unitSummaryText = (task: Task) => {
@@ -827,11 +840,19 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                           </span>
                         </td>
                         <td>
-                          <span
-                            className={`badge badge-xs ${statusBadgeClass(task.status)}`}
-                          >
-                            {task.status}
-                          </span>
+                          <div className="flex items-center gap-1">
+                            <span
+                          className={`badge badge-xs ${statusBadgeClass(task.status)}`}
+                            >
+                              {task.status}
+                            </span>
+                            {task.has_warnings ? (
+                              <span className="badge badge-warning badge-xs gap-1">
+                                <Icon icon="mdi:alert-outline" className="text-[11px]" />
+                                <span>{task.warning_count ?? 0}</span>
+                              </span>
+                            ) : null}
+                          </div>
                         </td>
                         <td className="max-w-xs truncate text-[11px]">
                           {unitSummaryText(task)}
@@ -905,6 +926,12 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                         >
                           {detail.status}
                         </span>
+                        {detail.has_warnings ? (
+                          <span className="badge badge-warning badge-xs gap-1">
+                            <Icon icon="mdi:alert-outline" className="text-[11px]" />
+                            <span>{detail.warning_count ?? 0}</span>
+                          </span>
+                        ) : null}
                       </div>
                       <div className="flex flex-wrap items-center gap-2 text-[11px] text-base-content/60">
                         <span>创建 · {formatTs(detail.created_at)}</span>
@@ -1033,9 +1060,12 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                                       {log.action}
                                     </span>
                                     <span
-                                      className={`badge badge-xs ${statusBadgeClass(log.status)}`}
+                                      className={`badge badge-xs ${statusBadgeClass(
+                                        log.status,
+                                        log.level,
+                                      )}`}
                                     >
-                                      {log.status}
+                                      {logStatusLabel(log)}
                                     </span>
                                     {log.unit ? (
                                       <span className="badge badge-ghost badge-xs">
