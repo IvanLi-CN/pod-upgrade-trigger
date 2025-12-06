@@ -594,7 +594,10 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
             cmd.env("MOCK_BUSCTL_FAIL", "podman-auto-update.service");
         },
     )?;
-    assert_eq!(response.status, 202, "manual auto-update API should accept the request even when unit start eventually fails");
+    assert_eq!(
+        response.status, 202,
+        "manual auto-update API should accept the request even when unit start eventually fails"
+    );
     let json = response.json_body()?;
     assert_eq!(json["status"], Value::from("pending"));
     let task_id = json["task_id"].as_str().unwrap_or_default().to_string();
@@ -608,12 +611,10 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
     assert_eq!(detail.status, 200);
     let body = detail.json_body()?;
     assert_eq!(body["status"], Value::from("failed"));
-    let summary = body["summary"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let summary = body["summary"].as_str().unwrap_or_default().to_string();
     assert!(
-        summary.contains("Auto-update unit failed to start") || summary.contains("Auto-update unit error"),
+        summary.contains("Auto-update unit failed to start")
+            || summary.contains("Auto-update unit error"),
         "unexpected manual auto-update failure summary: {summary}"
     );
 
@@ -930,15 +931,11 @@ async fn scenario_error_paths() -> AnyResult<()> {
     assert_eq!(response2.status, 202);
     let log_lines = env.read_mock_log()?;
     assert!(log_lines.iter().any(|line| line.contains("podman pull")));
-    assert!(
-        log_lines
-            .iter()
-            .all(|line| {
-                !line.contains("busctl --user call")
-                    || !line.contains("RestartUnit")
-                    || !line.contains("svc-beta.service")
-            })
-    );
+    assert!(log_lines.iter().all(|line| {
+        !line.contains("busctl --user call")
+            || !line.contains("RestartUnit")
+            || !line.contains("svc-beta.service")
+    }));
 
     let invalid = HttpRequest::post("/github-package-update/svc-alpha")
         .header("x-github-event", "registry_package")
