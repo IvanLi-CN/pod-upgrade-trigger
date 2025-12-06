@@ -9057,9 +9057,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
                     if err_str.is_empty() {
                         format!("{event_type} reported by podman auto-update for {subject}")
                     } else {
-                        format!(
-                            "{event_type} from podman auto-update for {subject}: {err_str}"
-                        )
+                        format!("{event_type} from podman auto-update for {subject}: {err_str}")
                     }
                 } else if event_type == "summary" {
                     "Auto-update summary received from podman auto-update".to_string()
@@ -9114,18 +9112,12 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
             .cloned()
             .unwrap_or_default();
 
-        let total = counts
-            .get("total")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let total = counts.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
         let succeeded = counts
             .get("succeeded")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let failed = counts
-            .get("failed")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let failed = counts.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
         let unchanged = total.saturating_sub(succeeded.saturating_add(failed));
 
         let task_status = if failed > 0 { "failed" } else { "succeeded" };
