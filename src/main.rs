@@ -39,6 +39,8 @@ const GITHUB_IMAGE_LIMIT_COUNT: u64 = 60;
 const GITHUB_IMAGE_LIMIT_WINDOW: u64 = 3_600; // 1 hour
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MANUAL_UNIT: &str = "podman-auto-update.service";
+const AUTO_UPDATE_RUN_POLL_INTERVAL_MS: u64 = 1_000;
+const AUTO_UPDATE_RUN_MAX_SECS: u64 = 1_800; // 30 minutes hard cap for a single auto-update run
 const DEFAULT_REGISTRY_HOST: &str = "ghcr.io";
 const PULL_RETRY_ATTEMPTS: u8 = 3;
 const PULL_RETRY_DELAY_SECS: u64 = 5;
@@ -3890,6 +3892,10 @@ fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
+    if ctx.path == "/api/manual/auto-update/run" {
+        return handle_manual_auto_update_run(ctx);
+    }
+
     if ctx.path == "/api/manual/trigger" {
         return handle_manual_trigger(ctx);
     }
@@ -3905,6 +3911,139 @@ fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
         "manual route not found",
         "manual-api",
         Some(json!({ "reason": "unknown-route" })),
+    )
+}
+
+fn handle_manual_auto_update_run(ctx: &RequestContext) -> Result<(), String> {
+    let request: ManualAutoUpdateRunRequest = match parse_json_body(ctx) {
+        Ok(body) => body,
+        Err(err) => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "invalid request",
+                "manual-auto-update-run",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let expected = manual_api_token();
+    let profile = env::var("PODUP_ENV")
+        .unwrap_or_else(|_| "dev".to_string())
+        .to_ascii_lowercase();
+    let is_dev_like = matches!(profile.as_str(), "dev" | "development" | "demo");
+    let require_token = !is_dev_like && !expected.is_empty();
+    if require_token && request.token.as_deref().unwrap_or_default() != expected {
+        respond_text(
+            ctx,
+            401,
+            "Unauthorized",
+            "unauthorized",
+            "manual-auto-update-run",
+            Some(json!({ "reason": "token" })),
+        )?;
+        return Ok(());
+    }
+
+    let unit = manual_auto_update_unit();
+
+    // Avoid running multiple auto-update executions concurrently for the same unit.
+    if let Ok(Some(existing_task)) = active_auto_update_task(&unit) {
+        let response = json!({
+            "unit": unit,
+            "status": "already-running",
+            "message": "Auto-update already running for this unit",
+            "dry_run": request.dry_run,
+            "caller": request.caller,
+            "reason": request.reason,
+            "image": Value::Null,
+            "task_id": existing_task,
+            "request_id": ctx.request_id,
+        });
+
+        respond_json(
+            ctx,
+            202,
+            "Accepted",
+            &response,
+            "manual-auto-update-run",
+            Some(json!({
+                "unit": unit,
+                "dry_run": request.dry_run,
+                "task_id": response.get("task_id").cloned().unwrap_or(Value::Null),
+                "reason": "already-running",
+            })),
+        )?;
+        return Ok(());
+    }
+
+    let task_id = match create_manual_auto_update_run_task(
+        &unit,
+        &ctx.request_id,
+        &ctx.path,
+        request.caller.as_deref(),
+        request.reason.as_deref(),
+        request.dry_run,
+    ) {
+        Ok(id) => id,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to schedule auto-update run",
+                "manual-auto-update-run",
+                Some(json!({
+                    "unit": unit,
+                    "error": err,
+                })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if let Err(err) = spawn_manual_task(&task_id, "manual-auto-update-run") {
+        respond_text(
+            ctx,
+            500,
+            "InternalServerError",
+            "failed to dispatch auto-update run",
+            "manual-auto-update-run",
+            Some(json!({
+                "unit": unit,
+                "task_id": task_id,
+                "error": err,
+            })),
+        )?;
+        return Ok(());
+    }
+
+    let response = json!({
+        "unit": unit,
+        "status": "pending",
+        "message": "scheduled via task",
+        "dry_run": request.dry_run,
+        "caller": request.caller,
+        "reason": request.reason,
+        "image": Value::Null,
+        "task_id": task_id,
+        "request_id": ctx.request_id,
+    });
+
+    respond_json(
+        ctx,
+        202,
+        "Accepted",
+        &response,
+        "manual-auto-update-run",
+        Some(json!({
+            "unit": unit,
+            "dry_run": request.dry_run,
+            "task_id": response.get("task_id").cloned().unwrap_or(Value::Null),
+        })),
     )
 }
 
@@ -3935,6 +4074,7 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
     let discovered_detail = discovered_unit_detail();
 
     let mut services = Vec::new();
+    let auto_update_unit = manual_auto_update_unit();
     for unit in manual_unit_list() {
         let slug = unit
             .trim()
@@ -3957,6 +4097,7 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
             "default_image": default_image,
             "github_path": github_path,
             "source": source,
+            "is_auto_update": unit == auto_update_unit,
         }));
     }
 
@@ -4257,6 +4398,15 @@ struct ManualTriggerRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ManualAutoUpdateRunRequest {
+    token: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+    caller: Option<String>,
+    reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct DiscoveredUnit {
     unit: String,
@@ -4351,6 +4501,12 @@ enum TaskMeta {
     },
     #[serde(rename = "auto-update")]
     AutoUpdate { unit: String },
+    #[serde(rename = "auto-update-run")]
+    AutoUpdateRun {
+        unit: String,
+        #[serde(default)]
+        dry_run: bool,
+    },
     #[serde(rename = "maintenance-prune")]
     MaintenancePrune {
         max_age_hours: u64,
@@ -5045,6 +5201,27 @@ fn create_manual_service_task(
     }
 }
 
+fn active_auto_update_task(unit: &str) -> Result<Option<String>, String> {
+    let unit_owned = unit.to_string();
+    with_db(|pool| async move {
+        let row_opt: Option<SqliteRow> = sqlx::query(
+            "SELECT t.task_id \
+             FROM tasks t \
+             JOIN task_units u ON t.task_id = u.task_id \
+             WHERE u.unit = ? AND t.status IN ('pending','running') \
+             ORDER BY t.created_at DESC \
+             LIMIT 1",
+        )
+        .bind(&unit_owned)
+        .fetch_optional(&pool)
+        .await?;
+
+        let task_id = row_opt.map(|row| row.get::<String, _>("task_id"));
+        Ok::<Option<String>, sqlx::Error>(task_id)
+    })
+    .map_err(|e| e.to_string())
+}
+
 fn create_manual_auto_update_task(
     unit: &str,
     request_id: &str,
@@ -5141,6 +5318,140 @@ fn create_manual_auto_update_task(
         .bind("task-created")
         .bind("running")
         .bind("Manual auto-update task created from API")
+        .bind(Some(unit_owned.clone()))
+        .bind(meta_log_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_manual_auto_update_run_task(
+    unit: &str,
+    request_id: &str,
+    path: &str,
+    caller: Option<&str>,
+    reason: Option<&str>,
+    dry_run: bool,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "manual".to_string();
+
+    let meta = TaskMeta::AutoUpdateRun {
+        unit: unit.to_string(),
+        dry_run,
+    };
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let unit_owned = unit.to_string();
+    let request_id_owned = request_id.to_string();
+    let path_owned = path.to_string();
+    let caller_owned = caller.map(|s| s.to_string());
+    let reason_owned = reason.map(|s| s.to_string());
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        let summary = if dry_run {
+            format!("Manual auto-update dry-run for {unit_owned}")
+        } else {
+            format!("Manual auto-update run for {unit_owned}")
+        };
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("manual")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some(summary))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(Some(path_owned.clone()))
+        .bind(&caller_owned)
+        .bind(&reason_owned)
+        .bind(Option::<i64>::None) // scheduler_iteration
+        .bind(0_i64) // can_stop (manual auto-update tasks cannot be safely cancelled)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64)) // is_long_running
+        .bind(Option::<String>::None) // retry_of
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_owned)
+        .bind(Some(
+            unit_owned
+                .trim_end_matches(".service")
+                .trim_matches('/')
+                .to_string(),
+        ))
+        .bind(&unit_owned)
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(if dry_run {
+            "Manual auto-update dry-run scheduled from API".to_string()
+        } else {
+            "Manual auto-update run scheduled from API".to_string()
+        }))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        let meta_log = json!({
+            "unit": unit_owned,
+            "source": trigger_source,
+            "path": path_owned,
+            "caller": caller_owned,
+            "reason": reason_owned,
+            "dry_run": dry_run,
+        });
+        let meta_log_str = serde_json::to_string(&meta_log).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind(if dry_run {
+            "Manual auto-update dry-run task created from API"
+        } else {
+            "Manual auto-update task created from API"
+        })
         .bind(Some(unit_owned.clone()))
         .bind(meta_log_str)
         .execute(&mut *tx)
@@ -5691,6 +6002,9 @@ fn run_task_by_id(task_id: &str) -> Result<(), String> {
             }
         }
         ("manual", TaskMeta::AutoUpdate { unit }) => run_auto_update_task(task_id, &unit),
+        ("manual", TaskMeta::AutoUpdateRun { unit, dry_run }) => {
+            run_auto_update_run_task(task_id, &unit, dry_run)
+        }
         ("scheduler", TaskMeta::AutoUpdate { unit }) => run_auto_update_task(task_id, &unit),
         (
             "maintenance",
@@ -8222,6 +8536,48 @@ fn update_task_state_with_unit(
     });
 }
 
+fn append_task_log(
+    task_id: &str,
+    level: &str,
+    action: &str,
+    status: &str,
+    summary: &str,
+    unit: Option<&str>,
+    meta: Value,
+) {
+    let task_id_owned = task_id.to_string();
+    let level_owned = level.to_string();
+    let action_owned = action.to_string();
+    let status_owned = status.to_string();
+    let summary_owned = summary.to_string();
+    let unit_owned = unit.map(|u| u.to_string());
+    let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+    let now = current_unix_secs() as i64;
+
+    let _ = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_owned)
+        .bind(now)
+        .bind(&level_owned)
+        .bind(&action_owned)
+        .bind(&status_owned)
+        .bind(&summary_owned)
+        .bind(unit_owned)
+        .bind(meta_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+}
+
 fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
     let task_id_owned = task_id.to_string();
     let (units,): (Vec<String>,) = with_db(|pool| async move {
@@ -8447,6 +8803,415 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         },
         meta,
     );
+
+    Ok(())
+}
+
+fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<(), String> {
+    let unit_owned = unit.to_string();
+    let command = format!("systemctl --user start {unit_owned}");
+    let argv = ["systemctl", "--user", "start", unit];
+
+    let start_result = start_auto_update_unit(&unit_owned);
+    let start_result = match start_result {
+        Ok(res) => res,
+        Err(err) => {
+            log_message(&format!(
+                "500 auto-update-run-error unit={unit_owned} task_id={task_id} err={err}"
+            ));
+            let meta = json!({
+                "unit": unit_owned,
+                "dry_run": dry_run,
+                "error": err,
+            });
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Auto-update run error",
+                "auto-update-run",
+                "error",
+                meta,
+            );
+            return Ok(());
+        }
+    };
+
+    if !start_result.success() {
+        let exit = exit_code_string(&start_result.status);
+        log_message(&format!(
+            "500 auto-update-run-start-failed unit={unit_owned} task_id={task_id} exit={exit} stderr={}",
+            start_result.stderr
+        ));
+        let extra_meta = json!({
+            "unit": unit_owned,
+            "dry_run": dry_run,
+            "exit": exit,
+        });
+        let meta = build_command_meta(&command, &argv, &start_result, Some(extra_meta));
+        update_task_state_with_unit(
+            task_id,
+            "failed",
+            unit,
+            "failed",
+            "Auto-update run failed to start",
+            "auto-update-run-start",
+            "error",
+            meta,
+        );
+        return Ok(());
+    }
+
+    log_message(&format!(
+        "202 auto-update-run-start unit={unit_owned} task_id={task_id} dry_run={dry_run}"
+    ));
+    let extra_meta = json!({
+        "unit": unit_owned,
+        "dry_run": dry_run,
+        "stderr": start_result.stderr,
+    });
+    let meta = build_command_meta(&command, &argv, &start_result, Some(extra_meta));
+    append_task_log(
+        task_id,
+        "info",
+        "auto-update-run-start",
+        "running",
+        if dry_run {
+            "podman auto-update dry-run started successfully"
+        } else {
+            "podman auto-update run started successfully"
+        },
+        Some(unit),
+        meta,
+    );
+
+    let log_dir_opt = auto_update_log_dir();
+    let mut baseline_files: HashSet<String> = HashSet::new();
+    if let Some(ref dir) = log_dir_opt {
+        if let Ok(read_dir) = fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    baseline_files.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    let start_instant = Instant::now();
+    let mut summary_event: Option<Value> = None;
+    let mut summary_log_file: Option<PathBuf> = None;
+
+    if let Some(log_dir) = log_dir_opt.clone() {
+        let mut known_file: Option<PathBuf> = None;
+        let mut processed_lines: usize = 0;
+
+        loop {
+            if start_instant.elapsed() >= Duration::from_secs(AUTO_UPDATE_RUN_MAX_SECS) {
+                log_message(&format!(
+                    "warn auto-update-run-timeout unit={unit_owned} task_id={task_id}"
+                ));
+                break;
+            }
+
+            if known_file.is_none() {
+                let mut latest: Option<(SystemTime, PathBuf)> = None;
+                match fs::read_dir(&log_dir) {
+                    Ok(read_dir) => {
+                        for entry in read_dir.flatten() {
+                            let path = entry.path();
+                            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                                continue;
+                            }
+                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                if baseline_files.contains(name) {
+                                    continue;
+                                }
+                            }
+                            let Ok(meta) = fs::metadata(&path) else {
+                                continue;
+                            };
+                            let Ok(modified) = meta.modified() else {
+                                continue;
+                            };
+                            match latest {
+                                Some((ts, _)) if modified <= ts => {}
+                                _ => latest = Some((modified, path)),
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log_message(&format!(
+                            "warn auto-update-run-log-dir-read-failed dir={} err={err}",
+                            log_dir.to_string_lossy()
+                        ));
+                        break;
+                    }
+                }
+
+                if let Some((_, path)) = latest {
+                    known_file = Some(path);
+                    processed_lines = 0;
+                } else {
+                    // No JSONL file yet; keep waiting.
+                    thread::sleep(Duration::from_millis(AUTO_UPDATE_RUN_POLL_INTERVAL_MS));
+                    continue;
+                }
+            }
+
+            let path = known_file.as_ref().cloned().unwrap();
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(err) => {
+                    log_message(&format!(
+                        "warn auto-update-run-open-log-failed file={} err={err}",
+                        path.to_string_lossy()
+                    ));
+                    break;
+                }
+            };
+
+            let reader = io::BufReader::new(file);
+            let mut line_index: usize = 0;
+            for line_result in reader.lines() {
+                let Ok(line) = line_result else {
+                    continue;
+                };
+                if line_index < processed_lines {
+                    line_index = line_index.saturating_add(1);
+                    continue;
+                }
+                line_index = line_index.saturating_add(1);
+                processed_lines = processed_lines.saturating_add(1);
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let event: Value = match serde_json::from_str(trimmed) {
+                    Ok(ev) => ev,
+                    Err(_) => {
+                        append_task_log(
+                            task_id,
+                            "info",
+                            "auto-update-log",
+                            "running",
+                            trimmed,
+                            Some(unit),
+                            json!({
+                                "unit": unit_owned,
+                                "raw": trimmed,
+                                "log_file": path.to_string_lossy(),
+                            }),
+                        );
+                        continue;
+                    }
+                };
+
+                let event_type = event
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let level = if event_type == "auto-update-error" {
+                    "error"
+                } else if event_type == "dry-run-error" {
+                    "warning"
+                } else {
+                    "info"
+                };
+
+                let message = if event_type == "dry-run-error" || event_type == "auto-update-error"
+                {
+                    let container = event
+                        .get("container")
+                        .or_else(|| event.get("container_name"))
+                        .or_else(|| event.get("container_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let image = event
+                        .get("image")
+                        .or_else(|| event.get("image_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let err_str = event
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let subject = if !image.is_empty() {
+                        image
+                    } else if !container.is_empty() {
+                        container
+                    } else {
+                        unit_owned.clone()
+                    };
+                    if err_str.is_empty() {
+                        format!("{event_type} reported by podman auto-update for {subject}")
+                    } else {
+                        format!("{event_type} from podman auto-update for {subject}: {err_str}")
+                    }
+                } else if event_type == "summary" {
+                    "Auto-update summary received from podman auto-update".to_string()
+                } else if event_type.is_empty() {
+                    "Auto-update event from podman auto-update".to_string()
+                } else {
+                    format!("Auto-update event: {event_type}")
+                };
+
+                append_task_log(
+                    task_id,
+                    level,
+                    "auto-update-log",
+                    if event_type == "summary" {
+                        "succeeded"
+                    } else {
+                        "running"
+                    },
+                    &message,
+                    Some(unit),
+                    json!({
+                        "unit": unit_owned,
+                        "log_file": path.to_string_lossy(),
+                        "event": event,
+                    }),
+                );
+
+                if event_type == "summary" {
+                    summary_log_file = Some(path.clone());
+                    summary_event = Some(event);
+                    break;
+                }
+            }
+
+            if summary_event.is_some() {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(AUTO_UPDATE_RUN_POLL_INTERVAL_MS));
+        }
+    }
+
+    let summary_meta_log_dir = log_dir_opt
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+
+    if let Some(summary) = summary_event {
+        let counts = summary
+            .get("summary")
+            .and_then(|v| v.get("counts"))
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+
+        let total = counts.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+        let succeeded = counts
+            .get("succeeded")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let failed = counts.get("failed").and_then(|v| v.as_u64()).unwrap_or(0);
+        let unchanged = total.saturating_sub(succeeded.saturating_add(failed));
+
+        let task_status = if failed > 0 { "failed" } else { "succeeded" };
+        let level = if failed > 0 { "error" } else { "info" };
+
+        let summary_text = if dry_run {
+            format!(
+                "podman auto-update dry-run completed: total={total}, updated={succeeded}, failed={failed}, unchanged={unchanged}"
+            )
+        } else {
+            format!(
+                "podman auto-update completed: total={total}, updated={succeeded}, failed={failed}, unchanged={unchanged}"
+            )
+        };
+
+        let meta = json!({
+            "unit": unit_owned,
+            "dry_run": dry_run,
+            "summary_event": summary,
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "unchanged": unchanged,
+            "log_file": summary_log_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            "log_dir": summary_meta_log_dir,
+        });
+
+        update_task_state_with_unit(
+            task_id,
+            task_status,
+            unit,
+            task_status,
+            &summary_text,
+            "auto-update-run",
+            level,
+            meta,
+        );
+        ingest_auto_update_warnings(task_id, unit);
+        return Ok(());
+    }
+
+    // No summary event observed; fall back to a generic success/failure based on timeout.
+    let timed_out = start_instant.elapsed() >= Duration::from_secs(AUTO_UPDATE_RUN_MAX_SECS);
+    let (task_status, level, summary_text) = if timed_out {
+        (
+            "failed",
+            "error",
+            if dry_run {
+                format!(
+                    "podman auto-update dry-run timed out after {} seconds; check podman auto-update logs",
+                    AUTO_UPDATE_RUN_MAX_SECS
+                )
+            } else {
+                format!(
+                    "podman auto-update run timed out after {} seconds; check podman auto-update logs",
+                    AUTO_UPDATE_RUN_MAX_SECS
+                )
+            },
+        )
+    } else {
+        (
+            "succeeded",
+            "info",
+            if dry_run {
+                "podman auto-update dry-run completed (no JSONL summary found)".to_string()
+            } else {
+                "podman auto-update run completed (no JSONL summary found)".to_string()
+            },
+        )
+    };
+
+    let meta = json!({
+        "unit": unit_owned,
+        "dry_run": dry_run,
+        "log_dir": summary_meta_log_dir,
+        "reason": if timed_out { "timeout" } else { "no-summary" },
+    });
+
+    update_task_state_with_unit(
+        task_id,
+        task_status,
+        unit,
+        task_status,
+        &summary_text,
+        "auto-update-run",
+        level,
+        meta,
+    );
+
+    if log_dir_opt.is_some() {
+        ingest_auto_update_warnings(task_id, unit);
+    }
 
     Ok(())
 }

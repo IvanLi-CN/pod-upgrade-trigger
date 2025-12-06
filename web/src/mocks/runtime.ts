@@ -36,6 +36,7 @@ export type ManualService = {
   display_name: string
   default_image?: string | null
   github_path?: string
+  is_auto_update?: boolean
 }
 
 export type WebhookUnit = {
@@ -264,6 +265,12 @@ function buildEvents(now: number, profile: MockProfile, tasks: Task[]): MockEven
 function buildServices(profile: MockProfile): ManualService[] {
   if (profile === 'empty-state') return []
   return [
+    {
+      slug: 'podman-auto-update',
+      unit: 'podman-auto-update.service',
+      display_name: 'podman-auto-update.service',
+      is_auto_update: true,
+    },
     {
       slug: 'svc-alpha',
       unit: 'svc-alpha.service',
