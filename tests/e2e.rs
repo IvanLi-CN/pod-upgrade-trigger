@@ -21,6 +21,8 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_webhook_auto_discovery_toggle().await?;
     scenario_health_db_error().await?;
     scenario_github_webhook().await?;
+    scenario_webhook_image_prune_success().await?;
+    scenario_webhook_image_prune_failure().await?;
     scenario_github_dispatch_failure().await?;
     scenario_rate_limit_and_prune().await?;
     scenario_task_prune_retention().await?;
@@ -226,6 +228,165 @@ async fn scenario_github_webhook() -> AnyResult<()> {
         .fetch_one(&pool)
         .await?;
     assert_eq!(lock_count, 0);
+
+    Ok(())
+}
+
+async fn scenario_webhook_image_prune_success() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    let payload = github_registry_payload("koha", "svc-alpha", "main");
+    let signature = env.github_signature(&payload);
+    let response = env.send_request(
+        HttpRequest::post("/github-package-update/svc-alpha")
+            .header("x-github-event", "registry_package")
+            .header("x-github-delivery", "prune-ok")
+            .header("x-hub-signature-256", &signature)
+            .body(payload.clone()),
+    )?;
+    assert_eq!(
+        response.status, 202,
+        "github webhook with prune-ok delivery should be accepted: {}",
+        response.body_text()
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find(|row| row.action == "github-webhook")
+        .and_then(|row| row.meta.get("task_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "github-webhook events should include a task_id in meta for prune success scenario"
+    );
+
+    let path = format!("/api/tasks/{task_id}");
+    let detail_resp = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(
+        detail_resp.status, 200,
+        "/api/tasks/:id should succeed for prune success scenario"
+    );
+    let body = detail_resp.json_body()?;
+    assert_eq!(
+        body["status"],
+        Value::from("succeeded"),
+        "webhook task should be marked succeeded when prune succeeds, got: {}",
+        body["status"]
+    );
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let prune_log = logs
+        .iter()
+        .find(|entry| {
+            entry.get("action") == Some(&Value::from("image-prune"))
+                && entry.get("status") == Some(&Value::from("succeeded"))
+        })
+        .cloned()
+        .expect("expected image-prune log entry with status=succeeded for webhook prune success");
+
+    let meta = prune_log
+        .get("meta")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    assert_eq!(
+        meta.get("type").and_then(|v| v.as_str()),
+        Some("command"),
+        "image-prune meta.type should be 'command'"
+    );
+    let command = meta.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        command.contains("podman image prune -f"),
+        "image-prune meta.command should contain 'podman image prune -f', got: {command}"
+    );
+
+    Ok(())
+}
+
+async fn scenario_webhook_image_prune_failure() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    let payload = github_registry_payload("koha", "svc-alpha", "main");
+    let signature = env.github_signature(&payload);
+    let request = HttpRequest::post("/github-package-update/svc-alpha")
+        .header("x-github-event", "registry_package")
+        .header("x-github-delivery", "prune-fail")
+        .header("x-hub-signature-256", &signature)
+        .body(payload.clone());
+
+    let response = env.send_request_with_env(request, |cmd| {
+        cmd.env("MOCK_PODMAN_PRUNE_FAIL", "1");
+    })?;
+    assert_eq!(
+        response.status, 202,
+        "github webhook with failing prune should still be accepted: {}",
+        response.body_text()
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find(|row| row.action == "github-webhook")
+        .and_then(|row| row.meta.get("task_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "github-webhook events should include a task_id in meta for prune failure scenario"
+    );
+
+    let path = format!("/api/tasks/{task_id}");
+    let detail_resp = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(
+        detail_resp.status, 200,
+        "/api/tasks/:id should succeed for prune failure scenario"
+    );
+    let body = detail_resp.json_body()?;
+    assert_eq!(
+        body["status"],
+        Value::from("succeeded"),
+        "webhook task should remain succeeded even when prune fails, got: {}",
+        body["status"]
+    );
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let prune_log = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("image-prune")))
+        .cloned()
+        .expect("expected image-prune log entry for webhook prune failure");
+    assert_eq!(
+        prune_log.get("status"),
+        Some(&Value::from("failed")),
+        "image-prune log status should be 'failed' when prune command fails"
+    );
+    assert_eq!(
+        prune_log.get("level"),
+        Some(&Value::from("warning")),
+        "image-prune log level should be 'warning' when prune command fails"
+    );
+
+    let meta = prune_log
+        .get("meta")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let exit = meta.get("exit").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !exit.is_empty(),
+        "image-prune meta.exit should be a non-empty string when prune command fails"
+    );
+    let stderr = meta.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        stderr.contains("simulated podman prune failure"),
+        "image-prune meta.stderr should include mock prune failure message, got: {stderr}"
+    );
 
     Ok(())
 }

@@ -8343,14 +8343,30 @@ fn pull_container_image(image: &str) -> Result<CommandExecResult, String> {
     Ok(last_result.expect("PULL_RETRY_ATTEMPTS must be >= 1"))
 }
 
-fn prune_images_silently() {
+fn prune_images_for_task(task_id: &str, unit: &str) {
+    let command = "podman image prune -f";
+    let argv = ["podman", "image", "prune", "-f"];
+
     match run_quiet_command({
         let mut cmd = Command::new("podman");
         cmd.arg("image").arg("prune").arg("-f");
         cmd
     }) {
         Ok(result) => {
-            if !result.success() {
+            let extra_meta = json!({ "unit": unit });
+            let meta = build_command_meta(command, &argv, &result, Some(extra_meta));
+
+            if result.success() {
+                append_task_log(
+                    task_id,
+                    "info",
+                    "image-prune",
+                    "succeeded",
+                    "Background image prune completed",
+                    Some(unit),
+                    meta,
+                );
+            } else {
                 let mut msg = format!(
                     "warn image-prune-failed exit={}",
                     exit_code_string(&result.status)
@@ -8360,10 +8376,38 @@ fn prune_images_silently() {
                     msg.push_str(&result.stderr);
                 }
                 log_message(&msg);
+
+                append_task_log(
+                    task_id,
+                    "warning",
+                    "image-prune",
+                    "failed",
+                    "Image prune failed (best-effort clean-up)",
+                    Some(unit),
+                    meta,
+                );
             }
         }
         Err(err) => {
             log_message(&format!("warn image-prune-error err={err}"));
+
+            let meta = json!({
+                "type": "command",
+                "command": command,
+                "argv": argv,
+                "error": err,
+                "unit": unit,
+            });
+
+            append_task_log(
+                task_id,
+                "warning",
+                "image-prune",
+                "failed",
+                "Image prune failed (best-effort clean-up)",
+                Some(unit),
+                meta,
+            );
         }
     }
 }
@@ -8550,7 +8594,6 @@ fn run_background_task(
             log_message(&format!(
                 "202 github-triggered unit={unit} image={image} event={event} delivery={delivery} path={path}"
             ));
-            prune_images_silently();
             let extra_meta = json!({
                 "status": "ok",
                 "image": image,
@@ -8570,6 +8613,7 @@ fn run_background_task(
                 "info",
                 meta,
             );
+            prune_images_for_task(task_id, unit);
         }
         Ok(result) => {
             let mut message = format!(
