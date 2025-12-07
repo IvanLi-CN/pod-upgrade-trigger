@@ -3845,6 +3845,19 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
             "500 manual-auto-update-dispatch-failed unit={unit} task_id={task_id} err={err} {}",
             redacted_line
         ));
+        mark_task_dispatch_failed(
+            &task_id,
+            Some(&unit),
+            "manual",
+            "manual-auto-update",
+            &err,
+            json!({
+                "unit": unit.clone(),
+                "path": ctx.path.clone(),
+                "request_id": ctx.request_id.clone(),
+                "reason": "manual-auto-update-dispatch-failed",
+            }),
+        );
         respond_text(
             ctx,
             500,
@@ -3853,6 +3866,7 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
             "manual-auto-update",
             Some(json!({
                 "unit": unit,
+                "task_id": task_id,
                 "error": err,
             })),
         )?;
@@ -4006,11 +4020,38 @@ fn handle_manual_auto_update_run(ctx: &RequestContext) -> Result<(), String> {
     };
 
     if let Err(err) = spawn_manual_task(&task_id, "manual-auto-update-run") {
-        respond_text(
+        mark_task_dispatch_failed(
+            &task_id,
+            Some(&unit),
+            "manual",
+            "manual-auto-update-run",
+            &err,
+            json!({
+                "unit": unit.clone(),
+                "dry_run": request.dry_run,
+                "caller": request.caller.clone(),
+                "reason": request.reason.clone(),
+                "path": ctx.path.clone(),
+                "request_id": ctx.request_id.clone(),
+            }),
+        );
+        let error_response = json!({
+            "unit": unit,
+            "status": "error",
+            "message": "failed to dispatch auto-update run",
+            "dry_run": request.dry_run,
+            "caller": request.caller,
+            "reason": request.reason,
+            "image": Value::Null,
+            "task_id": task_id,
+            "request_id": ctx.request_id,
+        });
+
+        respond_json(
             ctx,
             500,
             "InternalServerError",
-            "failed to dispatch auto-update run",
+            &error_response,
             "manual-auto-update-run",
             Some(json!({
                 "unit": unit,
@@ -4208,8 +4249,50 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
             })
             .collect();
 
-        // Fire-and-forget 调度 run-task <task_id>。
-        let _ = spawn_manual_task(&task, "manual-trigger");
+        // Fire-and-forget 调度 run-task <task_id>，但一旦派发失败，需要立即将
+        // Task 标记为 failed 并返回错误响应，避免壳任务。
+        if let Err(err) = spawn_manual_task(&task, "manual-trigger") {
+            mark_task_dispatch_failed(
+                &task,
+                None,
+                "manual",
+                "manual-trigger",
+                &err,
+                json!({
+                    "units": units.clone(),
+                    "caller": request.caller.clone(),
+                    "reason": request.reason.clone(),
+                    "path": ctx.path,
+                    "request_id": ctx.request_id,
+                }),
+            );
+
+            let error_response = ManualTriggerResponse {
+                triggered: Vec::new(),
+                dry_run,
+                caller: request.caller.clone(),
+                reason: request.reason.clone(),
+                task_id: Some(task.clone()),
+                request_id: Some(ctx.request_id.clone()),
+            };
+
+            let payload =
+                serde_json::to_value(&error_response).map_err(|e| e.to_string())?;
+            respond_json(
+                ctx,
+                500,
+                "InternalServerError",
+                &payload,
+                "manual-trigger",
+                Some(json!({
+                    "units": units.clone(),
+                    "dry_run": dry_run,
+                    "task_id": error_response.task_id,
+                    "error": err,
+                })),
+            )?;
+            return Ok(());
+        }
     }
 
     let (status, reason) = if all_units_ok(&results) {
@@ -4335,7 +4418,50 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
             message: Some("scheduled via task".to_string()),
         };
 
-        let _ = spawn_manual_task(&task, "manual-service");
+        if let Err(err) = spawn_manual_task(&task, "manual-service") {
+            mark_task_dispatch_failed(
+                &task,
+                Some(&unit),
+                "manual",
+                "manual-service",
+                &err,
+                json!({
+                    "unit": unit,
+                    "image": request.image.clone(),
+                    "caller": request.caller.clone(),
+                    "reason": request.reason.clone(),
+                    "path": ctx.path,
+                    "request_id": ctx.request_id,
+                }),
+            );
+
+            let response = json!({
+                "unit": unit,
+                "status": "error",
+                "message": "failed to dispatch manual service task",
+                "dry_run": dry_run,
+                "caller": request.caller.clone(),
+                "reason": request.reason.clone(),
+                "image": request.image.clone(),
+                "task_id": task_id,
+                "request_id": ctx.request_id,
+            });
+
+            respond_json(
+                ctx,
+                500,
+                "InternalServerError",
+                &response,
+                "manual-service",
+                Some(json!({
+                    "unit": unit,
+                    "dry_run": dry_run,
+                    "task_id": task_id,
+                    "error": err,
+                })),
+            )?;
+            return Ok(());
+        }
     }
 
     let status =
@@ -5797,6 +5923,20 @@ fn create_cli_maintenance_prune_task(max_age_hours: u64, dry_run: bool) -> Resul
 }
 
 fn spawn_manual_task(task_id: &str, action: &str) -> Result<(), String> {
+    // Test hook: allow integration tests to force dispatch failures for
+    // specific manual task actions (e.g. "manual-trigger", "manual-service",
+    // "manual-auto-update-run", "scheduler-auto-update") without relying on
+    // the underlying systemd-run/system environment.
+    if let Ok(raw) = env::var("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS") {
+        let needle = action.to_string();
+        for entry in raw.split(',') {
+            let trimmed = entry.trim();
+            if !trimmed.is_empty() && trimmed == needle {
+                return Err("test-manual-dispatch-failed".to_string());
+            }
+        }
+    }
+
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let exe_str = exe.to_str().ok_or_else(|| "invalid exe path".to_string())?;
 
@@ -6558,6 +6698,17 @@ fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result
                     log_message(&format!(
                         "scheduler dispatch error unit={unit} iteration={iterations} err={err}"
                     ));
+                    mark_task_dispatch_failed(
+                        &task_id,
+                        Some(&unit),
+                        "scheduler",
+                        "scheduler-auto-update",
+                        &err,
+                        json!({
+                            "unit": unit.clone(),
+                            "iteration": iterations,
+                        }),
+                    );
                     record_system_event(
                         "scheduler",
                         500,
@@ -6566,6 +6717,7 @@ fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result
                             "iteration": iterations,
                             "status": "dispatch-error",
                             "error": err,
+                            "task_id": task_id,
                         }),
                     );
                 }
@@ -7716,11 +7868,27 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         &task_meta,
     )?;
 
-    if let Err(err) = spawn_background_task(&unit, &image, &event, &delivery, &ctx.path, &task_id) {
+    if let Err(err) = spawn_background_task(&unit, &image, &event, &delivery, &ctx.path, &task_id)
+    {
         log_message(&format!(
             "500 github-dispatch-failed unit={unit} image={image} event={event} delivery={delivery} path={} err={err}",
             ctx.path
         ));
+        mark_task_dispatch_failed(
+            &task_id,
+            Some(&unit),
+            "github-webhook",
+            "github-webhook",
+            &err,
+            json!({
+                "unit": unit,
+                "image": image,
+                "event": event,
+                "delivery": delivery,
+                "path": ctx.path,
+                "request_id": ctx.request_id,
+            }),
+        );
         respond_text(
             ctx,
             500,
@@ -8536,6 +8704,156 @@ fn update_task_state_with_unit(
     });
 }
 
+fn merge_task_meta(mut base: Value, extra: Value) -> Value {
+    match (&mut base, extra) {
+        (Value::Object(base_map), Value::Object(extra_map)) => {
+            for (k, v) in extra_map {
+                base_map.insert(k, v);
+            }
+            base
+        }
+        (Value::Object(base_map), other) if !other.is_null() => {
+            base_map.insert("extra".to_string(), other);
+            base
+        }
+        _ => base,
+    }
+}
+
+fn mark_task_dispatch_failed(
+    task_id: &str,
+    unit: Option<&str>,
+    kind: &str,
+    source: &str,
+    error: &str,
+    extra_meta: Value,
+) {
+    let summary = if let Some(u) = unit {
+        format!("Failed to dispatch {source} task for unit {u}")
+    } else {
+        format!("Failed to dispatch {source} task")
+    };
+
+    let mut base_meta = json!({
+        "task_id": task_id,
+        "kind": kind,
+        "source": source,
+        "error": error,
+    });
+    if let Some(u) = unit {
+        base_meta["unit"] = Value::String(u.to_string());
+    }
+
+    let merged_meta = merge_task_meta(base_meta, extra_meta);
+
+    // Determine which task_units to mark as failed. When no explicit unit is
+    // provided (e.g. manual trigger tasks spanning multiple units), we mark all
+    // units belonging to this task as failed.
+    let units: Vec<String> = if let Some(u) = unit {
+        vec![u.to_string()]
+    } else {
+        let task_id_owned = task_id.to_string();
+        let units_result: Result<Vec<String>, String> = with_db(|pool| async move {
+            let rows: Vec<SqliteRow> =
+                sqlx::query("SELECT unit FROM task_units WHERE task_id = ? ORDER BY id")
+                    .bind(&task_id_owned)
+                    .fetch_all(&pool)
+                    .await?;
+            let mut units = Vec::with_capacity(rows.len());
+            for row in rows {
+                units.push(row.get::<String, _>("unit"));
+            }
+            Ok::<Vec<String>, sqlx::Error>(units)
+        });
+
+        match units_result {
+            Ok(units) if !units.is_empty() => units,
+            Ok(_) => Vec::new(),
+            Err(err) => {
+                log_message(&format!(
+                    "warn task-dispatch-failed mark-units-load-failed task_id={task_id} err={err}"
+                ));
+                Vec::new()
+            }
+        }
+    };
+
+    if units.is_empty() {
+        // Best-effort fallback: update the task status and append a log entry
+        // without a specific unit, so that the task is never left running
+        // without an explanation.
+        let task_id_owned = task_id.to_string();
+        let summary_owned = summary.clone();
+        let meta_str =
+            serde_json::to_string(&merged_meta).unwrap_or_else(|_| "{}".to_string());
+        let _ = with_db(|pool| async move {
+            let mut tx = pool.begin().await?;
+            let now = current_unix_secs() as i64;
+
+            sqlx::query(
+                "UPDATE tasks \
+                 SET status = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?, summary = ? \
+                 WHERE task_id = ?",
+            )
+            .bind("failed")
+            .bind(now)
+            .bind(now)
+            .bind(&summary_owned)
+            .bind(&task_id_owned)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE task_logs \
+                 SET status = ? \
+                 WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+            )
+            .bind("failed")
+            .bind(&task_id_owned)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_owned)
+            .bind(now)
+            .bind("error")
+            .bind("task-dispatch-failed")
+            .bind("failed")
+            .bind(&summary_owned)
+            .bind(Option::<String>::None)
+            .bind(meta_str)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok::<(), sqlx::Error>(())
+        });
+        return;
+    }
+
+    for u in units {
+        let mut meta_for_unit = merged_meta.clone();
+        if let Value::Object(ref mut obj) = meta_for_unit {
+            obj.insert("unit".to_string(), Value::String(u.clone()));
+        }
+
+        update_task_state_with_unit(
+            task_id,
+            "failed",
+            &u,
+            "failed",
+            &summary,
+            "task-dispatch-failed",
+            "error",
+            meta_for_unit,
+        );
+    }
+}
+
 fn append_task_log(
     task_id: &str,
     level: &str,
@@ -9308,8 +9626,12 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
     };
 
     let now = SystemTime::now();
+    let max_age_secs = env::var("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(600);
     let threshold = now
-        .checked_sub(Duration::from_secs(600))
+        .checked_sub(Duration::from_secs(max_age_secs))
         .unwrap_or(UNIX_EPOCH);
 
     let mut latest: Option<(SystemTime, PathBuf)> = None;
@@ -9945,6 +10267,9 @@ mod tests {
             super::ENV_AUTO_UPDATE_LOG_DIR,
             log_dir.to_string_lossy().as_ref(),
         );
+        // Ensure that our synthetic JSONL file is considered recent enough for
+        // ingestion regardless of test runtime/environment clock skew.
+        set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
 
         let unit = "podman-auto-update.service";
         let task_id = create_manual_auto_update_task(unit, "req-auto-update-test", "/auto-update")
