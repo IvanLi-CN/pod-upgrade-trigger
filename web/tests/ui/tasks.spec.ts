@@ -276,4 +276,96 @@ test.describe('Tasks page (mock)', () => {
     expect(content).toContain('"task_id"')
     expect(content).toContain('"logs"')
   })
+
+  test('renders unknown task status and auto-update run without JSONL summary', async ({ page }) => {
+    const rows = await openTasksPage(page)
+
+    const unknownRow = rows
+      .filter({ hasText: 'mock unknown run (no summary)' })
+      .first()
+    await expect(unknownRow).toBeVisible()
+
+    const statusCell = unknownRow.locator('td').nth(1)
+    await expect(statusCell.getByText('Unknown')).toBeVisible()
+
+    await unknownRow.click()
+
+    await expect(page.getByText('任务详情', { exact: true })).toBeVisible()
+    await expect(page.getByText('Status unknown')).toBeVisible()
+
+    const timeline = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(timeline).toBeVisible()
+
+    await expect(timeline.getByText('auto-update-run')).toBeVisible()
+    await expect(timeline.getByText('no JSONL summary found')).toBeVisible()
+  })
+
+  test('highlights image-prune logs with best-effort semantics and command meta', async ({ page }) => {
+    const rows = await openTasksPage(page)
+
+    const pruneRow = rows
+      .filter({ hasText: 'webhook with image prune' })
+      .first()
+    await expect(pruneRow).toBeVisible()
+
+    await pruneRow.click()
+
+    const timeline = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(timeline).toBeVisible()
+
+    const pruneFailureCard = timeline
+      .locator('div')
+      .filter({ hasText: 'Image prune failed (best-effort clean-up)' })
+      .first()
+    await pruneFailureCard.scrollIntoViewIfNeeded()
+    await expect(pruneFailureCard).toBeVisible()
+    await expect(
+      pruneFailureCard.getByText('后台镜像清理（best-effort）'),
+    ).toBeVisible()
+
+    const commandToggle = pruneFailureCard.getByRole('button', {
+      name: '命令输出',
+    })
+    await expect(commandToggle).toBeVisible()
+    await commandToggle.click()
+
+    await expect(
+      pruneFailureCard.getByText('podman image prune -f'),
+    ).toBeVisible()
+    await expect(pruneFailureCard.getByText('exit=1')).toBeVisible()
+    await expect(
+      pruneFailureCard.getByText('mock image prune failure'),
+    ).toBeVisible()
+  })
+
+  test('groups auto-update warnings and shows warning badge count', async ({ page }) => {
+    const rows = await openTasksPage(page)
+
+    const autoUpdateRow = rows
+      .filter({ hasText: 'Auto-update run succeeded with warnings' })
+      .first()
+    await expect(autoUpdateRow).toBeVisible()
+
+    const statusCell = autoUpdateRow.locator('td').nth(1)
+    await expect(statusCell.getByText('2')).toBeVisible()
+
+    await autoUpdateRow.click()
+
+    const timeline = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(timeline).toBeVisible()
+
+    await expect(timeline.getByText('Auto-update warnings (2)')).toBeVisible()
+    await expect(
+      timeline.getByText('auto-update warning for podman-auto-update.service'),
+    ).toBeVisible()
+  })
 })

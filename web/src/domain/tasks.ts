@@ -5,6 +5,12 @@ export type TaskStatus =
   | 'failed'
   | 'cancelled'
   | 'skipped'
+  /**
+   * Terminal-but-ambiguous state used when the backend cannot reliably
+   * determine success vs failure, e.g. auto-update runs that completed
+   * without a JSONL summary.
+   */
+  | 'unknown'
 
 export type TaskKind =
   | 'manual'

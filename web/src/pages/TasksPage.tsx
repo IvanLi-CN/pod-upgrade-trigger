@@ -13,6 +13,7 @@ import type {
 import { isCommandMeta } from '../domain/tasks'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
+import { AutoUpdateWarningsBlock } from '../components/AutoUpdateWarningsBlock'
 
 type TaskCategory = 'all' | 'manual' | 'webhook' | 'automatic' | 'maintenance'
 
@@ -386,9 +387,18 @@ export default function TasksPage() {
         return 'badge-neutral'
       case 'skipped':
         return 'badge-ghost'
+      case 'unknown':
+        // Unknown is terminal but ambiguous; keep it visually distinct from
+        // success by using a warning/amber style.
+        return 'badge-warning'
       default:
         return 'badge-warning'
     }
+  }
+
+  const renderTaskStatusLabel = (status: TaskStatus) => {
+    if (status === 'unknown') return 'Unknown'
+    return status
   }
 
   const logStatusLabel = (log: TaskLogEntry) => {
@@ -611,6 +621,7 @@ export default function TasksPage() {
                 <option value="failed">failed</option>
                 <option value="cancelled">cancelled</option>
                 <option value="skipped">skipped</option>
+                <option value="unknown">unknown</option>
               </select>
             </label>
 
@@ -718,7 +729,7 @@ export default function TasksPage() {
                         <span
                           className={`badge badge-xs ${statusBadgeClass(task.status)}`}
                         >
-                          {task.status}
+                          {renderTaskStatusLabel(task.status)}
                         </span>
                         {task.has_warnings ? (
                           <span className="badge badge-warning badge-xs gap-1">
@@ -819,8 +830,13 @@ export default function TasksPage() {
                         <span
                           className={`badge badge-xs ${statusBadgeClass(drawerTask.status)}`}
                         >
-                          {drawerTask.status}
+                          {renderTaskStatusLabel(drawerTask.status)}
                         </span>
+                        {drawerTask.status === 'unknown' ? (
+                          <span className="text-[10px] text-warning">
+                            Status unknown
+                          </span>
+                        ) : null}
                         {drawerTask.has_warnings ? (
                           <span className="badge badge-warning badge-xs gap-1">
                             <Icon icon="mdi:alert-outline" className="text-[11px]" />
@@ -884,7 +900,7 @@ export default function TasksPage() {
                                 <span
                                   className={`badge badge-xs ${statusBadgeClass(unit.status)}`}
                                 >
-                                  {unit.status}
+                                  {renderTaskStatusLabel(unit.status)}
                                 </span>
                                 {unit.phase ? (
                                   <span className="badge badge-outline badge-xs">
@@ -926,160 +942,284 @@ export default function TasksPage() {
                           </p>
                         )
                       }
-                      return (
-                        <div className="space-y-1">
-                          {logs.map((log) => {
-                            const commandMeta = isCommandMeta(log.meta)
-                              ? (log.meta as CommandMeta)
-                              : buildMockCommandMetaFallback(log, mockEnabled)
 
-                            const combinedLines =
-                              commandMeta && (commandMeta.stdout || commandMeta.stderr)
-                                ? [
-                                    ...(commandMeta.stdout
-                                      ? commandMeta.stdout.split('\n').map((text) => ({
-                                          stream: 'stdout' as const,
-                                          text,
-                                        }))
-                                      : []),
-                                    ...(commandMeta.stderr
-                                      ? commandMeta.stderr.split('\n').map((text) => ({
-                                          stream: 'stderr' as const,
-                                          text,
-                                        }))
-                                      : []),
-                                  ].filter((entry) => entry.text.length > 0)
-                                : []
-
-                            return (
-                              <div
-                                key={log.id}
-                                className="flex flex-col gap-1 rounded border border-base-200 bg-base-100 px-2 py-1 text-[11px]"
-                              >
-                                <div className="flex flex-wrap items-center justify-between gap-2">
-                                  <div className="flex items-center gap-2">
-                                    <span className="font-mono text-[11px]">
-                                      {log.action}
-                                    </span>
-                                    <span
-                                      className={`badge badge-xs ${statusBadgeClass(
-                                        log.status,
-                                        log.level,
-                                      )}`}
-                                    >
-                                      {logStatusLabel(log)}
-                                    </span>
-                                    {log.unit ? (
-                                      <span className="badge badge-ghost badge-xs">
-                                        {log.unit}
-                                      </span>
-                                    ) : null}
-                                  </div>
-                                  <div className="flex items-center gap-2 text-[10px] text-base-content/60">
-                                    {commandMeta?.exit ? (
-                                      <span className="badge badge-outline badge-xs font-mono">
-                                        {commandMeta.exit}
-                                      </span>
-                                    ) : null}
-                                    <span>{formatTs(log.ts)}</span>
-                                  </div>
-                                </div>
-                                <p className="text-[11px] text-base-content/80">
-                                  {log.summary}
-                                </p>
-                                {commandMeta ? (
-                                  <div className="mt-1 border-t border-base-200 pt-1">
-                                    <button
-                                      type="button"
-                                      className="flex w-full items-center justify-between text-[11px] text-base-content/70"
-                                      onClick={() =>
-                                        setExpandedCommandLogs((prev) => ({
-                                          ...prev,
-                                          [log.id]: !prev[log.id],
-                                        }))
-                                      }
-                                    >
-                                      <span className="flex items-center gap-1">
-                                        <Icon
-                                          icon={
-                                            expandedCommandLogs[log.id]
-                                              ? 'mdi:chevron-down'
-                                              : 'mdi:chevron-right'
-                                          }
-                                          className="text-xs"
-                                        />
-                                        <span>命令输出</span>
-                                      </span>
-                                    </button>
-                                    {expandedCommandLogs[log.id] ? (
-                                      <div className="mt-1 space-y-1">
-                                        {commandMeta.command ? (
-                                          <div className="flex items-start gap-2">
-                                            <code className="flex-1 overflow-x-auto rounded bg-base-200 px-2 py-1 font-mono text-[11px]">
-                                              {commandMeta.command}
-                                            </code>
-                                            <button
-                                              type="button"
-                                              className="btn btn-ghost btn-xs"
-                                              onClick={() =>
-                                                handleCopyCommand(commandMeta.command)
-                                              }
-                                            >
-                                              <Icon
-                                                icon="mdi:content-copy"
-                                                className="text-base"
-                                              />
-                                            </button>
-                                          </div>
-                                        ) : null}
-                                        {combinedLines.length > 0 ? (
-                                          <div className="space-y-0.5">
-                                            <span className="text-[10px] uppercase tracking-wide text-base-content/60">
-                                              stdout / stderr
-                                            </span>
-                                            <div className="max-h-32 overflow-auto rounded bg-base-200 p-2 font-mono text-[11px]">
-                                              {combinedLines.length === 0 ? (
-                                                <span className="text-[10px] text-base-content/60">
-                                                  （无输出）
-                                                </span>
-                                              ) : (
-                                                <div className="space-y-0.5">
-                                                  {combinedLines.map((entry, index) => (
-                                                    <div
-                                                      key={`${log.id}-${entry.stream}-${index}`}
-                                                      className="flex items-baseline gap-2"
-                                                    >
-                                                      <span
-                                                        className={`badge badge-xs ${
-                                                          entry.stream === 'stderr'
-                                                            ? 'badge-error'
-                                                            : 'badge-neutral'
-                                                        }`}
-                                                      >
-                                                        {entry.stream === 'stderr'
-                                                          ? 'ERR'
-                                                          : 'OUT'}
-                                                      </span>
-                                                      <span className="text-[10px] text-base-content/60 tabular-nums">
-                                                        {formatTimeWithMs(log.ts)}
-                                                      </span>
-                                                      <span className="flex-1 whitespace-pre-wrap break-words">
-                                                        {entry.text}
-                                                      </span>
-                                                    </div>
-                                                  ))}
-                                                </div>
-                                              )}
-                                            </div>
-                                          </div>
-                                        ) : null}
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                ) : null}
-                              </div>
+                      const autoUpdateSummary = logs.find(
+                        (log) => log.action === 'auto-update-warnings',
+                      )
+                      const autoUpdateDetails = logs.filter(
+                        (log) => log.action === 'auto-update-warning',
+                      )
+                      const timelineLogs =
+                        autoUpdateSummary && autoUpdateDetails.length > 0
+                          ? logs.filter(
+                              (log) =>
+                                log.action !== 'auto-update-warnings' &&
+                                log.action !== 'auto-update-warning',
                             )
-                          })}
+                          : logs
+
+                      return (
+                        <div className="space-y-2">
+                          {autoUpdateSummary ? (
+                            <AutoUpdateWarningsBlock
+                              summary={autoUpdateSummary}
+                              details={autoUpdateDetails}
+                            />
+                          ) : null}
+                          <div className="space-y-1">
+                            {timelineLogs.map((log) => {
+                              const isTaskDispatchFailed =
+                                log.action === 'task-dispatch-failed'
+                              const isImagePrune = log.action === 'image-prune'
+                              const isAutoUpdateRun = log.action === 'auto-update-run'
+                              const isAutoUpdateRunUnknown =
+                                isAutoUpdateRun && log.status === 'unknown'
+                              const hasNoSummaryHint =
+                                isAutoUpdateRun &&
+                                typeof log.summary === 'string' &&
+                                log.summary.includes('no JSONL summary found')
+
+                              const commandMeta = isCommandMeta(log.meta)
+                                ? (log.meta as CommandMeta)
+                                : buildMockCommandMetaFallback(log, mockEnabled)
+
+                              const combinedLines =
+                                commandMeta && (commandMeta.stdout || commandMeta.stderr)
+                                  ? [
+                                      ...(commandMeta.stdout
+                                        ? commandMeta.stdout.split('\n').map((text) => ({
+                                            stream: 'stdout' as const,
+                                            text,
+                                          }))
+                                        : []),
+                                      ...(commandMeta.stderr
+                                        ? commandMeta.stderr.split('\n').map((text) => ({
+                                            stream: 'stderr' as const,
+                                            text,
+                                          }))
+                                        : []),
+                                    ].filter((entry) => entry.text.length > 0)
+                                  : []
+
+                              const dispatchMeta =
+                                isTaskDispatchFailed &&
+                                log.meta &&
+                                typeof log.meta === 'object'
+                                  ? (log.meta as { [key: string]: unknown })
+                                  : null
+                              const dispatchSource =
+                                dispatchMeta && typeof dispatchMeta.source === 'string'
+                                  ? dispatchMeta.source
+                                  : null
+                              const dispatchKind =
+                                dispatchMeta && typeof dispatchMeta.kind === 'string'
+                                  ? dispatchMeta.kind
+                                  : null
+                              const dispatchError =
+                                dispatchMeta && typeof dispatchMeta.error === 'string'
+                                  ? dispatchMeta.error
+                                  : null
+
+                              const cardVariantClass = isTaskDispatchFailed
+                                ? 'border-error/70 bg-error/5'
+                                : isImagePrune
+                                ? log.level === 'warning'
+                                  ? 'border-warning/70 bg-warning/5'
+                                  : 'border-info/60 bg-info/5'
+                                : isAutoUpdateRunUnknown
+                                ? 'border-warning/70 bg-warning/5'
+                                : ''
+
+                              return (
+                                <div
+                                  key={log.id}
+                                  className={`flex flex-col gap-1 rounded border border-base-200 bg-base-100 px-2 py-1 text-[11px] ${cardVariantClass}`}
+                                >
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2">
+                                      <span className="flex items-center gap-1 font-mono text-[11px]">
+                                        {isTaskDispatchFailed ? (
+                                          <Icon
+                                            icon="mdi:alert-octagon-outline"
+                                            className="text-error text-sm"
+                                          />
+                                        ) : null}
+                                        {isImagePrune ? (
+                                          <Icon
+                                            icon="mdi:trash-can-outline"
+                                            className={
+                                              log.level === 'warning'
+                                                ? 'text-warning text-sm'
+                                                : 'text-info text-sm'
+                                            }
+                                          />
+                                        ) : null}
+                                        {isAutoUpdateRunUnknown ? (
+                                          <Icon
+                                            icon="mdi:help-circle-outline"
+                                            className="text-warning text-sm"
+                                          />
+                                        ) : null}
+                                        <span>{log.action}</span>
+                                      </span>
+                                      <span
+                                        className={`badge badge-xs ${statusBadgeClass(
+                                          log.status,
+                                          log.level,
+                                        )}`}
+                                      >
+                                        {logStatusLabel(log)}
+                                      </span>
+                                      {log.unit ? (
+                                        <span className="badge badge-ghost badge-xs">
+                                          {log.unit}
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <div className="flex items-center gap-2 text-[10px] text-base-content/60">
+                                      {commandMeta?.exit ? (
+                                        <span className="badge badge-outline badge-xs font-mono">
+                                          {commandMeta.exit}
+                                        </span>
+                                      ) : null}
+                                      <span>{formatTs(log.ts)}</span>
+                                    </div>
+                                  </div>
+                                  <p className="text-[11px] text-base-content/80">
+                                    {log.summary}
+                                  </p>
+                                  {hasNoSummaryHint ? (
+                                    <p className="text-[10px] text-warning">
+                                      no JSONL summary found
+                                    </p>
+                                  ) : null}
+                                  {isTaskDispatchFailed ? (
+                                    <div className="space-y-0.5">
+                                      <p className="text-[10px] text-error">
+                                        任务派发失败（Task dispatch failed，任务未进入业务执行阶段）
+                                      </p>
+                                      {dispatchSource || dispatchKind || dispatchError ? (
+                                        <div className="text-[10px] text-base-content/70">
+                                          {dispatchSource ? (
+                                            <span className="mr-2">
+                                              source · {dispatchSource}
+                                            </span>
+                                          ) : null}
+                                          {dispatchKind ? (
+                                            <span className="mr-2">
+                                              kind · {dispatchKind}
+                                            </span>
+                                          ) : null}
+                                          {dispatchError ? (
+                                            <div className="mt-0.5 break-words">
+                                              error · {dispatchError}
+                                            </div>
+                                          ) : null}
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  ) : null}
+                                  {isImagePrune ? (
+                                    <p className="text-[10px] text-base-content/70">
+                                      后台镜像清理（best-effort），失败仅作为告警，不会改变任务整体结果。
+                                    </p>
+                                  ) : null}
+                                  {commandMeta ? (
+                                    <div className="mt-1 border-t border-base-200 pt-1">
+                                      <button
+                                        type="button"
+                                        className="flex w-full items-center justify-between text-[11px] text-base-content/70"
+                                        onClick={() =>
+                                          setExpandedCommandLogs((prev) => ({
+                                            ...prev,
+                                            [log.id]: !prev[log.id],
+                                          }))
+                                        }
+                                      >
+                                        <span className="flex items-center gap-1">
+                                          <Icon
+                                            icon={
+                                              expandedCommandLogs[log.id]
+                                                ? 'mdi:chevron-down'
+                                                : 'mdi:chevron-right'
+                                            }
+                                            className="text-xs"
+                                          />
+                                          <span>命令输出</span>
+                                        </span>
+                                      </button>
+                                      {expandedCommandLogs[log.id] ? (
+                                        <div className="mt-1 space-y-1">
+                                          {commandMeta.command ? (
+                                            <div className="flex items-start gap-2">
+                                              <code className="flex-1 overflow-x-auto rounded bg-base-200 px-2 py-1 font-mono text-[11px]">
+                                                {commandMeta.command}
+                                              </code>
+                                              <button
+                                                type="button"
+                                                className="btn btn-ghost btn-xs"
+                                                onClick={() =>
+                                                  handleCopyCommand(commandMeta.command)
+                                                }
+                                              >
+                                                <Icon
+                                                  icon="mdi:content-copy"
+                                                  className="text-base"
+                                                />
+                                              </button>
+                                            </div>
+                                          ) : null}
+                                          {combinedLines.length > 0 ? (
+                                            <div className="space-y-0.5">
+                                              <span className="text-[10px] uppercase tracking-wide text-base-content/60">
+                                                stdout / stderr
+                                              </span>
+                                              <div className="max-h-32 overflow-auto rounded bg-base-200 p-2 font-mono text-[11px]">
+                                                {combinedLines.length === 0 ? (
+                                                  <span className="text-[10px] text-base-content/60">
+                                                    （无输出）
+                                                  </span>
+                                                ) : (
+                                                  <div className="space-y-0.5">
+                                                    {combinedLines.map(
+                                                      (entry, index) => (
+                                                        <div
+                                                          key={`${log.id}-${entry.stream}-${index}`}
+                                                          className="flex items-baseline gap-2"
+                                                        >
+                                                          <span
+                                                            className={`badge badge-xs ${
+                                                              entry.stream === 'stderr'
+                                                                ? 'badge-error'
+                                                                : 'badge-neutral'
+                                                            }`}
+                                                          >
+                                                            {entry.stream === 'stderr'
+                                                              ? 'ERR'
+                                                              : 'OUT'}
+                                                          </span>
+                                                          <span className="text-[10px] text-base-content/60 tabular-nums">
+                                                            {formatTimeWithMs(log.ts)}
+                                                          </span>
+                                                          <span className="flex-1 whitespace-pre-wrap break-words">
+                                                            {entry.text}
+                                                          </span>
+                                                        </div>
+                                                      ),
+                                                    )}
+                                                  </div>
+                                                )}
+                                              </div>
+                                            </div>
+                                          ) : null}
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  ) : null}
+                                </div>
+                              )
+                            })}
+                          </div>
                         </div>
                       )
                     })()}
