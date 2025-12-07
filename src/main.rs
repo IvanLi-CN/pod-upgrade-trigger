@@ -40,7 +40,13 @@ const GITHUB_IMAGE_LIMIT_WINDOW: u64 = 3_600; // 1 hour
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MANUAL_UNIT: &str = "podman-auto-update.service";
 const AUTO_UPDATE_RUN_POLL_INTERVAL_MS: u64 = 1_000;
-const AUTO_UPDATE_RUN_MAX_SECS: u64 = 1_800; // 30 minutes hard cap for a single auto-update run
+
+// Hard cap for a single auto-update run. In tests we shorten this to keep
+// timeout-based scenarios fast and deterministic.
+#[cfg(not(test))]
+const AUTO_UPDATE_RUN_MAX_SECS: u64 = 1_800; // 30 minutes in production
+#[cfg(test)]
+const AUTO_UPDATE_RUN_MAX_SECS: u64 = 2;
 const DEFAULT_REGISTRY_HOST: &str = "ghcr.io";
 const PULL_RETRY_ATTEMPTS: u8 = 3;
 const PULL_RETRY_DELAY_SECS: u64 = 5;
@@ -9251,6 +9257,10 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
     let log_dir_opt = auto_update_log_dir();
     let mut baseline_files: HashSet<String> = HashSet::new();
     if let Some(ref dir) = log_dir_opt {
+        // In production we snapshot existing JSONL files to avoid mixing logs
+        // from previous runs. In tests we skip this so that pre-seeded JSONL
+        // files can be picked up deterministically without background threads.
+        #[cfg(not(test))]
         if let Ok(read_dir) = fs::read_dir(dir) {
             for entry in read_dir.flatten() {
                 let path = entry.path();
@@ -9523,34 +9533,30 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
         return Ok(());
     }
 
-    // No summary event observed; fall back to a generic success/failure based on timeout.
+    // No summary event observed; fall back to a conservative terminal state based on timeout.
     let timed_out = start_instant.elapsed() >= Duration::from_secs(AUTO_UPDATE_RUN_MAX_SECS);
-    let (task_status, level, summary_text) = if timed_out {
-        (
-            "failed",
-            "error",
-            if dry_run {
-                format!(
-                    "podman auto-update dry-run timed out after {} seconds; check podman auto-update logs",
-                    AUTO_UPDATE_RUN_MAX_SECS
-                )
-            } else {
-                format!(
-                    "podman auto-update run timed out after {} seconds; check podman auto-update logs",
-                    AUTO_UPDATE_RUN_MAX_SECS
-                )
-            },
-        )
+    let (task_status, unit_status, level, summary_text) = if timed_out {
+        let summary = if dry_run {
+            format!(
+                "podman auto-update dry-run timed out after {} seconds; check podman auto-update logs",
+                AUTO_UPDATE_RUN_MAX_SECS
+            )
+        } else {
+            format!(
+                "podman auto-update run timed out after {} seconds; check podman auto-update logs",
+                AUTO_UPDATE_RUN_MAX_SECS
+            )
+        };
+        ("failed", "failed", "error", summary)
     } else {
-        (
-            "succeeded",
-            "info",
-            if dry_run {
-                "podman auto-update dry-run completed (no JSONL summary found)".to_string()
-            } else {
-                "podman auto-update run completed (no JSONL summary found)".to_string()
-            },
-        )
+        let summary = if dry_run {
+            "podman auto-update dry-run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)"
+                .to_string()
+        } else {
+            "podman auto-update run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)"
+                .to_string()
+        };
+        ("unknown", "unknown", "warning", summary)
     };
 
     let meta = json!({
@@ -9564,7 +9570,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
         task_id,
         task_status,
         unit,
-        task_status,
+        unit_status,
         &summary_text,
         "auto-update-run",
         level,
@@ -10077,7 +10083,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::sync::Once;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     fn init_test_db() {
         static INIT: Once = Once::new();
@@ -10125,6 +10131,14 @@ mod tests {
         unsafe {
             env::remove_var(key);
         }
+    }
+
+    fn temp_log_dir() -> (TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let log_dir_str = log_dir.to_string_lossy().into_owned();
+        (dir, log_dir_str)
     }
 
     #[test]
@@ -10384,6 +10398,285 @@ mod tests {
             events_for_task, 1,
             "expected exactly one auto-update-warning event for the task"
         );
+    }
+
+    #[test]
+    fn auto_update_run_task_terminal_states_and_warnings() {
+        init_test_db_with_systemctl_mock();
+
+        // 1. Summary present, failed == 0 -> succeeded + warnings ingested.
+        {
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-success",
+                "/auto-update-run-success",
+                Some("ops"),
+                Some("test-success"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            let jsonl_path = Path::new(&log_dir).join("2025-12-05T070437513Z.jsonl");
+            {
+                let mut file = File::create(&jsonl_path).unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"dry-run-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: dry-run failed: EOF"}}"#
+                )
+                .unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"summary","summary":{{"counts":{{"total":2,"succeeded":2,"failed":0}}}}}}"#
+                )
+                .unwrap();
+            }
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "succeeded");
+            assert!(
+                detail
+                    .task
+                    .summary
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("total=2, updated=2, failed=0"),
+                "summary should include counts, got={:?}",
+                detail.task.summary
+            );
+            assert!(
+                detail
+                    .logs
+                    .iter()
+                    .any(|log| log.action == "auto-update-warnings"),
+                "expected auto-update-warnings summary log entry"
+            );
+            assert!(
+                detail
+                    .logs
+                    .iter()
+                    .any(|log| log.action == "auto-update-warning"),
+                "expected at least one auto-update-warning log entry"
+            );
+        }
+
+        // 2. Summary present, failed > 0 -> failed + error-level warning logs.
+        {
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-failed",
+                "/auto-update-run-failed",
+                Some("ops"),
+                Some("test-failed"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            let jsonl_path = Path::new(&log_dir).join("2025-12-05T070437513Z.jsonl");
+            {
+                let mut file = File::create(&jsonl_path).unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"auto-update-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: update failed: boom"}}"#
+                )
+                .unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"summary","summary":{{"counts":{{"total":2,"succeeded":0,"failed":2}}}}}}"#
+                )
+                .unwrap();
+            }
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "failed");
+            assert!(
+                detail
+                    .task
+                    .summary
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("failed=2"),
+                "summary should include failed>0, got={:?}",
+                detail.task.summary
+            );
+
+            let warning_logs: Vec<_> = detail
+                .logs
+                .iter()
+                .filter(|log| log.action == "auto-update-warning")
+                .collect();
+            assert!(
+                !warning_logs.is_empty(),
+                "expected at least one auto-update-warning log entry"
+            );
+            assert!(
+                warning_logs.iter().any(|log| log.level == "error"),
+                "expected at least one auto-update-warning with level=error for auto-update-error events"
+            );
+        }
+
+        // 3. No summary + timeout -> failed with timeout reason.
+        {
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-timeout",
+                "/auto-update-run-timeout",
+                Some("ops"),
+                Some("test-timeout"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "failed");
+            let summary = detail
+                .task
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                summary.contains("timed out after"),
+                "timeout summary should mention timeout, got={summary}"
+            );
+
+            let reason = detail
+                .logs
+                .iter()
+                .rev()
+                .find(|log| log.action == "auto-update-run")
+                .and_then(|log| log.meta.as_ref())
+                .and_then(|meta| meta.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(reason, "timeout");
+        }
+
+        // 4. No summary + no timeout -> unknown with warning-level log.
+        {
+            // Point log dir to a non-existent directory so that the polling loop
+            // bails out quickly without waiting for AUTO_UPDATE_RUN_MAX_SECS.
+            let dir = tempfile::tempdir().unwrap();
+            let missing_log_dir = dir.path().join("missing-logs");
+            set_env(
+                super::ENV_AUTO_UPDATE_LOG_DIR,
+                missing_log_dir.to_string_lossy().as_ref(),
+            );
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-no-summary",
+                "/auto-update-run-no-summary",
+                Some("ops"),
+                Some("test-no-summary"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "unknown");
+
+            let final_log = detail
+                .logs
+                .iter()
+                .rev()
+                .find(|log| log.action == "auto-update-run")
+                .expect("expected final auto-update-run log");
+            assert_eq!(final_log.level, "warning");
+            assert!(
+                final_log.summary.contains("no JSONL summary found"),
+                "summary should mention missing JSONL summary, got={}",
+                final_log.summary
+            );
+            let reason = final_log
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert_eq!(reason, "no-summary");
+        }
+
+        // 5. Ingest warnings honours PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS.
+        {
+            init_test_db();
+
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_task(
+                unit,
+                "req-auto-update-max-age",
+                "/auto-update",
+            )
+            .expect("manual auto-update task created");
+
+            let jsonl_path = Path::new(&log_dir).join("2025-12-05T000000000Z.jsonl");
+            {
+                let mut file = File::create(&jsonl_path).unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"auto-update-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: update failed: boom"}}"#
+                )
+                .unwrap();
+            }
+
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "0");
+
+            ingest_auto_update_warnings(&task_id, unit);
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert!(
+                !detail.logs.iter().any(|log| {
+                    log.action == "auto-update-warning" || log.action == "auto-update-warnings"
+                }),
+                "no warnings should be ingested when JSONL is outside max-age window"
+            );
+        }
     }
 
     #[test]
