@@ -281,7 +281,10 @@ test.describe('Tasks page (mock)', () => {
     const rows = await openTasksPage(page)
 
     const unknownRow = rows
-      .filter({ hasText: 'mock unknown run (no summary)' })
+      .filter({
+        hasText:
+          'podman auto-update run completed (no JSONL summary found',
+      })
       .first()
     await expect(unknownRow).toBeVisible()
 
@@ -300,7 +303,9 @@ test.describe('Tasks page (mock)', () => {
     await expect(timeline).toBeVisible()
 
     await expect(timeline.getByText('auto-update-run')).toBeVisible()
-    await expect(timeline.getByText('no JSONL summary found')).toBeVisible()
+    await expect(
+      timeline.getByText('no JSONL summary found', { exact: true }),
+    ).toBeVisible()
   })
 
   test('highlights image-prune logs with best-effort semantics and command meta', async ({ page }) => {
@@ -320,18 +325,21 @@ test.describe('Tasks page (mock)', () => {
     await expect(timeline).toBeVisible()
 
     const pruneFailureCard = timeline
-      .locator('div')
-      .filter({ hasText: 'Image prune failed (best-effort clean-up)' })
+      .locator(
+        'div:has(> p:has-text("Image prune failed (best-effort clean-up)"))',
+      )
       .first()
     await pruneFailureCard.scrollIntoViewIfNeeded()
     await expect(pruneFailureCard).toBeVisible()
     await expect(
-      pruneFailureCard.getByText('后台镜像清理（best-effort）'),
+      timeline.getByText('后台镜像清理（best-effort）').first(),
     ).toBeVisible()
 
-    const commandToggle = pruneFailureCard.getByRole('button', {
-      name: '命令输出',
-    })
+    const commandToggle = pruneFailureCard
+      .getByRole('button', {
+        name: '命令输出',
+      })
+      .first()
     await expect(commandToggle).toBeVisible()
     await commandToggle.click()
 
@@ -365,7 +373,9 @@ test.describe('Tasks page (mock)', () => {
 
     await expect(timeline.getByText('Auto-update warnings (2)')).toBeVisible()
     await expect(
-      timeline.getByText('auto-update warning for podman-auto-update.service'),
+      timeline
+        .getByText('auto-update warning for podman-auto-update.service')
+        .first(),
     ).toBeVisible()
   })
 })
