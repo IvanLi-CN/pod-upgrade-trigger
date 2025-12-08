@@ -95,4 +95,29 @@ test.describe('Manual triggers', () => {
     const filterValue = await page.getByLabel('Request ID').inputValue()
     expect(filterValue.trim()).toEqual(requestId)
   })
+
+  test('shows Manual token warning when required and hides it after input; 401 surfaces a specific toast', async ({ page }) => {
+    await page.goto('/manual?mock=enabled&mock=profile=manual-token')
+
+    const warning = page.getByText('当前环境已配置 Manual token', { exact: false })
+    await expect(warning).toBeVisible()
+
+    const tokenInput = page.getByPlaceholder('Manual token')
+    await tokenInput.fill('wrong-secret')
+    await expect(warning).toHaveCount(0)
+
+    await page.route('**/api/manual/trigger', async (route) => {
+      await route.fulfill({
+        status: 401,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'manual token invalid' }),
+      })
+    })
+
+    await page.getByRole('button', { name: '触发全部' }).click()
+
+    await expect(
+      page.getByText('Manual token 缺失或错误', { exact: false }),
+    ).toBeVisible()
+  })
 })

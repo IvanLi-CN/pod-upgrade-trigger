@@ -517,6 +517,23 @@ const handlers = [
     await withLatency()
 
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+
+    const data = runtime.cloneData()
+    const manualTokenConfigured =
+      data.settings.env.PODUP_MANUAL_TOKEN_configured === true
+    if (manualTokenConfigured) {
+      const token =
+        typeof body.token === 'string' && body.token.trim().length > 0
+          ? body.token.trim()
+          : ''
+      const expected = 'mock-manual-token'
+      if (token !== expected) {
+        return HttpResponse.json(
+          { error: 'manual token invalid', reason: 'token' },
+          { status: 401, headers: JSON_HEADERS },
+        )
+      }
+    }
     const services = runtime.cloneData().services
     const dryRun = Boolean(body.dry_run)
 
@@ -581,9 +598,26 @@ const handlers = [
     if (failure) return failure
     await withLatency()
 
-    const services = runtime.cloneData().services
+    const data = runtime.cloneData()
+    const services = data.services
     const service = services.find((s) => s.slug === params.slug)
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+
+    const manualTokenConfigured =
+      data.settings.env.PODUP_MANUAL_TOKEN_configured === true
+    if (manualTokenConfigured) {
+      const token =
+        typeof body.token === 'string' && body.token.trim().length > 0
+          ? body.token.trim()
+          : ''
+      const expected = 'mock-manual-token'
+      if (token !== expected) {
+        return HttpResponse.json(
+          { error: 'manual token invalid', reason: 'token' },
+          { status: 401, headers: JSON_HEADERS },
+        )
+      }
+    }
 
     if (!service) {
       return HttpResponse.json({ error: 'service not found' }, { status: 404 })

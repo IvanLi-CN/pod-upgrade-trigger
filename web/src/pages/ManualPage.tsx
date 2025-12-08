@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
+import { useToken } from '../hooks/useToken'
 import { useToast } from '../components/Toast'
 import type {
   Task,
@@ -64,7 +65,8 @@ type ManualHistoryEntry = {
 }
 
 export default function ManualPage() {
-  const { getJson, postJson } = useApi()
+  const { getJson, postJson, manualTokenConfigured } = useApi()
+  const { token } = useToken()
   const { pushToast } = useToast()
   const [services, setServices] = useState<ManualService[]>([])
   const [history, setHistory] = useState<ManualHistoryEntry[]>([])
@@ -74,6 +76,9 @@ export default function ManualPage() {
   const [allCaller, setAllCaller] = useState('')
   const [allReason, setAllReason] = useState('')
   const navigate = useNavigate()
+
+  const manualTokenMissing =
+    manualTokenConfigured && (!token || token.trim().length === 0)
 
   useEffect(() => {
     let cancelled = false
@@ -254,6 +259,17 @@ export default function ManualPage() {
 
   return (
     <div className="space-y-6">
+      {manualTokenMissing && (
+        <section className="alert alert-warning shadow-sm text-xs leading-relaxed">
+          <div>
+            <span className="font-semibold">Manual token 未配置</span>
+          </div>
+          <div>
+            当前环境已配置 Manual token。使用手动触发和 auto-update 之前，请先在右上角输入正确的{' '}
+            <span className="font-mono">Manual token</span>，否则 Manual API 请求会被拒绝（HTTP 401）。
+          </div>
+        </section>
+      )}
       <section className="card bg-base-100 shadow">
         <form className="card-body gap-4" onSubmit={handleTriggerAll}>
           <div className="flex items-center justify-between gap-4">

@@ -64,6 +64,7 @@ export default function SettingsPage() {
   const systemd = settings?.systemd
   const forward = settings?.forward_auth
   const tasks = settings?.tasks
+  const manualTokenConfigured = settings?.env.PODUP_MANUAL_TOKEN_configured === true
 
   return (
     <div className="space-y-6">
@@ -105,6 +106,11 @@ export default function SettingsPage() {
               </tbody>
             </table>
           </div>
+          {manualTokenConfigured && (
+            <p className="mt-2 text-xs text-warning">
+              Manual API 受 Manual token 保护，请在控制台右上角输入该 token 后再使用 Manual 页。
+            </p>
+          )}
         </div>
       </section>
 
