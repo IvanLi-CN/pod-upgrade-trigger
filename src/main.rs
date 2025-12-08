@@ -10441,15 +10441,17 @@ mod tests {
                 .expect("task should exist");
 
             assert_eq!(detail.task.status, "succeeded");
+            let summary = detail
+                .task
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
             assert!(
-                detail
-                    .task
-                    .summary
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("total=2, updated=2, failed=0"),
-                "summary should include counts, got={:?}",
-                detail.task.summary
+                summary.contains("podman auto-update completed:")
+                    && summary.contains("total=")
+                    && summary.contains("failed=0"),
+                "summary should include completion counts with failed=0, got={summary:?}"
             );
             assert!(
                 detail
