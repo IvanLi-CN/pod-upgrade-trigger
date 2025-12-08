@@ -158,6 +158,55 @@ test.describe('Tasks page (mock)', () => {
     await resetMockData(page)
   })
 
+  test('shows scheduler-triggered tasks with correct source, summary and timeline', async ({
+    page,
+  }) => {
+    const rows = await openTasksPage(page)
+
+    const schedulerRow = rows
+      .filter({
+        hasText: 'Auto-update in progress for podman-auto-update.service',
+      })
+      .first()
+    await expect(schedulerRow).toBeVisible()
+
+    const cells = schedulerRow.locator('td')
+
+    await expect(cells.nth(0).getByText('Scheduler')).toBeVisible()
+    await expect(cells.nth(1).getByText('running')).toBeVisible()
+    await expect(cells.nth(3)).toContainText('scheduler')
+    await expect(
+      cells.nth(6).getByText('Auto-update in progress for podman-auto-update.service'),
+    ).toBeVisible()
+
+    await schedulerRow.click()
+
+    await expect(page.getByText('任务详情', { exact: true })).toBeVisible()
+    await expect(page.getByText('Auto-update in progress for podman-auto-update.service')).toBeVisible()
+
+    await expect(page.getByText('来源 · scheduler')).toBeVisible()
+
+    const unitsSection = page
+      .locator('section')
+      .filter({ hasText: '单元状态' })
+      .first()
+    await expect(
+      unitsSection.getByText('podman-auto-update.service', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      unitsSection.getByText('Checking images and applying updates'),
+    ).toBeVisible()
+
+    const timeline = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(timeline).toBeVisible()
+
+    await expect(timeline.getByText('Scheduler iteration #84 started')).toBeVisible()
+    await expect(timeline.getByText('Scanning auto-update units')).toBeVisible()
+  })
+
   test('supports force-stopping a running task', async ({ page }) => {
     const rows = await openTasksPage(page)
 
