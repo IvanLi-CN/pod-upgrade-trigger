@@ -55,13 +55,12 @@
 ### 3.1 GitHub Release 作为唯一发布载体
 
 - CI 要求：
-  - 每次 Release 时，为 Linux 生产环境构建单一二进制或压缩包：
-    - 建议目标平台：`x86_64-unknown-linux-gnu` 或使用 `musl` 静态链接（降低依赖风险）。
+  - 每次 Release 时，为 Linux 生产环境构建单一二进制：
+    - 当前 M2 实现的目标平台：`x86_64-unknown-linux-gnu`（Linux amd64，glibc）。
   - 将构建产物作为 Release 附件上传：
-    - 文件命名建议（示例）：
-      - `pod-upgrade-trigger-x86_64-unknown-linux-gnu`
-      - 或 `pod-upgrade-trigger-x86_64-unknown-linux-gnu.tar.gz`
-    - 附带 `SHA256` 校验文件（可选需求，视安全策略而定）。
+    - 当前 M2 实现的附件列表固定为：
+      - `pod-upgrade-trigger-x86_64-unknown-linux-gnu`（可执行二进制）
+      - `pod-upgrade-trigger-x86_64-unknown-linux-gnu.sha256`（对应的 SHA256 校验文件）
   - Release 标签与版本号：
     - 使用 SemVer（如 `v1.2.3`）。
     - 可视需求维护一个 `latest` tag 或通过 GitHub API 获取“最新稳定版本”。
@@ -78,7 +77,7 @@
 2. **从 Release 下载产物**：
    - 使用 `curl` / `wget` 下载对应附件到临时路径：
      - 如：`~/.local/bin/pod-upgrade-trigger.new`。
-   - 如配置了 `SHA256` 校验文件，下载后进行校验。
+   - 使用 Release 附带的 `.sha256` 校验文件，在下载目录中完成校验。
 3. **原子替换现有二进制**：
    - 确保临时文件 `chmod +x`。
    - 使用 `mv` 将 `*.new` 替换到最终路径：
@@ -150,17 +149,18 @@
 ### M2：CI 产物与 Release 规范化
 
 - 内容：
-  - 在 CI 中增加 Linux 生产环境二进制构建步骤。
-  - 将构建产物上传至 GitHub Release：
-    - 制定产物命名规则；
-    - 如需，附带 `SHA256` 校验文件。
+  - 在 CI 中增加面向 Release 事件的 Linux 生产环境二进制构建 job（`release-binaries`）。
+  - 目标平台固定为 `x86_64-unknown-linux-gnu`，仅构建单一可执行文件。
+  - 将构建产物作为附件上传至对应 GitHub Release，附件名称固定为：
+    - `pod-upgrade-trigger-x86_64-unknown-linux-gnu`
+    - `pod-upgrade-trigger-x86_64-unknown-linux-gnu.sha256`
   - 更新 `README` / docs，说明 Release 附件用法。
 - 验证：
-  - 能够在任意新环境中，仅通过：
-    - 下载 Release 附件；
-    - 放置到 `~/.local/bin`；
-    - 配置 systemd；
-    - 即完成部署。
+  - 能够在任意新环境中，仅通过如下步骤完成部署：
+    - 从目标 Release 下载上述两个附件；
+    - 在下载目录中执行 `sha256sum -c pod-upgrade-trigger-x86_64-unknown-linux-gnu.sha256` 校验通过；
+    - 将二进制移动到 `~/.local/bin/pod-upgrade-trigger`，执行 `chmod +x ~/.local/bin/pod-upgrade-trigger`；
+    - 按 M1 配置并启用 `systemctl --user enable --now pod-upgrade-trigger-http.service`。
 
 ### M3：更新脚本实现与手动更新流程
 
