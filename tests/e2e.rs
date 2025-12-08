@@ -246,7 +246,8 @@ async fn scenario_webhook_image_prune_success() -> AnyResult<()> {
             .body(payload.clone()),
     )?;
     assert_eq!(
-        response.status, 202,
+        response.status,
+        202,
         "github webhook with prune-ok delivery should be accepted: {}",
         response.body_text()
     );
@@ -289,10 +290,7 @@ async fn scenario_webhook_image_prune_success() -> AnyResult<()> {
         .cloned()
         .expect("expected image-prune log entry with status=succeeded for webhook prune success");
 
-    let meta = prune_log
-        .get("meta")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let meta = prune_log.get("meta").cloned().unwrap_or_else(|| json!({}));
     assert_eq!(
         meta.get("type").and_then(|v| v.as_str()),
         Some("command"),
@@ -323,7 +321,8 @@ async fn scenario_webhook_image_prune_failure() -> AnyResult<()> {
         cmd.env("MOCK_PODMAN_PRUNE_FAIL", "1");
     })?;
     assert_eq!(
-        response.status, 202,
+        response.status,
+        202,
         "github webhook with failing prune should still be accepted: {}",
         response.body_text()
     );
@@ -373,10 +372,7 @@ async fn scenario_webhook_image_prune_failure() -> AnyResult<()> {
         "image-prune log level should be 'warning' when prune command fails"
     );
 
-    let meta = prune_log
-        .get("meta")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let meta = prune_log.get("meta").cloned().unwrap_or_else(|| json!({}));
     let exit = meta.get("exit").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         !exit.is_empty(),
@@ -412,7 +408,8 @@ async fn scenario_github_dispatch_failure() -> AnyResult<()> {
         cmd.env("MOCK_SYSTEMD_RUN_FAIL", mock_unit);
     })?;
     assert_eq!(
-        response.status, 500,
+        response.status,
+        500,
         "github dispatch failure should return 500 but got {} ({})",
         response.status,
         response.body_text()
@@ -451,8 +448,10 @@ async fn scenario_github_dispatch_failure() -> AnyResult<()> {
     assert_eq!(body["status"], Value::from("failed"));
     let logs = body["logs"].as_array().cloned().unwrap_or_default();
     assert!(
-        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
-            && entry.get("status") == Some(&Value::from("failed"))),
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
         "expected at least one task-dispatch-failed log entry with status=failed for github dispatch failure"
     );
 
@@ -882,14 +881,12 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
             .header("content-type", "application/json")
             .body(trigger_body.to_string().into_bytes()),
         |cmd| {
-            cmd.env(
-                "PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS",
-                "manual-trigger",
-            );
+            cmd.env("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS", "manual-trigger");
         },
     )?;
     assert_eq!(
-        trigger.status, 500,
+        trigger.status,
+        500,
         "manual trigger dispatch failure should return 500 but got {} ({})",
         trigger.status,
         trigger.body_text()
@@ -911,8 +908,10 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
     assert_eq!(body["status"], Value::from("failed"));
     let logs = body["logs"].as_array().cloned().unwrap_or_default();
     assert!(
-        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
-            && entry.get("status") == Some(&Value::from("failed"))),
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
         "manual trigger dispatch failure should record task-dispatch-failed log entry"
     );
 
@@ -930,14 +929,12 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
             .header("content-type", "application/json")
             .body(service_body.to_string().into_bytes()),
         |cmd| {
-            cmd.env(
-                "PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS",
-                "manual-service",
-            );
+            cmd.env("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS", "manual-service");
         },
     )?;
     assert_eq!(
-        service.status, 500,
+        service.status,
+        500,
         "manual service dispatch failure should return 500 but got {} ({})",
         service.status,
         service.body_text()
@@ -959,8 +956,10 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
     assert_eq!(body["status"], Value::from("failed"));
     let logs = body["logs"].as_array().cloned().unwrap_or_default();
     assert!(
-        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
-            && entry.get("status") == Some(&Value::from("failed"))),
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
         "manual service dispatch failure should record task-dispatch-failed log entry"
     );
 
@@ -984,30 +983,29 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
         },
     )?;
     assert_eq!(
-        run.status, 500,
+        run.status,
+        500,
         "manual auto-update run dispatch failure should return 500 but got {} ({})",
         run.status,
         run.body_text()
     );
     let run_json = run.json_body()?;
-    let run_task_id = run_json["task_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let run_task_id = run_json["task_id"].as_str().unwrap_or_default().to_string();
     assert!(
         !run_task_id.is_empty(),
         "manual auto-update run dispatch failure must include task_id"
     );
 
-    let run_detail =
-        env.send_request(HttpRequest::get(&format!("/api/tasks/{run_task_id}")))?;
+    let run_detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{run_task_id}")))?;
     assert_eq!(run_detail.status, 200);
     let body = run_detail.json_body()?;
     assert_eq!(body["status"], Value::from("failed"));
     let logs = body["logs"].as_array().cloned().unwrap_or_default();
     assert!(
-        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
-            && entry.get("status") == Some(&Value::from("failed"))),
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
         "manual auto-update run dispatch failure should record task-dispatch-failed log entry"
     );
 
@@ -1091,14 +1089,8 @@ async fn scenario_scheduler_dispatch_failure() -> AnyResult<()> {
         .filter(|row| row.action == "scheduler")
         .collect();
     assert!(
-        scheduler_events
-            .iter()
-            .any(|row| row.status == 500
-                && row
-                    .meta
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    == Some("dispatch-error")),
+        scheduler_events.iter().any(|row| row.status == 500
+            && row.meta.get("status").and_then(|v| v.as_str()) == Some("dispatch-error")),
         "scheduler dispatch failure should produce an event with status=500 and meta.status=dispatch-error"
     );
     let failed_event = scheduler_events
@@ -1125,8 +1117,10 @@ async fn scenario_scheduler_dispatch_failure() -> AnyResult<()> {
     assert_eq!(body["status"], Value::from("failed"));
     let logs = body["logs"].as_array().cloned().unwrap_or_default();
     assert!(
-        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
-            && entry.get("status") == Some(&Value::from("failed"))),
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
         "scheduler dispatch failure task should record task-dispatch-failed log entry"
     );
 

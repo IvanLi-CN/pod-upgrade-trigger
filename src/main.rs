@@ -4282,8 +4282,7 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
                 request_id: Some(ctx.request_id.clone()),
             };
 
-            let payload =
-                serde_json::to_value(&error_response).map_err(|e| e.to_string())?;
+            let payload = serde_json::to_value(&error_response).map_err(|e| e.to_string())?;
             respond_json(
                 ctx,
                 500,
@@ -7874,8 +7873,7 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
         &task_meta,
     )?;
 
-    if let Err(err) = spawn_background_task(&unit, &image, &event, &delivery, &ctx.path, &task_id)
-    {
+    if let Err(err) = spawn_background_task(&unit, &image, &event, &delivery, &ctx.path, &task_id) {
         log_message(&format!(
             "500 github-dispatch-failed unit={unit} image={image} event={event} delivery={delivery} path={} err={err}",
             ctx.path
@@ -8834,8 +8832,7 @@ fn mark_task_dispatch_failed(
         // without an explanation.
         let task_id_owned = task_id.to_string();
         let summary_owned = summary.clone();
-        let meta_str =
-            serde_json::to_string(&merged_meta).unwrap_or_else(|_| "{}".to_string());
+        let meta_str = serde_json::to_string(&merged_meta).unwrap_or_else(|_| "{}".to_string());
         let _ = with_db(|pool| async move {
             let mut tx = pool.begin().await?;
             let now = current_unix_secs() as i64;
@@ -10645,12 +10642,9 @@ mod tests {
             set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
 
             let unit = "podman-auto-update.service";
-            let task_id = create_manual_auto_update_task(
-                unit,
-                "req-auto-update-max-age",
-                "/auto-update",
-            )
-            .expect("manual auto-update task created");
+            let task_id =
+                create_manual_auto_update_task(unit, "req-auto-update-max-age", "/auto-update")
+                    .expect("manual auto-update task created");
 
             let jsonl_path = Path::new(&log_dir).join("2025-12-05T000000000Z.jsonl");
             {
