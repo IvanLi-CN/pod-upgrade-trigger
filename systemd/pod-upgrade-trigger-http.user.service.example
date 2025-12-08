@@ -1,0 +1,36 @@
+# Example user-level systemd unit for the pod-upgrade-trigger HTTP server.
+# Copy this file to:
+#   ~/.config/systemd/user/pod-upgrade-trigger-http.service
+# then adjust paths and settings to match your environment.
+#
+# This unit is intended to run as a user service (systemd --user),
+# listening on 127.0.0.1:25111 behind Traefik / webhook-proxy.
+
+[Unit]
+Description=Pod upgrade trigger HTTP server (user service)
+After=network.target
+
+[Service]
+Type=simple
+
+# Path to the pod-upgrade-trigger binary installed under the invoking user's
+# home directory. %h expands to the user home (e.g. /home/<user>).
+ExecStart=%h/.local/bin/pod-upgrade-trigger http-server
+
+# Load environment from a per-user config file. This is where PODUP_HTTP_ADDR,
+# PODUP_STATE_DIR, tokens and other settings are configured.
+# Example template: systemd/pod-upgrade-trigger-http.env.example
+EnvironmentFile=%h/.config/pod-upgrade-trigger-http.env
+
+# Optional working directory for logs, database, and state. In most setups this
+# should match PODUP_STATE_DIR; adjust as needed for your deployment.
+# When migrating an existing deployment, point this (and PODUP_STATE_DIR) at
+# the existing state directory to avoid data migration.
+WorkingDirectory=%h/.local/share/pod-upgrade-trigger
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

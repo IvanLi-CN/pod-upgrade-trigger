@@ -1,0 +1,208 @@
+# 本机 systemd + GitHub Release 部署方案
+
+本文在现有 `container-deploy.md` 的基础上，给出“放弃容器常驻运行、改为本机 systemd（user 服务）+ GitHub Release 二进制发布”的需求与里程碑规划。目标是先在当前这台机器上落地一套稳定的生产形态，不考虑数据迁移。
+
+## 一、背景与范围
+
+- 当前生产形态：
+  - 使用 Docker 容器直接运行 `pod-upgrade-trigger`。
+  - HTTP 入口由容器内进程提供，对外由 Traefik / webhook-proxy 反向代理。
+- 运维现有思路：
+  - 将服务迁移到宿主 user systemd，镜像仅作为“发行载体”（通过 Podman 从镜像中复制二进制）。
+- 本文调整后的目标：
+  - 运行形态仍改为 **宿主 user systemd**。
+  - **不再依赖容器镜像作为发行载体**，改用 **GitHub Release 附件提供二进制**。
+  - 保持对外入口（Traefik / webhook-proxy）路径与行为不变。
+- 不在本次范围：
+  - 数据迁移（数据库 / 状态目录布局）不在本次需求内。
+  - 是否继续构建容器镜像仅作为 CI/测试产物，不纳入本轮部署决策。
+
+## 二、目标运行形态（Target State）
+
+### 2.1 服务进程形态
+
+- 在宿主机上以 **user systemd** 运行：
+  - Unit 名称（建议）：`pod-upgrade-trigger-http.service`。
+  - 运行用户：`ivan`（或等价非 root 用户）。
+  - 启动命令：
+    - `ExecStart=/home/<user>/.local/bin/pod-upgrade-trigger http-server`
+  - 监听地址：
+    - `127.0.0.1:25111`（或 `PODUP_HTTP_ADDR=127.0.0.1:25111`）。
+
+### 2.2 上游与网络
+
+- Traefik / webhook-proxy：
+  - 继续将现有域名 / 路由反向代理到 `127.0.0.1:25111`。
+  - 对外 API/回调 URL 不变，避免上游系统改动。
+- 不再长期运行 `pod-upgrade-trigger` 容器：
+  - 容器镜像可以继续存在，用于测试或其它用途，但**不再作为生产服务的长期进程**。
+
+### 2.3 宿主环境前提
+
+- 宿主机需要满足：
+  - 支持 user systemd（`systemctl --user` 可用，必要时启用 linger）。
+  - 用户 `ivan` 的 `$HOME` 路径稳定（例如 `/home/<user>`），并且：
+    - 存在 `~/.local/bin`，在用户 PATH 中；
+    - `pod-upgrade-trigger` 二进制放置于该目录。
+  - 可用工具：
+    - `curl` 或 `wget`（用于下载 Release 附件）；
+    - 如需更友好的 JSON 解析，可选 `jq`，但脚本需在无 `jq` 情况下也能工作。
+  - 网络：
+    - 能够访问 GitHub Release 下载地址（如受限环境，需提前规划代理 / 缓存）。
+
+## 三、发布与更新需求
+
+### 3.1 GitHub Release 作为唯一发布载体
+
+- CI 要求：
+  - 每次 Release 时，为 Linux 生产环境构建单一二进制或压缩包：
+    - 建议目标平台：`x86_64-unknown-linux-gnu` 或使用 `musl` 静态链接（降低依赖风险）。
+  - 将构建产物作为 Release 附件上传：
+    - 文件命名建议（示例）：
+      - `pod-upgrade-trigger-x86_64-unknown-linux-gnu`
+      - 或 `pod-upgrade-trigger-x86_64-unknown-linux-gnu.tar.gz`
+    - 附带 `SHA256` 校验文件（可选需求，视安全策略而定）。
+  - Release 标签与版本号：
+    - 使用 SemVer（如 `v1.2.3`）。
+    - 可视需求维护一个 `latest` tag 或通过 GitHub API 获取“最新稳定版本”。
+
+### 3.2 更新链路（唯一逻辑链）
+
+更新链路设计为**一条唯一的流程**，由不同触发方调用，不区分“手动版”和“自动版”的实现。
+
+链路步骤：
+
+1. **确定目标版本**：
+   - 通过 GitHub API 查询最新 Release（或指定 channel，如 stable / beta）。
+   - 或从本地配置中读取“目标版本”。
+2. **从 Release 下载产物**：
+   - 使用 `curl` / `wget` 下载对应附件到临时路径：
+     - 如：`~/.local/bin/pod-upgrade-trigger.new`。
+   - 如配置了 `SHA256` 校验文件，下载后进行校验。
+3. **原子替换现有二进制**：
+   - 确保临时文件 `chmod +x`。
+   - 使用 `mv` 将 `*.new` 替换到最终路径：
+     - `/home/<user>/.local/bin/pod-upgrade-trigger`
+   - 可选：保留 `pod-upgrade-trigger.old` 以便快速回滚。
+4. **重启 HTTP 服务**：
+   - `systemctl --user restart pod-upgrade-trigger-http.service`
+   - 失败时：
+     - 同步返回错误码；
+     - 日志留在 `journalctl --user` 中供排查。
+
+**手动更新 vs 自动更新**：
+
+- 实现上只维护一份脚本（例如 `scripts/update-pod-upgrade-trigger-from-release.sh`）：
+  - 手动更新：管理员直接运行脚本。
+  - 自动更新：user systemd 的 oneshot service / timer 调用同一脚本。
+- 不再有“两条不同的下载路径”，避免维护成本和行为差异。
+
+### 3.3 可靠性与安全要求
+
+- 失败保护：
+  - 下载失败 / 校验失败时，**不得覆盖现有二进制**。
+  - 重启失败时，保持现有进程或快速回滚，不出现“服务消失”状态。
+- 版本可观测性：
+  - `pod-upgrade-trigger --version` 输出需包含版本号与 commit 信息，便于对齐 Release。
+  - 更新脚本在日志中记录：
+    - 当前版本 → 目标版本；
+    - 下载来源（Release tag / URL）；
+    - 成功或失败原因。
+- 可选：与现有 auto-update 体系集成：
+  - 如需要在现有 `/tasks` / `/events` JSONL 里记录自更新事件，可在脚本内追加 JSONL 输出，或者由上游调用方（如 `podman-update-manager.ts`）在检测到新版本时调用脚本并记录结果。
+
+## 四、迁移约束与兼容性
+
+- 不动的数据 / 状态：
+  - 不在本次计划中对数据库或状态目录（`PODUP_STATE_DIR`）做迁移方案；沿用当前路径或另行设计，单独文档说明。
+- 架构和 ABI 兼容：
+  - 要求 Release 附件与生产机 CPU 架构、glibc 版本兼容。
+  - 建议优先使用 `musl` 静态链接二进制，以降低 ABI 兼容风险。
+- 网络约束：
+  - 若生产机无法直接访问 GitHub，需要事先确认：
+    - 是否通过代理下载；
+    - 是否需要在内部仓库镜像 Release 附件。
+
+## 五、里程碑规划
+
+### M0：方案确认与文档落地（本文件）
+
+- 明确：
+  - 从 Docker 容器部署迁移到宿主 user systemd 的目标。
+  - GitHub Release 作为主要发行载体的设计。
+  - 更新链路：单一脚本，被手动与定时两种方式共用。
+- 输出：
+  - 本文档合并到仓库，作为后续实现的设计依据。
+
+### M1：基础运行形态落地（手动部署）
+
+- 内容：
+  - 在仓库中添加 `pod-upgrade-trigger-http.service` 示例（`systemd/` 或 `docs/` 示例）。
+    - 示例 user unit：`systemd/pod-upgrade-trigger-http.user.service.example`，配套 env 示例：`systemd/pod-upgrade-trigger-http.env.example`。
+  - 在当前机器上手动：
+    - 将 Release 二进制放到 `/home/<user>/.local/bin/pod-upgrade-trigger`。
+    - 配置并启用 `systemctl --user enable --now pod-upgrade-trigger-http.service`。
+  - Traefik / webhook-proxy 配置切换到 `127.0.0.1:25111` 并验证。
+- 验证：
+  - 功能回归：所有现有 webhook / API 路径正常工作。
+  - 日志与监控：确认 journald 中能看到服务日志。
+
+### M2：CI 产物与 Release 规范化
+
+- 内容：
+  - 在 CI 中增加 Linux 生产环境二进制构建步骤。
+  - 将构建产物上传至 GitHub Release：
+    - 制定产物命名规则；
+    - 如需，附带 `SHA256` 校验文件。
+  - 更新 `README` / docs，说明 Release 附件用法。
+- 验证：
+  - 能够在任意新环境中，仅通过：
+    - 下载 Release 附件；
+    - 放置到 `~/.local/bin`；
+    - 配置 systemd；
+    - 即完成部署。
+
+### M3：更新脚本实现与手动更新流程
+
+- 内容：
+  - 在仓库中添加 `scripts/update-pod-upgrade-trigger-from-release.sh`：
+    - 调用 GitHub API 或固定 URL 查询最新 Release；
+    - 下载产物到临时文件，校验并原子替换；
+    - 重启 `pod-upgrade-trigger-http.service`；
+    - 记录日志（包含版本信息和错误信息）。
+  - 在当前机器上使用该脚本完成一次“手动更新”演练。
+- 验证：
+  - 在不破坏现有数据与配置的前提下，完成一次从版本 A → 版本 B 的更新。
+  - 出错路径测试：模拟下载失败 / 校验失败，确保不会破坏现有服务。
+
+### M4：自动更新（systemd timer）
+
+- 内容：
+  - 定义并添加：
+    - `pod-upgrade-trigger-updater.service`（`Type=oneshot`，`ExecStart` 调用更新脚本）。
+    - `pod-upgrade-trigger-updater.timer`（例如 `OnBootSec=5m`、`OnUnitActiveSec=6h`）。
+  - 在当前机器上启用：
+    - `systemctl --user enable --now pod-upgrade-trigger-updater.timer`
+  - 确保：
+    - 定时任务在 journald 中有清晰日志；
+    - 失败不影响现有服务运行。
+- 验证：
+  - 通过手工制造新 Release 或模拟版本号差异，验证定时任务能够自动更新并重启服务。
+
+### M5（可选）：与现有 auto-update 体系集成
+
+- 内容：
+  - 视现有 `podman-auto-update.service` / `podman-update-manager.ts` 等组件情况，考虑：
+    - 在检测到 `pod-upgrade-trigger` 新版本时，不再尝试滚动某个容器；
+    - 改为调用 `update-pod-upgrade-trigger-from-release.sh`；
+    - 将执行结果写入统一的 `/tasks` / `/events` JSONL / summary。
+- 验证：
+  - 在统一的任务 / 事件视图中，可以看到“pod-upgrade-trigger 自更新”的记录，与其它容器更新事件共存。
+
+## 六、后续工作
+
+- 在 M1–M4 实现过程中，需要补充：
+  - systemd unit 示例文件；
+  - 更新脚本实现；
+  - CI 配置变更与 Release 规范说明。
+- 每个里程碑完成后，应在本仓库的变更记录 / PR 描述中简要回顾对应目标与验证结果，以便后续运维和开发追踪。
