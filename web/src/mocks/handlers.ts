@@ -517,6 +517,23 @@ const handlers = [
     await withLatency()
 
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+
+    const data = runtime.cloneData()
+    const manualTokenConfigured =
+      data.settings.env.PODUP_MANUAL_TOKEN_configured === true
+    if (manualTokenConfigured) {
+      const token =
+        typeof body.token === 'string' && body.token.trim().length > 0
+          ? body.token.trim()
+          : ''
+      const expected = 'mock-manual-token'
+      if (token !== expected) {
+        return HttpResponse.json(
+          { error: 'manual token invalid', reason: 'token' },
+          { status: 401, headers: JSON_HEADERS },
+        )
+      }
+    }
     const services = runtime.cloneData().services
     const dryRun = Boolean(body.dry_run)
 
@@ -575,15 +592,119 @@ const handlers = [
     )
   }),
 
+  http.post('/api/manual/auto-update/run', async ({ request }) => {
+    const url = new URL(request.url)
+    const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
+    if (failure) return failure
+    await withLatency()
+
+    const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+
+    const data = runtime.cloneData()
+    const manualTokenConfigured =
+      data.settings.env.PODUP_MANUAL_TOKEN_configured === true
+    if (manualTokenConfigured) {
+      const token =
+        typeof body.token === 'string' && body.token.trim().length > 0
+          ? body.token.trim()
+          : ''
+      const expected = 'mock-manual-token'
+      if (token !== expected) {
+        return HttpResponse.json(
+          { error: 'manual token invalid', reason: 'token' },
+          { status: 401, headers: JSON_HEADERS },
+        )
+      }
+    }
+
+    const dryRun = Boolean(body.dry_run)
+    const caller =
+      typeof body.caller === 'string' && body.caller.trim()
+        ? body.caller.trim()
+        : null
+    const reason =
+      typeof body.reason === 'string' && body.reason.trim()
+        ? body.reason.trim()
+        : null
+
+    const unit =
+      data.settings.systemd?.auto_update_unit ?? 'podman-auto-update.service'
+
+    let status: 'dry-run' | 'pending'
+    let message: string
+    let taskId: string | null = null
+
+    if (dryRun) {
+      status = 'dry-run'
+      message = 'auto-update run dry-run scheduled'
+    } else {
+      const task = runtime.createAdHocTask({
+        kind: 'manual',
+        source: 'manual',
+        units: [unit],
+        caller,
+        reason,
+        path: '/api/manual/auto-update/run',
+        is_long_running: true,
+      })
+      taskId = task.task_id
+      status = 'pending'
+      message = 'scheduled via task'
+    }
+
+    const requestId = runtime.addEvent({
+      request_id: makeRequestId(),
+      ts: Math.floor(Date.now() / 1000),
+      method: 'POST',
+      path: '/api/manual/auto-update/run',
+      status: 202,
+      action: 'manual-auto-update-run',
+      duration_ms: 120,
+      meta: body,
+    }).request_id
+
+    return HttpResponse.json(
+      {
+        unit,
+        status,
+        message,
+        dry_run: dryRun,
+        caller,
+        reason,
+        image: null,
+        task_id: taskId,
+        request_id: requestId,
+      },
+      { headers: JSON_HEADERS },
+    )
+  }),
+
   http.post('/api/manual/services/:slug', async ({ params, request }) => {
     const url = new URL(request.url)
     const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
     if (failure) return failure
     await withLatency()
 
-    const services = runtime.cloneData().services
+    const data = runtime.cloneData()
+    const services = data.services
     const service = services.find((s) => s.slug === params.slug)
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+
+    const manualTokenConfigured =
+      data.settings.env.PODUP_MANUAL_TOKEN_configured === true
+    if (manualTokenConfigured) {
+      const token =
+        typeof body.token === 'string' && body.token.trim().length > 0
+          ? body.token.trim()
+          : ''
+      const expected = 'mock-manual-token'
+      if (token !== expected) {
+        return HttpResponse.json(
+          { error: 'manual token invalid', reason: 'token' },
+          { status: 401, headers: JSON_HEADERS },
+        )
+      }
+    }
 
     if (!service) {
       return HttpResponse.json({ error: 'service not found' }, { status: 404 })

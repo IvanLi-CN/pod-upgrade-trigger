@@ -14,6 +14,7 @@ export type MockProfile =
   | 'empty-state'
   | 'rate-limit-hot'
   | 'auth-error'
+  | 'manual-token'
   | 'degraded'
 
 export type MockEvent = {
@@ -339,11 +340,13 @@ function buildLocks(now: number, profile: MockProfile): LockEntry[] {
 }
 
 function buildSettings(now: number, profile: MockProfile): SettingsSnapshot {
+  const manualTokenConfigured = profile === 'manual-token'
+
   return {
     env: {
       PODUP_STATE_DIR: '/var/lib/podup',
       PODUP_TOKEN_configured: true,
-      PODUP_MANUAL_TOKEN_configured: profile !== 'auth-error',
+      PODUP_MANUAL_TOKEN_configured: manualTokenConfigured,
       PODUP_GH_WEBHOOK_SECRET_configured: profile !== 'auth-error',
     },
     scheduler: {
@@ -779,6 +782,322 @@ function buildTasks(
         summary: 'Consistency check finished',
         unit: null,
         meta: {},
+      },
+    ],
+  )
+
+  // Webhook task with best-effort image prune showing both success and failure.
+  addTask(
+    {
+      kind: 'github-webhook',
+      status: 'succeeded',
+      created_at: baseTs + 2050,
+      started_at: baseTs + 2051,
+      finished_at: baseTs + 2075,
+      updated_at: baseTs + 2075,
+      summary: '1/1 units succeeded · webhook with image prune',
+      trigger: {
+        source: 'webhook',
+        path: '/github-package-update/svc-gamma',
+        request_id: makeRequestId(),
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: true,
+      is_long_running: false,
+      retry_of: null,
+      units: [
+        {
+          unit: 'svc-gamma.service',
+          slug: 'svc-gamma',
+          display_name: 'Gamma Deploy',
+          status: 'succeeded',
+          phase: 'done',
+          started_at: baseTs + 2052,
+          finished_at: baseTs + 2070,
+          duration_ms: 18_000,
+          message: 'webhook deploy completed; prune attempted',
+        },
+      ],
+      has_warnings: true,
+      warning_count: 1,
+    },
+    [
+      {
+        ts: baseTs + 2051,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Github webhook accepted for svc-gamma',
+        unit: 'svc-gamma.service',
+        meta: { slug: 'svc-gamma' },
+      },
+      {
+        ts: baseTs + 2060,
+        level: 'info',
+        action: 'image-prune',
+        status: 'succeeded',
+        summary: 'Background image prune completed',
+        unit: 'svc-gamma.service',
+        meta: {
+          type: 'command',
+          command: 'podman image prune -f --filter label=app=svc-gamma',
+          argv: [
+            'podman',
+            'image',
+            'prune',
+            '-f',
+            '--filter',
+            'label=app=svc-gamma',
+          ],
+          stdout: 'deleted 3 unused layers',
+          stderr: '',
+          exit: 'exit=0',
+          unit: 'svc-gamma.service',
+        },
+      },
+      {
+        ts: baseTs + 2070,
+        level: 'warning',
+        action: 'image-prune',
+        status: 'failed',
+        summary: 'Image prune failed (best-effort clean-up)',
+        unit: 'svc-gamma.service',
+        meta: {
+          type: 'command',
+          command: 'podman image prune -f --filter label=app=svc-gamma',
+          argv: [
+            'podman',
+            'image',
+            'prune',
+            '-f',
+            '--filter',
+            'label=app=svc-gamma',
+          ],
+          stdout: '',
+          stderr: 'error: mock image prune failure',
+          exit: 'exit=1',
+          unit: 'svc-gamma.service',
+        },
+      },
+    ],
+  )
+
+  // Task whose dispatch failed before any business work started.
+  addTask(
+    {
+      kind: 'github-webhook',
+      status: 'failed',
+      created_at: baseTs + 2100,
+      started_at: baseTs + 2100,
+      finished_at: baseTs + 2101,
+      updated_at: baseTs + 2101,
+      summary: 'Dispatch failed before scheduling units',
+      trigger: {
+        source: 'webhook',
+        path: '/github-package-update/svc-dispatch-failed',
+        request_id: makeRequestId(),
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: true,
+      is_long_running: false,
+      retry_of: null,
+      units: [],
+      has_warnings: true,
+      warning_count: 1,
+    },
+    [
+      {
+        ts: baseTs + 2100,
+        level: 'warning',
+        action: 'task-dispatch-failed',
+        status: 'failed',
+        summary: 'Failed to dispatch webhook task to worker',
+        unit: null,
+        meta: {
+          source: 'github-webhook',
+          kind: 'webhook',
+          error: 'mock dispatch failure',
+        },
+      },
+    ],
+  )
+
+  // Manual auto-update runs with different terminal states and warnings.
+  addTask(
+    {
+      kind: 'manual',
+      status: 'succeeded',
+      created_at: baseTs + 2140,
+      started_at: baseTs + 2141,
+      finished_at: baseTs + 2160,
+      updated_at: baseTs + 2160,
+      summary: 'Auto-update run succeeded with warnings',
+      trigger: {
+        source: 'manual',
+        path: '/api/manual/auto-update/run',
+        caller: 'ops-auto',
+        reason: 'mock successful run with warnings',
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: true,
+      is_long_running: true,
+      retry_of: null,
+      units: [
+        {
+          unit: 'podman-auto-update.service',
+          status: 'succeeded',
+          phase: 'done',
+          started_at: baseTs + 2141,
+          finished_at: baseTs + 2160,
+          duration_ms: 19_000,
+          message: 'Auto-update completed with warnings from podman auto-update',
+        },
+      ],
+      has_warnings: true,
+      warning_count: 2,
+    },
+    [
+      {
+        ts: baseTs + 2141,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Manual auto-update run accepted from UI',
+        unit: null,
+        meta: { caller: 'ops-auto' },
+      },
+      {
+        ts: baseTs + 2150,
+        level: 'info',
+        action: 'auto-update-run',
+        status: 'succeeded',
+        summary: 'podman auto-update run succeeded (JSONL summary found)',
+        unit: 'podman-auto-update.service',
+        meta: {
+          unit: 'podman-auto-update.service',
+          dry_run: false,
+          log_dir: '/var/log/podman-auto-update',
+          reason: 'summary',
+        },
+      },
+      {
+        ts: baseTs + 2155,
+        level: 'info',
+        action: 'auto-update-warnings',
+        status: 'succeeded',
+        summary: 'Auto-update succeeded with 2 warning(s) from podman auto-update',
+        unit: 'podman-auto-update.service',
+        meta: {
+          unit: 'podman-auto-update.service',
+          log_file: '/var/log/podman-auto-update/mock.jsonl',
+          warnings: [
+            { type: 'dry-run-error', at: '2024-01-01T00:00:00Z' },
+            { type: 'auto-update-error', at: '2024-01-01T00:01:00Z' },
+          ],
+        },
+      },
+      {
+        ts: baseTs + 2156,
+        level: 'warning',
+        action: 'auto-update-warning',
+        status: 'succeeded',
+        summary:
+          '[dry-run-error] auto-update warning for podman-auto-update.service: simulated dry-run warning',
+        unit: 'podman-auto-update.service',
+        meta: {
+          unit: 'podman-auto-update.service',
+          log_file: '/var/log/podman-auto-update/mock.jsonl',
+          event: {
+            type: 'dry-run-error',
+            container: 'auto-update-container',
+            image: 'ghcr.io/example/auto-update:mock',
+          },
+        },
+      },
+      {
+        ts: baseTs + 2157,
+        level: 'error',
+        action: 'auto-update-warning',
+        status: 'succeeded',
+        summary:
+          '[auto-update-error] auto-update warning for podman-auto-update.service: simulated fatal warning',
+        unit: 'podman-auto-update.service',
+        meta: {
+          unit: 'podman-auto-update.service',
+          log_file: '/var/log/podman-auto-update/mock.jsonl',
+          event: {
+            type: 'auto-update-error',
+            container: 'auto-update-container',
+            image: 'ghcr.io/example/auto-update:mock',
+          },
+        },
+      },
+    ],
+  )
+
+  addTask(
+    {
+      kind: 'manual',
+      status: 'unknown',
+      created_at: baseTs + 2180,
+      started_at: baseTs + 2181,
+      finished_at: baseTs + 2195,
+      updated_at: baseTs + 2195,
+      summary:
+        'podman auto-update run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)',
+      trigger: {
+        source: 'manual',
+        path: '/api/manual/auto-update/run',
+        caller: 'ops-auto',
+        reason: 'mock unknown run (no summary)',
+      },
+      can_stop: false,
+      can_force_stop: false,
+      can_retry: true,
+      is_long_running: true,
+      retry_of: null,
+      units: [
+        {
+          unit: 'podman-auto-update.service',
+          status: 'unknown',
+          phase: 'done',
+          started_at: baseTs + 2181,
+          finished_at: baseTs + 2195,
+          duration_ms: 14_000,
+          message:
+            'Run completed without JSONL summary; please inspect host logs if needed',
+        },
+      ],
+      has_warnings: false,
+      warning_count: 0,
+    },
+    [
+      {
+        ts: baseTs + 2181,
+        level: 'info',
+        action: 'task-created',
+        status: 'running',
+        summary: 'Manual auto-update run accepted from UI',
+        unit: null,
+        meta: { caller: 'ops-auto' },
+      },
+      {
+        ts: baseTs + 2195,
+        level: 'warning',
+        action: 'auto-update-run',
+        status: 'unknown',
+        summary:
+          'podman auto-update run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)',
+        unit: 'podman-auto-update.service',
+        meta: {
+          unit: 'podman-auto-update.service',
+          dry_run: false,
+          log_dir: '/var/log/podman-auto-update',
+          reason: 'no-summary',
+        },
       },
     ],
   )

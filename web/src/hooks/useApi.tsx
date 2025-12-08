@@ -56,6 +56,7 @@ function isMockEnabled(): boolean {
 type ApiContextValue = {
   status: AppStatus
   mockEnabled: boolean
+  manualTokenConfigured: boolean
   getJson: <T>(input: RequestInfo | URL, init?: RequestInit) => Promise<T>
   postJson: <T>(
     input: RequestInfo | URL,
@@ -74,6 +75,7 @@ export function ApiProvider({ children }: PropsWithChildren) {
     lastIteration: null,
   })
   const [now, setNow] = useState<Date>(new Date())
+  const [manualTokenConfigured, setManualTokenConfigured] = useState(false)
   const navigate = useNavigate()
   const location = useLocation()
   const { pushToast } = useToast()
@@ -124,6 +126,9 @@ export function ApiProvider({ children }: PropsWithChildren) {
       }
       type SettingsSnapshot = {
         scheduler?: SchedulerSnapshot
+        env?: {
+          PODUP_MANUAL_TOKEN_configured?: boolean
+        }
       }
 
       try {
@@ -148,7 +153,13 @@ export function ApiProvider({ children }: PropsWithChildren) {
           }
         }
 
+        const manualConfigured =
+          data.env && typeof data.env.PODUP_MANUAL_TOKEN_configured === 'boolean'
+            ? data.env.PODUP_MANUAL_TOKEN_configured
+            : false
+
         setScheduler({ intervalSecs, lastIteration })
+        setManualTokenConfigured(manualConfigured)
       } catch {
         // ignore
       }
@@ -258,24 +269,67 @@ export function ApiProvider({ children }: PropsWithChildren) {
         payload = { token }
       }
 
-      return getJson<T>(input, {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+          ? input.toString()
+          : // Fallback for Request objects or other types
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            ((input as any).url as string | undefined) ?? String(input)
+
+      const res = await fetch(input, {
         ...init,
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
       })
+
+      if (res.status === 401) {
+        const isManualApi = url.startsWith('/api/manual/')
+
+        if (isManualApi && manualTokenConfigured) {
+          pushToast({
+            variant: 'error',
+            title: 'Manual token 校验失败',
+            message:
+              'Manual API 返回 401：Manual token 缺失或错误。请检查右上角的 Manual token 输入框，并确认后端已配置 PODUP_MANUAL_TOKEN/PODUP_TOKEN。',
+          })
+          throw {
+            status: 401,
+            message: 'manual-token-invalid',
+          } satisfies ApiError
+        }
+
+        handle401()
+        throw {
+          status: 401,
+          message: 'unauthorized',
+        } satisfies ApiError
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText)
+        throw {
+          status: res.status,
+          message: text || res.statusText,
+        } satisfies ApiError
+      }
+
+      return (await res.json()) as T
     },
-    [getJson, token],
+    [token, manualTokenConfigured, handle401, pushToast],
   )
 
   const value: ApiContextValue = useMemo(
     () => ({
       status: { health, sseStatus, scheduler, now },
       mockEnabled,
+      manualTokenConfigured,
       getJson,
       postJson,
     }),
-    [getJson, health, mockEnabled, now, scheduler, sseStatus, postJson],
+    [getJson, health, mockEnabled, now, scheduler, sseStatus, postJson, manualTokenConfigured],
   )
 
   return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>

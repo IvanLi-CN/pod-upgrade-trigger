@@ -40,7 +40,13 @@ const GITHUB_IMAGE_LIMIT_WINDOW: u64 = 3_600; // 1 hour
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MANUAL_UNIT: &str = "podman-auto-update.service";
 const AUTO_UPDATE_RUN_POLL_INTERVAL_MS: u64 = 1_000;
-const AUTO_UPDATE_RUN_MAX_SECS: u64 = 1_800; // 30 minutes hard cap for a single auto-update run
+
+// Hard cap for a single auto-update run. In tests we shorten this to keep
+// timeout-based scenarios fast and deterministic.
+#[cfg(not(test))]
+const AUTO_UPDATE_RUN_MAX_SECS: u64 = 1_800; // 30 minutes in production
+#[cfg(test)]
+const AUTO_UPDATE_RUN_MAX_SECS: u64 = 2;
 const DEFAULT_REGISTRY_HOST: &str = "ghcr.io";
 const PULL_RETRY_ATTEMPTS: u8 = 3;
 const PULL_RETRY_DELAY_SECS: u64 = 5;
@@ -3845,6 +3851,19 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
             "500 manual-auto-update-dispatch-failed unit={unit} task_id={task_id} err={err} {}",
             redacted_line
         ));
+        mark_task_dispatch_failed(
+            &task_id,
+            Some(&unit),
+            "manual",
+            "manual-auto-update",
+            &err,
+            json!({
+                "unit": unit.clone(),
+                "path": ctx.path.clone(),
+                "request_id": ctx.request_id.clone(),
+                "reason": "manual-auto-update-dispatch-failed",
+            }),
+        );
         respond_text(
             ctx,
             500,
@@ -3853,6 +3872,7 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
             "manual-auto-update",
             Some(json!({
                 "unit": unit,
+                "task_id": task_id,
                 "error": err,
             })),
         )?;
@@ -4006,11 +4026,38 @@ fn handle_manual_auto_update_run(ctx: &RequestContext) -> Result<(), String> {
     };
 
     if let Err(err) = spawn_manual_task(&task_id, "manual-auto-update-run") {
-        respond_text(
+        mark_task_dispatch_failed(
+            &task_id,
+            Some(&unit),
+            "manual",
+            "manual-auto-update-run",
+            &err,
+            json!({
+                "unit": unit.clone(),
+                "dry_run": request.dry_run,
+                "caller": request.caller.clone(),
+                "reason": request.reason.clone(),
+                "path": ctx.path.clone(),
+                "request_id": ctx.request_id.clone(),
+            }),
+        );
+        let error_response = json!({
+            "unit": unit,
+            "status": "error",
+            "message": "failed to dispatch auto-update run",
+            "dry_run": request.dry_run,
+            "caller": request.caller,
+            "reason": request.reason,
+            "image": Value::Null,
+            "task_id": task_id,
+            "request_id": ctx.request_id,
+        });
+
+        respond_json(
             ctx,
             500,
             "InternalServerError",
-            "failed to dispatch auto-update run",
+            &error_response,
             "manual-auto-update-run",
             Some(json!({
                 "unit": unit,
@@ -4208,8 +4255,49 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
             })
             .collect();
 
-        // Fire-and-forget 调度 run-task <task_id>。
-        let _ = spawn_manual_task(&task, "manual-trigger");
+        // Fire-and-forget 调度 run-task <task_id>，但一旦派发失败，需要立即将
+        // Task 标记为 failed 并返回错误响应，避免壳任务。
+        if let Err(err) = spawn_manual_task(&task, "manual-trigger") {
+            mark_task_dispatch_failed(
+                &task,
+                None,
+                "manual",
+                "manual-trigger",
+                &err,
+                json!({
+                    "units": units.clone(),
+                    "caller": request.caller.clone(),
+                    "reason": request.reason.clone(),
+                    "path": ctx.path,
+                    "request_id": ctx.request_id,
+                }),
+            );
+
+            let error_response = ManualTriggerResponse {
+                triggered: Vec::new(),
+                dry_run,
+                caller: request.caller.clone(),
+                reason: request.reason.clone(),
+                task_id: Some(task.clone()),
+                request_id: Some(ctx.request_id.clone()),
+            };
+
+            let payload = serde_json::to_value(&error_response).map_err(|e| e.to_string())?;
+            respond_json(
+                ctx,
+                500,
+                "InternalServerError",
+                &payload,
+                "manual-trigger",
+                Some(json!({
+                    "units": units.clone(),
+                    "dry_run": dry_run,
+                    "task_id": error_response.task_id,
+                    "error": err,
+                })),
+            )?;
+            return Ok(());
+        }
     }
 
     let (status, reason) = if all_units_ok(&results) {
@@ -4335,7 +4423,50 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
             message: Some("scheduled via task".to_string()),
         };
 
-        let _ = spawn_manual_task(&task, "manual-service");
+        if let Err(err) = spawn_manual_task(&task, "manual-service") {
+            mark_task_dispatch_failed(
+                &task,
+                Some(&unit),
+                "manual",
+                "manual-service",
+                &err,
+                json!({
+                    "unit": unit,
+                    "image": request.image.clone(),
+                    "caller": request.caller.clone(),
+                    "reason": request.reason.clone(),
+                    "path": ctx.path,
+                    "request_id": ctx.request_id,
+                }),
+            );
+
+            let response = json!({
+                "unit": unit,
+                "status": "error",
+                "message": "failed to dispatch manual service task",
+                "dry_run": dry_run,
+                "caller": request.caller.clone(),
+                "reason": request.reason.clone(),
+                "image": request.image.clone(),
+                "task_id": task_id,
+                "request_id": ctx.request_id,
+            });
+
+            respond_json(
+                ctx,
+                500,
+                "InternalServerError",
+                &response,
+                "manual-service",
+                Some(json!({
+                    "unit": unit,
+                    "dry_run": dry_run,
+                    "task_id": task_id,
+                    "error": err,
+                })),
+            )?;
+            return Ok(());
+        }
     }
 
     let status =
@@ -5797,6 +5928,20 @@ fn create_cli_maintenance_prune_task(max_age_hours: u64, dry_run: bool) -> Resul
 }
 
 fn spawn_manual_task(task_id: &str, action: &str) -> Result<(), String> {
+    // Test hook: allow integration tests to force dispatch failures for
+    // specific manual task actions (e.g. "manual-trigger", "manual-service",
+    // "manual-auto-update-run", "scheduler-auto-update") without relying on
+    // the underlying systemd-run/system environment.
+    if let Ok(raw) = env::var("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS") {
+        let needle = action.to_string();
+        for entry in raw.split(',') {
+            let trimmed = entry.trim();
+            if !trimmed.is_empty() && trimmed == needle {
+                return Err("test-manual-dispatch-failed".to_string());
+            }
+        }
+    }
+
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let exe_str = exe.to_str().ok_or_else(|| "invalid exe path".to_string())?;
 
@@ -6558,6 +6703,17 @@ fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result
                     log_message(&format!(
                         "scheduler dispatch error unit={unit} iteration={iterations} err={err}"
                     ));
+                    mark_task_dispatch_failed(
+                        &task_id,
+                        Some(&unit),
+                        "scheduler",
+                        "scheduler-auto-update",
+                        &err,
+                        json!({
+                            "unit": unit.clone(),
+                            "iteration": iterations,
+                        }),
+                    );
                     record_system_event(
                         "scheduler",
                         500,
@@ -6566,6 +6722,7 @@ fn run_scheduler_loop(interval_secs: u64, max_iterations: Option<u64>) -> Result
                             "iteration": iterations,
                             "status": "dispatch-error",
                             "error": err,
+                            "task_id": task_id,
                         }),
                     );
                 }
@@ -7721,6 +7878,21 @@ fn handle_github_request(ctx: &RequestContext) -> Result<(), String> {
             "500 github-dispatch-failed unit={unit} image={image} event={event} delivery={delivery} path={} err={err}",
             ctx.path
         ));
+        mark_task_dispatch_failed(
+            &task_id,
+            Some(&unit),
+            "github-webhook",
+            "github-webhook",
+            &err,
+            json!({
+                "unit": unit,
+                "image": image,
+                "event": event,
+                "delivery": delivery,
+                "path": ctx.path,
+                "request_id": ctx.request_id,
+            }),
+        );
         respond_text(
             ctx,
             500,
@@ -8175,14 +8347,30 @@ fn pull_container_image(image: &str) -> Result<CommandExecResult, String> {
     Ok(last_result.expect("PULL_RETRY_ATTEMPTS must be >= 1"))
 }
 
-fn prune_images_silently() {
+fn prune_images_for_task(task_id: &str, unit: &str) {
+    let command = "podman image prune -f";
+    let argv = ["podman", "image", "prune", "-f"];
+
     match run_quiet_command({
         let mut cmd = Command::new("podman");
         cmd.arg("image").arg("prune").arg("-f");
         cmd
     }) {
         Ok(result) => {
-            if !result.success() {
+            let extra_meta = json!({ "unit": unit });
+            let meta = build_command_meta(command, &argv, &result, Some(extra_meta));
+
+            if result.success() {
+                append_task_log(
+                    task_id,
+                    "info",
+                    "image-prune",
+                    "succeeded",
+                    "Background image prune completed",
+                    Some(unit),
+                    meta,
+                );
+            } else {
                 let mut msg = format!(
                     "warn image-prune-failed exit={}",
                     exit_code_string(&result.status)
@@ -8192,10 +8380,38 @@ fn prune_images_silently() {
                     msg.push_str(&result.stderr);
                 }
                 log_message(&msg);
+
+                append_task_log(
+                    task_id,
+                    "warning",
+                    "image-prune",
+                    "failed",
+                    "Image prune failed (best-effort clean-up)",
+                    Some(unit),
+                    meta,
+                );
             }
         }
         Err(err) => {
             log_message(&format!("warn image-prune-error err={err}"));
+
+            let meta = json!({
+                "type": "command",
+                "command": command,
+                "argv": argv,
+                "error": err,
+                "unit": unit,
+            });
+
+            append_task_log(
+                task_id,
+                "warning",
+                "image-prune",
+                "failed",
+                "Image prune failed (best-effort clean-up)",
+                Some(unit),
+                meta,
+            );
         }
     }
 }
@@ -8382,7 +8598,6 @@ fn run_background_task(
             log_message(&format!(
                 "202 github-triggered unit={unit} image={image} event={event} delivery={delivery} path={path}"
             ));
-            prune_images_silently();
             let extra_meta = json!({
                 "status": "ok",
                 "image": image,
@@ -8402,6 +8617,7 @@ fn run_background_task(
                 "info",
                 meta,
             );
+            prune_images_for_task(task_id, unit);
         }
         Ok(result) => {
             let mut message = format!(
@@ -8534,6 +8750,155 @@ fn update_task_state_with_unit(
         tx.commit().await?;
         Ok::<(), sqlx::Error>(())
     });
+}
+
+fn merge_task_meta(mut base: Value, extra: Value) -> Value {
+    match (&mut base, extra) {
+        (Value::Object(base_map), Value::Object(extra_map)) => {
+            for (k, v) in extra_map {
+                base_map.insert(k, v);
+            }
+            base
+        }
+        (Value::Object(base_map), other) if !other.is_null() => {
+            base_map.insert("extra".to_string(), other);
+            base
+        }
+        _ => base,
+    }
+}
+
+fn mark_task_dispatch_failed(
+    task_id: &str,
+    unit: Option<&str>,
+    kind: &str,
+    source: &str,
+    error: &str,
+    extra_meta: Value,
+) {
+    let summary = if let Some(u) = unit {
+        format!("Failed to dispatch {source} task for unit {u}")
+    } else {
+        format!("Failed to dispatch {source} task")
+    };
+
+    let mut base_meta = json!({
+        "task_id": task_id,
+        "kind": kind,
+        "source": source,
+        "error": error,
+    });
+    if let Some(u) = unit {
+        base_meta["unit"] = Value::String(u.to_string());
+    }
+
+    let merged_meta = merge_task_meta(base_meta, extra_meta);
+
+    // Determine which task_units to mark as failed. When no explicit unit is
+    // provided (e.g. manual trigger tasks spanning multiple units), we mark all
+    // units belonging to this task as failed.
+    let units: Vec<String> = if let Some(u) = unit {
+        vec![u.to_string()]
+    } else {
+        let task_id_owned = task_id.to_string();
+        let units_result: Result<Vec<String>, String> = with_db(|pool| async move {
+            let rows: Vec<SqliteRow> =
+                sqlx::query("SELECT unit FROM task_units WHERE task_id = ? ORDER BY id")
+                    .bind(&task_id_owned)
+                    .fetch_all(&pool)
+                    .await?;
+            let mut units = Vec::with_capacity(rows.len());
+            for row in rows {
+                units.push(row.get::<String, _>("unit"));
+            }
+            Ok::<Vec<String>, sqlx::Error>(units)
+        });
+
+        match units_result {
+            Ok(units) if !units.is_empty() => units,
+            Ok(_) => Vec::new(),
+            Err(err) => {
+                log_message(&format!(
+                    "warn task-dispatch-failed mark-units-load-failed task_id={task_id} err={err}"
+                ));
+                Vec::new()
+            }
+        }
+    };
+
+    if units.is_empty() {
+        // Best-effort fallback: update the task status and append a log entry
+        // without a specific unit, so that the task is never left running
+        // without an explanation.
+        let task_id_owned = task_id.to_string();
+        let summary_owned = summary.clone();
+        let meta_str = serde_json::to_string(&merged_meta).unwrap_or_else(|_| "{}".to_string());
+        let _ = with_db(|pool| async move {
+            let mut tx = pool.begin().await?;
+            let now = current_unix_secs() as i64;
+
+            sqlx::query(
+                "UPDATE tasks \
+                 SET status = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?, summary = ? \
+                 WHERE task_id = ?",
+            )
+            .bind("failed")
+            .bind(now)
+            .bind(now)
+            .bind(&summary_owned)
+            .bind(&task_id_owned)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE task_logs \
+                 SET status = ? \
+                 WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+            )
+            .bind("failed")
+            .bind(&task_id_owned)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_owned)
+            .bind(now)
+            .bind("error")
+            .bind("task-dispatch-failed")
+            .bind("failed")
+            .bind(&summary_owned)
+            .bind(Option::<String>::None)
+            .bind(meta_str)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok::<(), sqlx::Error>(())
+        });
+        return;
+    }
+
+    for u in units {
+        let mut meta_for_unit = merged_meta.clone();
+        if let Value::Object(ref mut obj) = meta_for_unit {
+            obj.insert("unit".to_string(), Value::String(u.clone()));
+        }
+
+        update_task_state_with_unit(
+            task_id,
+            "failed",
+            &u,
+            "failed",
+            &summary,
+            "task-dispatch-failed",
+            "error",
+            meta_for_unit,
+        );
+    }
 }
 
 fn append_task_log(
@@ -8889,6 +9254,10 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
     let log_dir_opt = auto_update_log_dir();
     let mut baseline_files: HashSet<String> = HashSet::new();
     if let Some(ref dir) = log_dir_opt {
+        // In production we snapshot existing JSONL files to avoid mixing logs
+        // from previous runs. In tests we skip this so that pre-seeded JSONL
+        // files can be picked up deterministically without background threads.
+        #[cfg(not(test))]
         if let Ok(read_dir) = fs::read_dir(dir) {
             for entry in read_dir.flatten() {
                 let path = entry.path();
@@ -9161,34 +9530,30 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
         return Ok(());
     }
 
-    // No summary event observed; fall back to a generic success/failure based on timeout.
+    // No summary event observed; fall back to a conservative terminal state based on timeout.
     let timed_out = start_instant.elapsed() >= Duration::from_secs(AUTO_UPDATE_RUN_MAX_SECS);
-    let (task_status, level, summary_text) = if timed_out {
-        (
-            "failed",
-            "error",
-            if dry_run {
-                format!(
-                    "podman auto-update dry-run timed out after {} seconds; check podman auto-update logs",
-                    AUTO_UPDATE_RUN_MAX_SECS
-                )
-            } else {
-                format!(
-                    "podman auto-update run timed out after {} seconds; check podman auto-update logs",
-                    AUTO_UPDATE_RUN_MAX_SECS
-                )
-            },
-        )
+    let (task_status, unit_status, level, summary_text) = if timed_out {
+        let summary = if dry_run {
+            format!(
+                "podman auto-update dry-run timed out after {} seconds; check podman auto-update logs",
+                AUTO_UPDATE_RUN_MAX_SECS
+            )
+        } else {
+            format!(
+                "podman auto-update run timed out after {} seconds; check podman auto-update logs",
+                AUTO_UPDATE_RUN_MAX_SECS
+            )
+        };
+        ("failed", "failed", "error", summary)
     } else {
-        (
-            "succeeded",
-            "info",
-            if dry_run {
-                "podman auto-update dry-run completed (no JSONL summary found)".to_string()
-            } else {
-                "podman auto-update run completed (no JSONL summary found)".to_string()
-            },
-        )
+        let summary = if dry_run {
+            "podman auto-update dry-run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)"
+                .to_string()
+        } else {
+            "podman auto-update run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)"
+                .to_string()
+        };
+        ("unknown", "unknown", "warning", summary)
     };
 
     let meta = json!({
@@ -9202,7 +9567,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
         task_id,
         task_status,
         unit,
-        task_status,
+        unit_status,
         &summary_text,
         "auto-update-run",
         level,
@@ -9308,8 +9673,12 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
     };
 
     let now = SystemTime::now();
+    let max_age_secs = env::var("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(600);
     let threshold = now
-        .checked_sub(Duration::from_secs(600))
+        .checked_sub(Duration::from_secs(max_age_secs))
         .unwrap_or(UNIX_EPOCH);
 
     let mut latest: Option<(SystemTime, PathBuf)> = None;
@@ -9711,7 +10080,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::sync::Once;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     fn init_test_db() {
         static INIT: Once = Once::new();
@@ -9759,6 +10128,14 @@ mod tests {
         unsafe {
             env::remove_var(key);
         }
+    }
+
+    fn temp_log_dir() -> (TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let log_dir_str = log_dir.to_string_lossy().into_owned();
+        (dir, log_dir_str)
     }
 
     #[test]
@@ -9945,6 +10322,9 @@ mod tests {
             super::ENV_AUTO_UPDATE_LOG_DIR,
             log_dir.to_string_lossy().as_ref(),
         );
+        // Ensure that our synthetic JSONL file is considered recent enough for
+        // ingestion regardless of test runtime/environment clock skew.
+        set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
 
         let unit = "podman-auto-update.service";
         let task_id = create_manual_auto_update_task(unit, "req-auto-update-test", "/auto-update")
@@ -10015,6 +10395,284 @@ mod tests {
             events_for_task, 1,
             "expected exactly one auto-update-warning event for the task"
         );
+    }
+
+    #[test]
+    fn auto_update_run_task_terminal_states_and_warnings() {
+        init_test_db_with_systemctl_mock();
+
+        // 1. Summary present, failed == 0 -> succeeded + warnings ingested.
+        {
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-success",
+                "/auto-update-run-success",
+                Some("ops"),
+                Some("test-success"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            let jsonl_path = Path::new(&log_dir).join("2025-12-05T070437513Z.jsonl");
+            {
+                let mut file = File::create(&jsonl_path).unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"dry-run-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: dry-run failed: EOF"}}"#
+                )
+                .unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"summary","summary":{{"counts":{{"total":2,"succeeded":2,"failed":0}}}}}}"#
+                )
+                .unwrap();
+            }
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "succeeded");
+            let summary = detail
+                .task
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                summary.contains("podman auto-update completed:")
+                    && summary.contains("total=")
+                    && summary.contains("failed=0"),
+                "summary should include completion counts with failed=0, got={summary:?}"
+            );
+            assert!(
+                detail
+                    .logs
+                    .iter()
+                    .any(|log| log.action == "auto-update-warnings"),
+                "expected auto-update-warnings summary log entry"
+            );
+            assert!(
+                detail
+                    .logs
+                    .iter()
+                    .any(|log| log.action == "auto-update-warning"),
+                "expected at least one auto-update-warning log entry"
+            );
+        }
+
+        // 2. Summary present, failed > 0 -> failed + error-level warning logs.
+        {
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-failed",
+                "/auto-update-run-failed",
+                Some("ops"),
+                Some("test-failed"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            let jsonl_path = Path::new(&log_dir).join("2025-12-05T070437513Z.jsonl");
+            {
+                let mut file = File::create(&jsonl_path).unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"auto-update-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: update failed: boom"}}"#
+                )
+                .unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"summary","summary":{{"counts":{{"total":2,"succeeded":0,"failed":2}}}}}}"#
+                )
+                .unwrap();
+            }
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "failed");
+            assert!(
+                detail
+                    .task
+                    .summary
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("failed=2"),
+                "summary should include failed>0, got={:?}",
+                detail.task.summary
+            );
+
+            let warning_logs: Vec<_> = detail
+                .logs
+                .iter()
+                .filter(|log| log.action == "auto-update-warning")
+                .collect();
+            assert!(
+                !warning_logs.is_empty(),
+                "expected at least one auto-update-warning log entry"
+            );
+            assert!(
+                warning_logs.iter().any(|log| log.level == "error"),
+                "expected at least one auto-update-warning with level=error for auto-update-error events"
+            );
+        }
+
+        // 3. No summary + timeout -> failed with timeout reason.
+        {
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-timeout",
+                "/auto-update-run-timeout",
+                Some("ops"),
+                Some("test-timeout"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "failed");
+            let summary = detail
+                .task
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                summary.contains("timed out after"),
+                "timeout summary should mention timeout, got={summary}"
+            );
+
+            let reason = detail
+                .logs
+                .iter()
+                .rev()
+                .find(|log| log.action == "auto-update-run")
+                .and_then(|log| log.meta.as_ref())
+                .and_then(|meta| meta.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(reason, "timeout");
+        }
+
+        // 4. No summary + no timeout -> unknown with warning-level log.
+        {
+            // Point log dir to a non-existent directory so that the polling loop
+            // bails out quickly without waiting for AUTO_UPDATE_RUN_MAX_SECS.
+            let dir = tempfile::tempdir().unwrap();
+            let missing_log_dir = dir.path().join("missing-logs");
+            set_env(
+                super::ENV_AUTO_UPDATE_LOG_DIR,
+                missing_log_dir.to_string_lossy().as_ref(),
+            );
+
+            let unit = "podman-auto-update.service";
+            let task_id = create_manual_auto_update_run_task(
+                unit,
+                "req-auto-update-run-no-summary",
+                "/auto-update-run-no-summary",
+                Some("ops"),
+                Some("test-no-summary"),
+                false,
+            )
+            .expect("manual auto-update run task created");
+
+            run_auto_update_run_task(&task_id, unit, false)
+                .expect("auto-update run task should run");
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert_eq!(detail.task.status, "unknown");
+
+            let final_log = detail
+                .logs
+                .iter()
+                .rev()
+                .find(|log| log.action == "auto-update-run")
+                .expect("expected final auto-update-run log");
+            assert_eq!(final_log.level, "warning");
+            assert!(
+                final_log.summary.contains("no JSONL summary found"),
+                "summary should mention missing JSONL summary, got={}",
+                final_log.summary
+            );
+            let reason = final_log
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert_eq!(reason, "no-summary");
+        }
+
+        // 5. Ingest warnings honours PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS.
+        {
+            init_test_db();
+
+            let (_dir, log_dir) = temp_log_dir();
+            set_env(super::ENV_AUTO_UPDATE_LOG_DIR, &log_dir);
+
+            let unit = "podman-auto-update.service";
+            let task_id =
+                create_manual_auto_update_task(unit, "req-auto-update-max-age", "/auto-update")
+                    .expect("manual auto-update task created");
+
+            let jsonl_path = Path::new(&log_dir).join("2025-12-05T000000000Z.jsonl");
+            {
+                let mut file = File::create(&jsonl_path).unwrap();
+                writeln!(
+                    file,
+                    r#"{{"type":"auto-update-error","at":"2025-12-05T07:08:06.653Z","container":"demo","image":"ghcr.io/example/demo:latest","error":"Error: update failed: boom"}}"#
+                )
+                .unwrap();
+            }
+
+            set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "0");
+
+            ingest_auto_update_warnings(&task_id, unit);
+
+            let detail = load_task_detail_record(&task_id)
+                .expect("detail load should succeed")
+                .expect("task should exist");
+
+            assert!(
+                !detail.logs.iter().any(|log| {
+                    log.action == "auto-update-warning" || log.action == "auto-update-warnings"
+                }),
+                "no warnings should be ingested when JSONL is outside max-age window"
+            );
+        }
     }
 
     #[test]

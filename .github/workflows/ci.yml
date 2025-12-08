@@ -99,7 +99,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run cargo test
-        run: cargo test --locked --all-features
+        run: RUST_TEST_THREADS=1 cargo test --locked --all-features
 
   e2e-tests:
     name: End-to-End Tests

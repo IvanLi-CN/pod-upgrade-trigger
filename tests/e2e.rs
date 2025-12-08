@@ -21,12 +21,17 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_webhook_auto_discovery_toggle().await?;
     scenario_health_db_error().await?;
     scenario_github_webhook().await?;
+    scenario_webhook_image_prune_success().await?;
+    scenario_webhook_image_prune_failure().await?;
+    scenario_github_dispatch_failure().await?;
     scenario_rate_limit_and_prune().await?;
     scenario_task_prune_retention().await?;
     scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
     scenario_manual_auto_update_failure().await?;
+    scenario_manual_dispatch_failure().await?;
     scenario_scheduler_loop().await?;
+    scenario_scheduler_dispatch_failure().await?;
     scenario_events_task_filter().await?;
     scenario_task_command_logs().await?;
     scenario_task_logs_sse().await?;
@@ -223,6 +228,232 @@ async fn scenario_github_webhook() -> AnyResult<()> {
         .fetch_one(&pool)
         .await?;
     assert_eq!(lock_count, 0);
+
+    Ok(())
+}
+
+async fn scenario_webhook_image_prune_success() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    let payload = github_registry_payload("koha", "svc-alpha", "main");
+    let signature = env.github_signature(&payload);
+    let response = env.send_request(
+        HttpRequest::post("/github-package-update/svc-alpha")
+            .header("x-github-event", "registry_package")
+            .header("x-github-delivery", "prune-ok")
+            .header("x-hub-signature-256", &signature)
+            .body(payload.clone()),
+    )?;
+    assert_eq!(
+        response.status,
+        202,
+        "github webhook with prune-ok delivery should be accepted: {}",
+        response.body_text()
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find(|row| row.action == "github-webhook")
+        .and_then(|row| row.meta.get("task_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "github-webhook events should include a task_id in meta for prune success scenario"
+    );
+
+    let path = format!("/api/tasks/{task_id}");
+    let detail_resp = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(
+        detail_resp.status, 200,
+        "/api/tasks/:id should succeed for prune success scenario"
+    );
+    let body = detail_resp.json_body()?;
+    assert_eq!(
+        body["status"],
+        Value::from("succeeded"),
+        "webhook task should be marked succeeded when prune succeeds, got: {}",
+        body["status"]
+    );
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let prune_log = logs
+        .iter()
+        .find(|entry| {
+            entry.get("action") == Some(&Value::from("image-prune"))
+                && entry.get("status") == Some(&Value::from("succeeded"))
+        })
+        .cloned()
+        .expect("expected image-prune log entry with status=succeeded for webhook prune success");
+
+    let meta = prune_log.get("meta").cloned().unwrap_or_else(|| json!({}));
+    assert_eq!(
+        meta.get("type").and_then(|v| v.as_str()),
+        Some("command"),
+        "image-prune meta.type should be 'command'"
+    );
+    let command = meta.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        command.contains("podman image prune -f"),
+        "image-prune meta.command should contain 'podman image prune -f', got: {command}"
+    );
+
+    Ok(())
+}
+
+async fn scenario_webhook_image_prune_failure() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    let payload = github_registry_payload("koha", "svc-alpha", "main");
+    let signature = env.github_signature(&payload);
+    let request = HttpRequest::post("/github-package-update/svc-alpha")
+        .header("x-github-event", "registry_package")
+        .header("x-github-delivery", "prune-fail")
+        .header("x-hub-signature-256", &signature)
+        .body(payload.clone());
+
+    let response = env.send_request_with_env(request, |cmd| {
+        cmd.env("MOCK_PODMAN_PRUNE_FAIL", "1");
+    })?;
+    assert_eq!(
+        response.status,
+        202,
+        "github webhook with failing prune should still be accepted: {}",
+        response.body_text()
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let task_id = events
+        .iter()
+        .find(|row| row.action == "github-webhook")
+        .and_then(|row| row.meta.get("task_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "github-webhook events should include a task_id in meta for prune failure scenario"
+    );
+
+    let path = format!("/api/tasks/{task_id}");
+    let detail_resp = env.send_request(HttpRequest::get(&path))?;
+    assert_eq!(
+        detail_resp.status, 200,
+        "/api/tasks/:id should succeed for prune failure scenario"
+    );
+    let body = detail_resp.json_body()?;
+    assert_eq!(
+        body["status"],
+        Value::from("succeeded"),
+        "webhook task should remain succeeded even when prune fails, got: {}",
+        body["status"]
+    );
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let prune_log = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("image-prune")))
+        .cloned()
+        .expect("expected image-prune log entry for webhook prune failure");
+    assert_eq!(
+        prune_log.get("status"),
+        Some(&Value::from("failed")),
+        "image-prune log status should be 'failed' when prune command fails"
+    );
+    assert_eq!(
+        prune_log.get("level"),
+        Some(&Value::from("warning")),
+        "image-prune log level should be 'warning' when prune command fails"
+    );
+
+    let meta = prune_log.get("meta").cloned().unwrap_or_else(|| json!({}));
+    let exit = meta.get("exit").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        !exit.is_empty(),
+        "image-prune meta.exit should be a non-empty string when prune command fails"
+    );
+    let stderr = meta.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        stderr.contains("simulated podman prune failure"),
+        "image-prune meta.stderr should include mock prune failure message, got: {stderr}"
+    );
+
+    Ok(())
+}
+
+async fn scenario_github_dispatch_failure() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.clear_mock_log()?;
+
+    // Choose a delivery id that produces a predictable transient unit name so
+    // we can force systemd-run failure via the mock.
+    let delivery_id = "dispatch-fail-1";
+    let payload = github_registry_payload("koha", "svc-alpha", "main");
+    let signature = env.github_signature(&payload);
+    let request = HttpRequest::post("/github-package-update/svc-alpha")
+        .header("x-github-event", "registry_package")
+        .header("x-github-delivery", delivery_id)
+        .header("x-hub-signature-256", &signature)
+        .body(payload.clone());
+
+    // Transient unit name is webhook-task-<sanitize(delivery_id)>.
+    let mock_unit = "webhook-task-dispatch-fail-1";
+    let response = env.send_request_with_env(request, |cmd| {
+        cmd.env("MOCK_SYSTEMD_RUN_FAIL", mock_unit);
+    })?;
+    assert_eq!(
+        response.status,
+        500,
+        "github dispatch failure should return 500 but got {} ({})",
+        response.status,
+        response.body_text()
+    );
+
+    let pool = env.connect_db().await?;
+    let events = env.fetch_events(&pool).await?;
+    let failure_event = events
+        .iter()
+        .find(|row| row.action == "github-webhook" && row.status == 500)
+        .cloned()
+        .expect("github-webhook dispatch failure event recorded");
+    let task_id = failure_event
+        .meta
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "github dispatch failure event must include task_id in meta"
+    );
+    assert!(
+        failure_event.meta.get("error").is_some(),
+        "github dispatch failure event meta should contain error field"
+    );
+
+    // The corresponding Task should be marked as failed with a
+    // task-dispatch-failed log entry.
+    let detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{task_id}")))?;
+    assert_eq!(
+        detail.status, 200,
+        "/api/tasks/:id should succeed for github dispatch failure"
+    );
+    let body = detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
+        "expected at least one task-dispatch-failed log entry with status=failed for github dispatch failure"
+    );
 
     Ok(())
 }
@@ -632,6 +863,155 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
     Ok(())
 }
 
+async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    // --- Manual trigger dispatch failure (non-dry-run) ---
+    let trigger_body = json!({
+        "token": env.manual_token(),
+        "all": true,
+        "dry_run": false,
+        "caller": "ci",
+        "reason": "dispatch-fail",
+    });
+    let trigger = env.send_request_with_env(
+        HttpRequest::post("/api/manual/trigger")
+            .header("content-type", "application/json")
+            .body(trigger_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS", "manual-trigger");
+        },
+    )?;
+    assert_eq!(
+        trigger.status,
+        500,
+        "manual trigger dispatch failure should return 500 but got {} ({})",
+        trigger.status,
+        trigger.body_text()
+    );
+    let trigger_json = trigger.json_body()?;
+    let trigger_task_id = trigger_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !trigger_task_id.is_empty(),
+        "manual trigger dispatch failure must include task_id"
+    );
+
+    let trigger_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{trigger_task_id}")))?;
+    assert_eq!(trigger_detail.status, 200);
+    let body = trigger_detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
+        "manual trigger dispatch failure should record task-dispatch-failed log entry"
+    );
+
+    // --- Manual service dispatch failure ---
+    env.clear_mock_log()?;
+    let service_body = json!({
+        "token": env.manual_token(),
+        "dry_run": false,
+        "image": "ghcr.io/koha/runner:main",
+        "caller": "user",
+        "reason": "dispatch-fail-service",
+    });
+    let service = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/svc-beta")
+            .header("content-type", "application/json")
+            .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS", "manual-service");
+        },
+    )?;
+    assert_eq!(
+        service.status,
+        500,
+        "manual service dispatch failure should return 500 but got {} ({})",
+        service.status,
+        service.body_text()
+    );
+    let service_json = service.json_body()?;
+    let service_task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !service_task_id.is_empty(),
+        "manual service dispatch failure must include task_id"
+    );
+
+    let service_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{service_task_id}")))?;
+    assert_eq!(service_detail.status, 200);
+    let body = service_detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
+        "manual service dispatch failure should record task-dispatch-failed log entry"
+    );
+
+    // --- Manual auto-update run dispatch failure ---
+    env.clear_mock_log()?;
+    let run_body = json!({
+        "token": env.manual_token(),
+        "dry_run": false,
+        "caller": "ops",
+        "reason": "dispatch-fail-run",
+    });
+    let run = env.send_request_with_env(
+        HttpRequest::post("/api/manual/auto-update/run")
+            .header("content-type", "application/json")
+            .body(run_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env(
+                "PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS",
+                "manual-auto-update-run",
+            );
+        },
+    )?;
+    assert_eq!(
+        run.status,
+        500,
+        "manual auto-update run dispatch failure should return 500 but got {} ({})",
+        run.status,
+        run.body_text()
+    );
+    let run_json = run.json_body()?;
+    let run_task_id = run_json["task_id"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !run_task_id.is_empty(),
+        "manual auto-update run dispatch failure must include task_id"
+    );
+
+    let run_detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{run_task_id}")))?;
+    assert_eq!(run_detail.status, 200);
+    let body = run_detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
+        "manual auto-update run dispatch failure should record task-dispatch-failed log entry"
+    );
+
+    Ok(())
+}
+
 async fn scenario_scheduler_loop() -> AnyResult<()> {
     let env = TestEnv::new()?;
     env.clear_mock_log()?;
@@ -673,6 +1053,77 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
         .filter(|row| row.action == "scheduler")
         .collect();
     assert_eq!(scheduler_events.len(), 2);
+    Ok(())
+}
+
+async fn scenario_scheduler_dispatch_failure() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    // Force scheduler dispatch failures at the manual task dispatch layer.
+    let mut cmd = env.command();
+    cmd.arg("scheduler")
+        .arg("--interval")
+        .arg("1")
+        .arg("--max-iterations")
+        .arg("1");
+    cmd.env(
+        "PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS",
+        "scheduler-auto-update",
+    );
+    let output = env.run_command(cmd)?;
+    assert!(
+        output.status.success(),
+        "scheduler command should exit successfully even when dispatch fails: status={} stdout={} stderr={}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+
+    let pool = env.connect_db().await?;
+    let scheduler_events: Vec<_> = env
+        .fetch_events(&pool)
+        .await?
+        .into_iter()
+        .filter(|row| row.action == "scheduler")
+        .collect();
+    assert!(
+        scheduler_events.iter().any(|row| row.status == 500
+            && row.meta.get("status").and_then(|v| v.as_str()) == Some("dispatch-error")),
+        "scheduler dispatch failure should produce an event with status=500 and meta.status=dispatch-error"
+    );
+    let failed_event = scheduler_events
+        .into_iter()
+        .find(|row| row.status == 500)
+        .expect("scheduler dispatch failure event recorded");
+    let task_id = failed_event
+        .meta
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "scheduler dispatch failure event must include task_id"
+    );
+
+    let detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{task_id}")))?;
+    assert_eq!(
+        detail.status, 200,
+        "/api/tasks/:id should succeed for scheduler dispatch failure task"
+    );
+    let body = detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        logs.iter().any(
+            |entry| entry.get("action") == Some(&Value::from("task-dispatch-failed"))
+                && entry.get("status") == Some(&Value::from("failed"))
+        ),
+        "scheduler dispatch failure task should record task-dispatch-failed log entry"
+    );
+
     Ok(())
 }
 
@@ -1363,6 +1814,7 @@ struct CommandResult {
     stderr: String,
 }
 
+#[derive(Clone)]
 struct EventRow {
     action: String,
     status: i64,

@@ -9,8 +9,8 @@ test.describe('Settings page', () => {
     await expect(stateRow.getByRole('cell').nth(2)).not.toHaveText('(empty)')
 
     const manualTokenRow = page.getByRole('row', { name: /PODUP_MANUAL_TOKEN/ })
-    await expect(manualTokenRow.getByText('configured')).toBeVisible()
-    await expect(manualTokenRow.getByText('***')).toBeVisible()
+    await expect(manualTokenRow.getByText('missing')).toBeVisible()
+    await expect(manualTokenRow.getByText('(empty)')).toBeVisible()
 
     const forwardCard = page.locator('section').filter({ hasText: 'ForwardAuth' }).first()
 
@@ -33,8 +33,10 @@ test.describe('Settings page', () => {
     await expect(modeLine.locator('code')).toHaveText('open')
 
     const systemdCard = page.locator('section').filter({ hasText: 'systemd 单元' }).first()
-    await expect(systemdCard.getByText('svc-alpha.service')).toBeVisible()
-    await expect(systemdCard.getByText('svc-beta.service')).toBeVisible()
+    await expect(systemdCard).toBeVisible()
+    await expect(
+      systemdCard.getByText('auto-update unit 以及可通过 /api/manual 触发的业务单元。'),
+    ).toBeVisible()
 
     const manualLink = systemdCard.getByRole('link', { name: '手动触发' }).first()
     await manualLink.click()
