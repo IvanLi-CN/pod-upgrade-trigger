@@ -30,6 +30,7 @@ rate_limit_check() {
   local l2_count="${PODUP_LIMIT2_COUNT:-10}"
   local l2_window="${PODUP_LIMIT2_WINDOW:-18000}"
 
+  # Default to generic state dir; prefer PODUP_STATE_DIR in real deployments.
   path="${PODUP_STATE_DIR:-/srv/pod-upgrade-trigger}"
   db="$path/ratelimit.db"
   lock="$path/ratelimit.lock"

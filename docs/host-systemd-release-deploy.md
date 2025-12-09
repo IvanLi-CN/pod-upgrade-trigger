@@ -23,7 +23,7 @@
 
 - 在宿主机上以 **user systemd** 运行：
   - Unit 名称（建议）：`pod-upgrade-trigger-http.service`。
-  - 运行用户：`ivan`（或等价非 root 用户）。
+  - 运行用户：`deploy`（或等价非 root 用户）。
   - 启动命令：
     - `ExecStart=/home/<user>/.local/bin/pod-upgrade-trigger http-server`
   - 监听地址：
@@ -51,7 +51,7 @@
 
 - 宿主机需要满足：
   - 支持 user systemd（`systemctl --user` 可用，必要时启用 linger）。
-  - 用户 `ivan` 的 `$HOME` 路径稳定（例如 `/home/<user>`），并且：
+- 运行用户的 `$HOME` 路径稳定（例如 `/home/<user>`），并且：
     - 存在 `~/.local/bin`，在用户 PATH 中；
     - `pod-upgrade-trigger` 二进制放置于该目录。
   - 可用工具：

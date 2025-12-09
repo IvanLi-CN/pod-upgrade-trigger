@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Default to a generic state dir; override via PODUP_STATE_DIR in real deployments.
 DEFAULT_STATE_DIR="/srv/pod-upgrade-trigger"
 REPORT_SUBDIR="self-update-reports"
 DRY_RUN="false"

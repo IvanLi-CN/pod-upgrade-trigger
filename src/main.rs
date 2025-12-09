@@ -29,7 +29,7 @@ const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
 const DEFAULT_WEB_DIST_DIR: &str = "web/dist";
 const DEFAULT_WEB_DIST_FALLBACK: &str = "/srv/app/web";
-const DEFAULT_CONTAINER_DIR: &str = "/home/<user>/.config/containers/systemd";
+const DEFAULT_CONTAINER_DIR: &str = "/srv/pod-upgrade-trigger/containers/systemd";
 const GITHUB_ROUTE_PREFIX: &str = "github-package-update";
 const DEFAULT_LIMIT1_COUNT: u64 = 2;
 const DEFAULT_LIMIT1_WINDOW: u64 = 600; // 10 minutes
@@ -6422,11 +6422,24 @@ fn manual_api_token() -> String {
 }
 
 fn container_systemd_dir() -> PathBuf {
-    env::var(ENV_CONTAINER_DIR)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTAINER_DIR))
+    if let Ok(raw) = env::var(ENV_CONTAINER_DIR) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return Path::new(trimmed)
+                .join(".config")
+                .join("containers")
+                .join("systemd");
+        }
+    }
+
+    PathBuf::from(DEFAULT_CONTAINER_DIR)
 }
 
 fn auto_update_log_dir() -> Option<PathBuf> {
@@ -10545,7 +10558,7 @@ fn unit_configured_image(unit: &str) -> Option<String> {
         return None;
     }
 
-    let fallback = Path::new(DEFAULT_CONTAINER_DIR).join(format!("{trimmed}.container"));
+    let fallback = container_systemd_dir().join(format!("{trimmed}.container"));
     parse_container_image(&fallback)
 }
 

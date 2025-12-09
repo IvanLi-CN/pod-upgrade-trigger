@@ -1,6 +1,6 @@
 # User-level oneshot updater for pod-upgrade-trigger
 # Copy to ~/.config/systemd/user/pod-upgrade-trigger-updater.service and adjust paths/env.
-# ExecStart must point to the deployed script path (e.g. /home/<user>/Projects/pod-upgrade-trigger/scripts/update-pod-upgrade-trigger-from-release.sh).
+# ExecStart must point to the deployed script path (e.g. /srv/pod-upgrade-trigger/scripts/update-pod-upgrade-trigger-from-release.sh).
 # Override TARGET_BIN/PODUP_RELEASE_BASE_URL/PODUP_RELEASE_TAG via Environment= or EnvironmentFile=; do not bake host-specific paths into the script itself.
 
 [Unit]
