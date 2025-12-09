@@ -192,15 +192,24 @@
 - 验证：
   - 通过手工制造新 Release 或模拟版本号差异，验证定时任务能够自动更新并重启服务。
 
-### M5（可选）：与现有 auto-update 体系集成
+### M5：自更新报告 + `/tasks` 导入
 
-- 内容：
-  - 视现有 `podman-auto-update.service` / `podman-update-manager.ts` 等组件情况，考虑：
-    - 在检测到 `pod-upgrade-trigger` 新版本时，不再尝试滚动某个容器；
-    - 改为调用 `update-pod-upgrade-trigger-from-release.sh`；
-    - 将执行结果写入统一的 `/tasks` / `/events` JSONL / summary。
-- 验证：
-  - 在统一的任务 / 事件视图中，可以看到“pod-upgrade-trigger 自更新”的记录，与其它容器更新事件共存。
+- 自更新执行器脚本：`scripts/self-update-runner.sh`。它调用 `scripts/update-pod-upgrade-trigger-from-release.sh`，不会访问 SQLite；每次运行结束都会生成一份 JSON 报告（即使失败）。
+- 报告目录：
+  - `PODUP_SELF_UPDATE_REPORT_DIR` 设置且非空时优先使用；
+  - 否则落在 `${PODUP_STATE_DIR:-/srv/pod-upgrade-trigger}/self-update-reports`；
+  - 文件名 `self-update-<timestamp>-<pid>.json`（先写 `.json.tmp` 再 `mv` 原子落盘）。
+- 报告字段（最小集）：`type="self-update-run"`、`started_at`、`finished_at`、`status`、`exit_code`、`binary_path`、`release_tag`、`stderr_tail`、`runner_host`、`runner_pid`，时间为 Unix 秒。
+- crontab 示例（建议用执行器而不是直接跑更新脚本）：
+
+  ```
+  */30 * * * * PODUP_STATE_DIR=/srv/podup /opt/pod-upgrade-trigger/scripts/self-update-runner.sh >>$HOME/.local/share/podup-self-update.log 2>&1
+  ```
+
+- 导入逻辑：
+  - `pod-upgrade-trigger http-server` 每分钟扫描报告目录并导入新的 `.json`；
+  - 成功导入后重命名为 `.json.imported`，避免重复处理；
+  - 导入的任务出现在 `/tasks` / UI，`type=self-update-run`，单位固定 `pod-upgrade-trigger-http.service`，日志 action=`self-update-run`。
 
 ## 六、后续工作
 

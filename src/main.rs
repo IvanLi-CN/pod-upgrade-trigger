@@ -54,6 +54,8 @@ const COMMAND_OUTPUT_MAX_LEN: usize = 32_768;
 const DEFAULT_SCHEDULER_INTERVAL_SECS: u64 = 900;
 const DEFAULT_STATE_RETENTION_SECS: u64 = 86_400; // 24 hours
 const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
+const SELF_UPDATE_IMPORT_INTERVAL_SECS: u64 = 60;
+const SELF_UPDATE_UNIT: &str = "pod-upgrade-trigger-http.service";
 
 // Environment variable names (external interface). All variables use the
 // PODUP_ prefix to avoid ambiguity with legacy naming.
@@ -80,6 +82,7 @@ const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
 const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
 const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
 const ENV_AUTO_UPDATE_LOG_DIR: &str = "PODUP_AUTO_UPDATE_LOG_DIR";
+const ENV_SELF_UPDATE_REPORT_DIR: &str = "PODUP_SELF_UPDATE_REPORT_DIR";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -92,6 +95,7 @@ static DB_INIT_STATUS: OnceLock<RwLock<DbInitStatus>> = OnceLock::new();
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static PODMAN_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
 static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static SELF_UPDATE_IMPORTER_STARTED: OnceLock<()> = OnceLock::new();
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -498,6 +502,8 @@ fn run_seed_demo_cli(_args: &[String]) -> ! {
 }
 
 fn run_http_server_cli(_args: &[String]) -> ! {
+    start_self_update_report_importer();
+
     let addr = env::var(ENV_HTTP_ADDR).unwrap_or_else(|_| "0.0.0.0:25111".to_string());
     let listener = TcpListener::bind(&addr).unwrap_or_else(|err| {
         eprintln!("failed to bind HTTP address {addr}: {err}");
@@ -524,6 +530,21 @@ fn run_http_server_cli(_args: &[String]) -> ! {
             }
         }
     }
+}
+
+fn start_self_update_report_importer() {
+    if SELF_UPDATE_IMPORTER_STARTED.set(()).is_err() {
+        return;
+    }
+
+    thread::spawn(|| {
+        loop {
+            if let Err(err) = import_self_update_reports_once() {
+                log_message(&format!("warn self-update-import-error err={err}"));
+            }
+            thread::sleep(Duration::from_secs(SELF_UPDATE_IMPORT_INTERVAL_SECS));
+        }
+    });
 }
 
 fn spawn_server_for_stream(stream: TcpStream) -> Result<(), String> {
@@ -4638,6 +4659,11 @@ enum TaskMeta {
         #[serde(default)]
         dry_run: bool,
     },
+    #[serde(rename = "self-update-run")]
+    SelfUpdateRun {
+        #[serde(default)]
+        dry_run: bool,
+    },
     #[serde(rename = "maintenance-prune")]
     MaintenancePrune {
         max_age_hours: u64,
@@ -4763,6 +4789,32 @@ struct TaskDetailResponse {
 #[derive(Debug, Serialize)]
 struct TaskEventsHint {
     task_id: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SelfUpdateReport {
+    #[serde(rename = "type")]
+    report_type: Option<String>,
+    #[serde(default)]
+    started_at: Option<i64>,
+    #[serde(default)]
+    finished_at: Option<i64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i64>,
+    #[serde(default)]
+    binary_path: Option<String>,
+    #[serde(default)]
+    release_tag: Option<String>,
+    #[serde(default)]
+    stderr_tail: Option<String>,
+    #[serde(default)]
+    runner_host: Option<String>,
+    #[serde(default)]
+    runner_pid: Option<i64>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6202,6 +6254,18 @@ fn auto_update_log_dir() -> Option<PathBuf> {
             .join("podman-auto-update")
             .join("logs"),
     )
+}
+
+fn self_update_report_dir() -> PathBuf {
+    if let Ok(raw) = env::var(ENV_SELF_UPDATE_REPORT_DIR) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    let state_dir = env::var(ENV_STATE_DIR).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    Path::new(&state_dir).join("self-update-reports")
 }
 
 fn query_flag(ctx: &RequestContext, names: &[&str]) -> bool {
@@ -8941,6 +9005,282 @@ fn append_task_log(
         tx.commit().await?;
         Ok::<(), sqlx::Error>(())
     });
+}
+
+fn import_self_update_reports_once() -> Result<(), String> {
+    let dir = self_update_report_dir();
+    let dir_display = dir.to_string_lossy().to_string();
+
+    if dir_display.trim().is_empty() {
+        return Err("self-update-report-dir-empty".to_string());
+    }
+
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return Err(format!(
+            "self-update-report-dir-create-failed dir={} err={err}",
+            dir_display
+        ));
+    }
+
+    let read_dir = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(err) => {
+            return Err(format!(
+                "self-update-report-dir-read-failed dir={} err={err}",
+                dir_display
+            ));
+        }
+    };
+
+    let mut last_error: Option<String> = None;
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-entry-error dir={} err={err}",
+                    dir_display
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let raw = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-read path={} err={err}",
+                    path.display()
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let raw_value: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-parse path={} err={err}",
+                    path.display()
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let report: SelfUpdateReport = match serde_json::from_value(raw_value.clone()) {
+            Ok(r) => r,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-structure path={} err={err}",
+                    path.display()
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let report_type_ok = report
+            .report_type
+            .as_deref()
+            .map(|t| t == "self-update-run")
+            .unwrap_or(false);
+        if !report_type_ok {
+            log_message(&format!(
+                "warn self-update-import-skip path={} reason=type-mismatch",
+                path.display()
+            ));
+            last_error = Some("type-mismatch".to_string());
+            continue;
+        }
+
+        let now = current_unix_secs() as i64;
+        let started_at = report.started_at.or(report.finished_at).unwrap_or(now);
+        let finished_at = report.finished_at.unwrap_or(started_at);
+        let created_at = started_at.min(finished_at);
+
+        let status_raw = report
+            .status
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let normalized = status_raw.to_ascii_lowercase();
+        let succeeded = matches!(
+            normalized.as_str(),
+            "succeeded" | "success" | "ok" | "passed"
+        );
+        let task_status = if succeeded { "succeeded" } else { "failed" };
+        let exit_label = report
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        let summary = if succeeded {
+            if let Some(tag) = report.release_tag.as_ref().filter(|t| !t.trim().is_empty()) {
+                format!("Self-update from GitHub Release succeeded ({tag})")
+            } else {
+                "Self-update from GitHub Release succeeded".to_string()
+            }
+        } else {
+            format!("Self-update failed (exit={exit_label})")
+        };
+
+        let unit_name = SELF_UPDATE_UNIT.to_string();
+        let unit_slug = unit_name
+            .trim_end_matches(".service")
+            .trim_matches('/')
+            .to_string();
+        let binary_path = report.binary_path.clone();
+        let runner_pid = report.runner_pid;
+        let extra_fields = report.extra.clone();
+
+        let meta_value = TaskMeta::SelfUpdateRun { dry_run: false };
+        let meta_str = match serde_json::to_string(&meta_value) {
+            Ok(v) => v,
+            Err(err) => {
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let log_meta = json!({
+            "report": raw_value,
+            "source_file": file_name,
+            "binary_path": binary_path,
+            "runner_pid": runner_pid,
+            "extra": extra_fields,
+        });
+        let log_meta_str = serde_json::to_string(&log_meta).unwrap_or_else(|_| "{}".to_string());
+
+        let task_id = format!("tsk_{}", next_request_id());
+        let task_id_clone = task_id.clone();
+        let kind = "self-update".to_string();
+        let summary_clone = summary.clone();
+        let unit_name_clone = unit_name.clone();
+        let unit_slug_clone = unit_slug.clone();
+        let trigger_source = "self-update-runner".to_string();
+        let trigger_reason = report.release_tag.clone();
+        let stderr_tail = report.stderr_tail.clone();
+        let runner_host = report.runner_host.clone();
+        let request_id = Some(file_name.clone());
+        let task_status_clone = task_status.to_string();
+
+        let db_result = with_db(|pool| async move {
+            let mut tx = pool.begin().await?;
+
+            sqlx::query(
+                "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+                 updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+                 trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+                 can_force_stop, can_retry, is_long_running, retry_of) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(&kind)
+            .bind(&task_status_clone)
+            .bind(created_at)
+            .bind(Some(started_at))
+            .bind(Some(finished_at))
+            .bind(Some(finished_at))
+            .bind(Some(summary_clone.clone()))
+            .bind(&meta_str)
+            .bind(&trigger_source)
+            .bind(&request_id)
+            .bind(Some("/self-update-report".to_string()))
+            .bind(runner_host.clone())
+            .bind(trigger_reason.clone())
+            .bind(Option::<i64>::None)
+            .bind(0_i64)
+            .bind(0_i64)
+            .bind(0_i64)
+            .bind(Some(0_i64))
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_units \
+                 (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+                  duration_ms, message, error) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(&unit_name_clone)
+            .bind(Some(unit_slug_clone))
+            .bind(&unit_name_clone)
+            .bind(&task_status_clone)
+            .bind(Some("completed"))
+            .bind(Some(started_at))
+            .bind(Some(finished_at))
+            .bind(Some(
+                finished_at.saturating_sub(started_at).saturating_mul(1000),
+            ))
+            .bind(Some(summary_clone.clone()))
+            .bind(if succeeded { None } else { stderr_tail.clone() })
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(finished_at)
+            .bind(if succeeded { "info" } else { "error" })
+            .bind("self-update-run")
+            .bind(&task_status_clone)
+            .bind(summary_clone)
+            .bind(Some(unit_name_clone))
+            .bind(log_meta_str)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok::<(), sqlx::Error>(())
+        });
+
+        if let Err(err) = db_result {
+            log_message(&format!(
+                "warn self-update-import-db path={} err={err}",
+                path.display()
+            ));
+            last_error = Some(err.to_string());
+            continue;
+        }
+
+        let imported_name = format!("{file_name}.imported");
+        let imported_path = path.with_file_name(imported_name);
+        if let Err(err) = fs::rename(&path, &imported_path) {
+            log_message(&format!(
+                "warn self-update-import-rename path={} err={err}",
+                path.display()
+            ));
+            last_error = Some(err.to_string());
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
