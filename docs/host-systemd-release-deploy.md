@@ -178,14 +178,17 @@
 ### M4：自动更新（systemd timer）
 
 - 内容：
-  - 定义并添加：
-    - `pod-upgrade-trigger-updater.service`（`Type=oneshot`，`ExecStart` 调用更新脚本）。
-    - `pod-upgrade-trigger-updater.timer`（例如 `OnBootSec=5m`、`OnUnitActiveSec=6h`）。
-  - 在当前机器上启用：
-    - `systemctl --user enable --now pod-upgrade-trigger-updater.timer`
+  - 示例 user unit：`systemd/pod-upgrade-trigger-updater.user.service.example`（`Type=oneshot`，`ExecStart` 调用更新脚本）。
+  - 示例 timer：`systemd/pod-upgrade-trigger-updater.user.timer.example`（`OnBootSec=5m`、`OnUnitActiveSec=6h`，`Persistent=true`）。
+  - 启用步骤（user systemd）：
+    1. 将上述两个示例复制到 `~/.config/systemd/user/`。
+    2. 按实际部署路径修改 `ExecStart`，必要时用 `Environment=TARGET_BIN=...`、`Environment=PODUP_RELEASE_BASE_URL=...` 或 `EnvironmentFile=%h/.config/pod-upgrade-trigger-updater.env` 覆盖目标二进制和下载源。
+    3. `systemctl --user daemon-reload`
+    4. `systemctl --user enable --now pod-upgrade-trigger-updater.timer`
+    5. 使用 `systemctl --user status pod-upgrade-trigger-updater.timer`、`journalctl --user -u pod-upgrade-trigger-updater.service` 检查运行。
   - 确保：
     - 定时任务在 journald 中有清晰日志；
-    - 失败不影响现有服务运行。
+    - Release 不可用或下载失败时返回非 0，不影响现有 `pod-upgrade-trigger-http.service` 正常运行。
 - 验证：
   - 通过手工制造新 Release 或模拟版本号差异，验证定时任务能够自动更新并重启服务。
 
