@@ -4804,6 +4804,8 @@ struct SelfUpdateReport {
     #[serde(default)]
     exit_code: Option<i64>,
     #[serde(default)]
+    dry_run: Option<bool>,
+    #[serde(default)]
     binary_path: Option<String>,
     #[serde(default)]
     release_tag: Option<String>,
@@ -9130,13 +9132,22 @@ fn import_self_update_reports_once() -> Result<(), String> {
             .exit_code
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let dry_run = report.dry_run.unwrap_or(false);
 
         let summary = if succeeded {
-            if let Some(tag) = report.release_tag.as_ref().filter(|t| !t.trim().is_empty()) {
+            if dry_run {
+                if let Some(tag) = report.release_tag.as_ref().filter(|t| !t.trim().is_empty()) {
+                    format!("Self-update dry-run from GitHub Release succeeded ({tag})")
+                } else {
+                    "Self-update dry-run from GitHub Release succeeded".to_string()
+                }
+            } else if let Some(tag) = report.release_tag.as_ref().filter(|t| !t.trim().is_empty()) {
                 format!("Self-update from GitHub Release succeeded ({tag})")
             } else {
                 "Self-update from GitHub Release succeeded".to_string()
             }
+        } else if dry_run {
+            format!("Self-update dry-run failed (exit={exit_label})")
         } else {
             format!("Self-update failed (exit={exit_label})")
         };
@@ -9150,7 +9161,7 @@ fn import_self_update_reports_once() -> Result<(), String> {
         let runner_pid = report.runner_pid;
         let extra_fields = report.extra.clone();
 
-        let meta_value = TaskMeta::SelfUpdateRun { dry_run: false };
+        let meta_value = TaskMeta::SelfUpdateRun { dry_run };
         let meta_str = match serde_json::to_string(&meta_value) {
             Ok(v) => v,
             Err(err) => {
@@ -9165,6 +9176,7 @@ fn import_self_update_reports_once() -> Result<(), String> {
             "binary_path": binary_path,
             "runner_pid": runner_pid,
             "extra": extra_fields,
+            "dry_run": dry_run,
         });
         let log_meta_str = serde_json::to_string(&log_meta).unwrap_or_else(|_| "{}".to_string());
 

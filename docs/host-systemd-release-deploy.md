@@ -194,22 +194,23 @@
 
 ### M5：自更新报告 + `/tasks` 导入
 
-- 自更新执行器脚本：`scripts/self-update-runner.sh`。它调用 `scripts/update-pod-upgrade-trigger-from-release.sh`，不会访问 SQLite；每次运行结束都会生成一份 JSON 报告（即使失败）。
+- 自更新执行器脚本：`scripts/self-update-runner.sh`。它调用 `scripts/update-pod-upgrade-trigger-from-release.sh`，不会访问 SQLite；每次运行结束都会生成一份 JSON 报告（即使失败）。支持 dry-run：通过 `--dry-run` 或 `PODUP_SELF_UPDATE_DRY_RUN=1|true|yes|on` 只检查下载与校验，不替换二进制也不重启服务，仍会输出报告。
 - 报告目录：
   - `PODUP_SELF_UPDATE_REPORT_DIR` 设置且非空时优先使用；
   - 否则落在 `${PODUP_STATE_DIR:-/srv/pod-upgrade-trigger}/self-update-reports`；
   - 文件名 `self-update-<timestamp>-<pid>.json`（先写 `.json.tmp` 再 `mv` 原子落盘）。
-- 报告字段（最小集）：`type="self-update-run"`、`started_at`、`finished_at`、`status`、`exit_code`、`binary_path`、`release_tag`、`stderr_tail`、`runner_host`、`runner_pid`，时间为 Unix 秒。
+- 报告字段（最小集）：`type="self-update-run"`、`dry_run`（布尔，缺省视为 false）、`started_at`、`finished_at`、`status`、`exit_code`、`binary_path`、`release_tag`、`stderr_tail`、`runner_host`、`runner_pid`，时间为 Unix 秒。
 - crontab 示例（建议用执行器而不是直接跑更新脚本）：
 
   ```
   */30 * * * * PODUP_STATE_DIR=/srv/podup /opt/pod-upgrade-trigger/scripts/self-update-runner.sh >>$HOME/.local/share/podup-self-update.log 2>&1
+  - 需要预检时可加 `--dry-run`，只验证 Release 可用性与校验值。
   ```
 
 - 导入逻辑：
   - `pod-upgrade-trigger http-server` 每分钟扫描报告目录并导入新的 `.json`；
   - 成功导入后重命名为 `.json.imported`，避免重复处理；
-  - 导入的任务出现在 `/tasks` / UI，`type=self-update-run`，单位固定 `pod-upgrade-trigger-http.service`，日志 action=`self-update-run`。
+- 导入的任务出现在 `/tasks` / UI，`type=self-update-run`，单位固定 `pod-upgrade-trigger-http.service`，日志 action=`self-update-run`，任务 meta 中包含 `dry_run` 标记（旧报告未带字段时默认为 false）。
 
 ## 六、后续工作
 

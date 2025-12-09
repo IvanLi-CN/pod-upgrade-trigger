@@ -3,6 +3,23 @@ set -euo pipefail
 
 DEFAULT_STATE_DIR="/srv/pod-upgrade-trigger"
 REPORT_SUBDIR="self-update-reports"
+DRY_RUN="false"
+
+parse_bool() {
+  local value="${1:-}"
+  value="${value,,}"
+  case "$value" in
+  1 | true | yes | on)
+    echo "true"
+    ;;
+  0 | false | no | off | "")
+    echo "false"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 update_script="${script_dir}/update-pod-upgrade-trigger-from-release.sh"
@@ -20,6 +37,27 @@ fi
 
 mkdir -p "$report_dir"
 
+if [ -n "${PODUP_SELF_UPDATE_DRY_RUN:-}" ]; then
+  DRY_RUN=$(parse_bool "$PODUP_SELF_UPDATE_DRY_RUN" || echo "false")
+fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+  --dry-run)
+    DRY_RUN="true"
+    ;;
+  -h | --help)
+    echo "Usage: self-update-runner.sh [--dry-run]" >&2
+    exit 0
+    ;;
+  *)
+    echo "[ERROR] Unknown argument: $1" >&2
+    exit 2
+    ;;
+  esac
+  shift
+done
+
 started_at="$(date +%s)"
 stderr_tail=""
 exit_code=0
@@ -34,7 +72,11 @@ else
   stderr_file="$(mktemp "${report_dir}/self-update-${started_at}-$$.stderr.XXXXXX")"
 
   set +e
-  "$update_script" 2>"$stderr_file"
+  if [ "$DRY_RUN" = "true" ]; then
+    PODUP_SELF_UPDATE_DRY_RUN=1 "$update_script" --dry-run 2>"$stderr_file"
+  else
+    "$update_script" 2>"$stderr_file"
+  fi
   exit_code=$?
   set -e
 
@@ -63,6 +105,7 @@ export PODUP_RELEASE_TAG="$release_tag"
 export PODUP_STDERR_TAIL="$stderr_tail"
 export PODUP_RUNNER_HOST="$runner_host"
 export PODUP_RUNNER_PID="$$"
+export PODUP_DRY_RUN="$DRY_RUN"
 
 report_json="$(python3 - <<'PY'
 import json
@@ -72,8 +115,12 @@ def optional(key):
     value = os.environ.get(key, "")
     return value if value else None
 
+dry_run_env = os.environ.get("PODUP_DRY_RUN", "false").lower()
+dry_run = dry_run_env in ("1", "true", "yes", "on")
+
 report = {
     "type": "self-update-run",
+    "dry_run": dry_run,
     "started_at": int(os.environ["PODUP_STARTED_AT"]),
     "finished_at": int(os.environ["PODUP_FINISHED_AT"]),
     "status": os.environ["PODUP_STATUS"],

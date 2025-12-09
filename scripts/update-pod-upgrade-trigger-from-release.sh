@@ -15,6 +15,7 @@ TARGET_DIR="$(dirname "$TARGET_BIN")"
 ASSET_NAME_BIN="pod-upgrade-trigger-x86_64-unknown-linux-gnu"
 ASSET_NAME_SHA="pod-upgrade-trigger-x86_64-unknown-linux-gnu.sha256"
 BASE_URL="${PODUP_RELEASE_BASE_URL:-https://github.com}"
+DRY_RUN="false"
 
 TMP_DIR=""
 cleanup() {
@@ -23,6 +24,31 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+parse_bool() {
+  local value="${1:-}"
+  value="${value,,}"
+  case "$value" in
+  1 | true | yes | on)
+    echo "true"
+    ;;
+  0 | false | no | off | "")
+    echo "false"
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+usage() {
+  cat <<'USAGE'
+Usage: update-pod-upgrade-trigger-from-release.sh [--dry-run]
+
+Options:
+  --dry-run   Download and verify the release artifacts only; do not replace the binary or restart the service.
+USAGE
+}
 
 detect_current_version() {
   if [ -x "$TARGET_BIN" ]; then
@@ -63,6 +89,31 @@ fetch_latest_tag() {
 }
 
 main() {
+  if [ -n "${PODUP_SELF_UPDATE_DRY_RUN:-}" ]; then
+    DRY_RUN=$(parse_bool "$PODUP_SELF_UPDATE_DRY_RUN" || echo "false")
+  fi
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --dry-run)
+      DRY_RUN="true"
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      log_error "Unknown argument: $1"
+      exit 2
+      ;;
+    esac
+    shift
+  done
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log_info "Dry-run mode enabled"
+  fi
+
   local current_version release_tag
   current_version=$(detect_current_version)
   log_info "Current version: ${current_version}"
@@ -93,6 +144,11 @@ main() {
     curl --fail --silent --show-error --location -o "$ASSET_NAME_BIN" "$binary_url"
     sha256sum -c "$ASSET_NAME_SHA"
   )
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log_info "self-update dry-run: binary verified; no changes applied"
+    return 0
+  fi
 
   local staged_bin
   staged_bin="${TARGET_BIN}.new"
