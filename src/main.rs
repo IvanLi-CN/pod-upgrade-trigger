@@ -56,6 +56,9 @@ const DEFAULT_STATE_RETENTION_SECS: u64 = 86_400; // 24 hours
 const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
 const SELF_UPDATE_IMPORT_INTERVAL_SECS: u64 = 60;
 const SELF_UPDATE_UNIT: &str = "pod-upgrade-trigger-http.service";
+const ENV_SELF_UPDATE_COMMAND: &str = "PODUP_SELF_UPDATE_COMMAND";
+const ENV_SELF_UPDATE_CRON: &str = "PODUP_SELF_UPDATE_CRON";
+const ENV_SELF_UPDATE_DRY_RUN: &str = "PODUP_SELF_UPDATE_DRY_RUN";
 
 // Environment variable names (external interface). All variables use the
 // PODUP_ prefix to avoid ambiguity with legacy naming.
@@ -96,6 +99,8 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static PODMAN_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
 static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static SELF_UPDATE_IMPORTER_STARTED: OnceLock<()> = OnceLock::new();
+static SELF_UPDATE_SCHEDULER_STARTED: OnceLock<()> = OnceLock::new();
+static SELF_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -502,6 +507,7 @@ fn run_seed_demo_cli(_args: &[String]) -> ! {
 }
 
 fn run_http_server_cli(_args: &[String]) -> ! {
+    start_self_update_scheduler();
     start_self_update_report_importer();
 
     let addr = env::var(ENV_HTTP_ADDR).unwrap_or_else(|_| "0.0.0.0:25111".to_string());
@@ -530,6 +536,189 @@ fn run_http_server_cli(_args: &[String]) -> ! {
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum SelfUpdateSchedule {
+    EveryMinutes(u64),
+    EveryHours(u64),
+}
+
+fn parse_self_update_cron(expr: &str) -> Result<SelfUpdateSchedule, String> {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 5 {
+        return Err("invalid-field-count".to_string());
+    }
+
+    let minute = parts[0];
+    let hour = parts[1];
+    let dom = parts[2];
+    let month = parts[3];
+    let dow = parts[4];
+
+    if dom != "*" || month != "*" || dow != "*" {
+        return Err("unsupported-fields".to_string());
+    }
+
+    if hour == "*" {
+        if let Some(n_raw) = minute.strip_prefix("*/") {
+            let n = n_raw
+                .parse::<u64>()
+                .map_err(|_| "invalid-minute-interval".to_string())?;
+            if n == 0 {
+                return Err("minute-interval-zero".to_string());
+            }
+            return Ok(SelfUpdateSchedule::EveryMinutes(n));
+        }
+    }
+
+    if minute == "0" {
+        if let Some(n_raw) = hour.strip_prefix("*/") {
+            let n = n_raw
+                .parse::<u64>()
+                .map_err(|_| "invalid-hour-interval".to_string())?;
+            if n == 0 {
+                return Err("hour-interval-zero".to_string());
+            }
+            return Ok(SelfUpdateSchedule::EveryHours(n));
+        }
+    }
+
+    Err("unsupported-cron-pattern".to_string())
+}
+
+fn parse_env_bool(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn start_self_update_scheduler() {
+    if SELF_UPDATE_SCHEDULER_STARTED.set(()).is_err() {
+        return;
+    }
+
+    let command = env::var(ENV_SELF_UPDATE_COMMAND)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let Some(command) = command else {
+        log_message("info self-update-scheduler-disabled reason=command-missing");
+        return;
+    };
+
+    let command_path = Path::new(&command);
+    if !command_path.exists() {
+        log_message(&format!(
+            "warn self-update-command-invalid path={} reason=not-found",
+            command
+        ));
+        return;
+    }
+    if !command_path.is_file() {
+        log_message(&format!(
+            "warn self-update-command-invalid path={} reason=not-file",
+            command
+        ));
+        return;
+    }
+
+    let cron_raw = env::var(ENV_SELF_UPDATE_CRON).unwrap_or_default();
+    let cron_expr = cron_raw.trim().to_string();
+    if cron_expr.is_empty() {
+        log_message("warn self-update-cron-invalid expr=\"\" reason=missing");
+        return;
+    }
+
+    let schedule = match parse_self_update_cron(&cron_expr) {
+        Ok(s) => s,
+        Err(err) => {
+            log_message(&format!(
+                "warn self-update-cron-invalid expr=\"{}\" reason={}",
+                cron_expr, err
+            ));
+            return;
+        }
+    };
+
+    let dry_run = parse_env_bool(ENV_SELF_UPDATE_DRY_RUN);
+    let command_clone = command.clone();
+    thread::spawn(move || self_update_scheduler_loop(command_clone, schedule, dry_run));
+
+    log_message(&format!(
+        "info self-update-scheduler-start command={} expr=\"{}\" dry_run={}",
+        command, cron_expr, dry_run
+    ));
+}
+
+fn self_update_scheduler_loop(command: String, schedule: SelfUpdateSchedule, dry_run: bool) {
+    let interval_secs = match schedule {
+        SelfUpdateSchedule::EveryMinutes(n) => n.saturating_mul(60),
+        SelfUpdateSchedule::EveryHours(n) => n.saturating_mul(3_600),
+    }
+    .max(1);
+
+    loop {
+        if SELF_UPDATE_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            log_message("info self-update-skip-running reason=still-running");
+            thread::sleep(Duration::from_secs(interval_secs));
+            continue;
+        }
+
+        let started_at = current_unix_secs();
+        let result = run_self_update_command(&command, dry_run);
+
+        match result {
+            Ok(status) => {
+                let exit_label = status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                let level = if status.success() { "info" } else { "warn" };
+                log_message(&format!(
+                    "{level} self-update-run-finished exit={} success={} dry_run={} elapsed={}s",
+                    exit_label,
+                    status.success(),
+                    dry_run,
+                    current_unix_secs().saturating_sub(started_at)
+                ));
+            }
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-run-error err={} dry_run={} elapsed={}s",
+                    err,
+                    dry_run,
+                    current_unix_secs().saturating_sub(started_at)
+                ));
+            }
+        }
+
+        SELF_UPDATE_RUNNING.store(false, Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(interval_secs));
+    }
+}
+
+fn run_self_update_command(command: &str, dry_run: bool) -> Result<ExitStatus, String> {
+    let mut cmd = Command::new(command);
+    if dry_run {
+        cmd.arg("--dry-run");
+        cmd.env(ENV_SELF_UPDATE_DRY_RUN, "1");
+    }
+
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::inherit());
+
+    cmd.status().map_err(|e| format!("spawn-failed: {e}"))
 }
 
 fn start_self_update_report_importer() {

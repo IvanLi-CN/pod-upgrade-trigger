@@ -200,6 +200,11 @@
   - 否则落在 `${PODUP_STATE_DIR:-/srv/pod-upgrade-trigger}/self-update-reports`；
   - 文件名 `self-update-<timestamp>-<pid>.json`（先写 `.json.tmp` 再 `mv` 原子落盘）。
 - 报告字段（最小集）：`type="self-update-run"`、`dry_run`（布尔，缺省视为 false）、`started_at`、`finished_at`、`status`、`exit_code`、`binary_path`、`release_tag`、`stderr_tail`、`runner_host`、`runner_pid`，时间为 Unix 秒。
+- 内建调度（主程序线程）：
+  - 通过环境变量启用：`PODUP_SELF_UPDATE_COMMAND`（必填，通常指向 `scripts/self-update-runner.sh`）、`PODUP_SELF_UPDATE_CRON`（必填，支持 `*/N * * * *` 或 `0 */N * * *` 两种子集语法）、`PODUP_SELF_UPDATE_DRY_RUN`（可选，1/true/yes/on 表示 dry-run）。
+  - 配置有效时，`pod-upgrade-trigger http-server` 会在后台线程按 cron 周期调用自更新执行器；上一轮未结束时会跳过本轮，避免重叠。
+  - 配置缺失或表达式不符合子集语法时，仅记录 warning 日志并禁用内建调度，可继续使用外部 crontab。
+  - 执行器生成的报告仍由导入线程每 60 秒扫描并写入 `/tasks`，可在 UI 看到 kind=self-update / type=self-update-run 的任务记录。
 - crontab 示例（建议用执行器而不是直接跑更新脚本）：
 
   ```
