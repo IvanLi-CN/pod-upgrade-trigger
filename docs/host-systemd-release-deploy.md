@@ -1,6 +1,6 @@
 # 本机 systemd + GitHub Release 部署方案
 
-本文在现有 `container-deploy.md` 的基础上，给出“放弃容器常驻运行、改为本机 systemd（user 服务）+ GitHub Release 二进制发布”的需求与里程碑规划。目标是先在当前这台机器上落地一套稳定的生产形态，不考虑数据迁移。
+本文在现有 `container-deploy.md` 的基础上，给出“放弃容器常驻运行、改为本机 systemd（user 服务）+ GitHub Release 二进制发布”的需求与里程碑规划。目标是先在当前这台机器上落地一套稳定的生产形态，不考虑数据迁移。运行视角的操作卡片与切换步骤见 `docs/deployment-host-systemd-prod.md`。
 
 ## 一、背景与范围
 
