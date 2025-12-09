@@ -29,7 +29,7 @@ const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
 const DEFAULT_WEB_DIST_DIR: &str = "web/dist";
 const DEFAULT_WEB_DIST_FALLBACK: &str = "/srv/app/web";
-const DEFAULT_CONTAINER_DIR: &str = "/home/<user>/.config/containers/systemd";
+const DEFAULT_CONTAINER_DIR: &str = "/srv/pod-upgrade-trigger/containers/systemd";
 const GITHUB_ROUTE_PREFIX: &str = "github-package-update";
 const DEFAULT_LIMIT1_COUNT: u64 = 2;
 const DEFAULT_LIMIT1_WINDOW: u64 = 600; // 10 minutes
@@ -54,6 +54,11 @@ const COMMAND_OUTPUT_MAX_LEN: usize = 32_768;
 const DEFAULT_SCHEDULER_INTERVAL_SECS: u64 = 900;
 const DEFAULT_STATE_RETENTION_SECS: u64 = 86_400; // 24 hours
 const DEFAULT_DB_PATH: &str = "data/pod-upgrade-trigger.db";
+const SELF_UPDATE_IMPORT_INTERVAL_SECS: u64 = 60;
+const SELF_UPDATE_UNIT: &str = "pod-upgrade-trigger-http.service";
+const ENV_SELF_UPDATE_COMMAND: &str = "PODUP_SELF_UPDATE_COMMAND";
+const ENV_SELF_UPDATE_CRON: &str = "PODUP_SELF_UPDATE_CRON";
+const ENV_SELF_UPDATE_DRY_RUN: &str = "PODUP_SELF_UPDATE_DRY_RUN";
 
 // Environment variable names (external interface). All variables use the
 // PODUP_ prefix to avoid ambiguity with legacy naming.
@@ -80,6 +85,7 @@ const ENV_SYSTEMD_RUN_SNAPSHOT: &str = "PODUP_SYSTEMD_RUN_SNAPSHOT";
 const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
 const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
 const ENV_AUTO_UPDATE_LOG_DIR: &str = "PODUP_AUTO_UPDATE_LOG_DIR";
+const ENV_SELF_UPDATE_REPORT_DIR: &str = "PODUP_SELF_UPDATE_REPORT_DIR";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -92,6 +98,9 @@ static DB_INIT_STATUS: OnceLock<RwLock<DbInitStatus>> = OnceLock::new();
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static PODMAN_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
 static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static SELF_UPDATE_IMPORTER_STARTED: OnceLock<()> = OnceLock::new();
+static SELF_UPDATE_SCHEDULER_STARTED: OnceLock<()> = OnceLock::new();
+static SELF_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -498,6 +507,9 @@ fn run_seed_demo_cli(_args: &[String]) -> ! {
 }
 
 fn run_http_server_cli(_args: &[String]) -> ! {
+    start_self_update_scheduler();
+    start_self_update_report_importer();
+
     let addr = env::var(ENV_HTTP_ADDR).unwrap_or_else(|_| "0.0.0.0:25111".to_string());
     let listener = TcpListener::bind(&addr).unwrap_or_else(|err| {
         eprintln!("failed to bind HTTP address {addr}: {err}");
@@ -524,6 +536,204 @@ fn run_http_server_cli(_args: &[String]) -> ! {
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+enum SelfUpdateSchedule {
+    EveryMinutes(u64),
+    EveryHours(u64),
+}
+
+fn parse_self_update_cron(expr: &str) -> Result<SelfUpdateSchedule, String> {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    if parts.len() != 5 {
+        return Err("invalid-field-count".to_string());
+    }
+
+    let minute = parts[0];
+    let hour = parts[1];
+    let dom = parts[2];
+    let month = parts[3];
+    let dow = parts[4];
+
+    if dom != "*" || month != "*" || dow != "*" {
+        return Err("unsupported-fields".to_string());
+    }
+
+    if hour == "*" {
+        if let Some(n_raw) = minute.strip_prefix("*/") {
+            let n = n_raw
+                .parse::<u64>()
+                .map_err(|_| "invalid-minute-interval".to_string())?;
+            if n == 0 {
+                return Err("minute-interval-zero".to_string());
+            }
+            return Ok(SelfUpdateSchedule::EveryMinutes(n));
+        }
+    }
+
+    if minute == "0" {
+        if let Some(n_raw) = hour.strip_prefix("*/") {
+            let n = n_raw
+                .parse::<u64>()
+                .map_err(|_| "invalid-hour-interval".to_string())?;
+            if n == 0 {
+                return Err("hour-interval-zero".to_string());
+            }
+            return Ok(SelfUpdateSchedule::EveryHours(n));
+        }
+    }
+
+    Err("unsupported-cron-pattern".to_string())
+}
+
+fn parse_env_bool(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn start_self_update_scheduler() {
+    if SELF_UPDATE_SCHEDULER_STARTED.set(()).is_err() {
+        return;
+    }
+
+    let command = env::var(ENV_SELF_UPDATE_COMMAND)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let Some(command) = command else {
+        log_message("info self-update-scheduler-disabled reason=command-missing");
+        return;
+    };
+
+    let command_path = Path::new(&command);
+    if !command_path.exists() {
+        log_message(&format!(
+            "warn self-update-command-invalid path={} reason=not-found",
+            command
+        ));
+        return;
+    }
+    if !command_path.is_file() {
+        log_message(&format!(
+            "warn self-update-command-invalid path={} reason=not-file",
+            command
+        ));
+        return;
+    }
+
+    let cron_raw = env::var(ENV_SELF_UPDATE_CRON).unwrap_or_default();
+    let cron_expr = cron_raw.trim().to_string();
+    if cron_expr.is_empty() {
+        log_message("warn self-update-cron-invalid expr=\"\" reason=missing");
+        return;
+    }
+
+    let schedule = match parse_self_update_cron(&cron_expr) {
+        Ok(s) => s,
+        Err(err) => {
+            log_message(&format!(
+                "warn self-update-cron-invalid expr=\"{}\" reason={}",
+                cron_expr, err
+            ));
+            return;
+        }
+    };
+
+    let dry_run = parse_env_bool(ENV_SELF_UPDATE_DRY_RUN);
+    let command_clone = command.clone();
+    thread::spawn(move || self_update_scheduler_loop(command_clone, schedule, dry_run));
+
+    log_message(&format!(
+        "info self-update-scheduler-start command={} expr=\"{}\" dry_run={}",
+        command, cron_expr, dry_run
+    ));
+}
+
+fn self_update_scheduler_loop(command: String, schedule: SelfUpdateSchedule, dry_run: bool) {
+    let interval_secs = match schedule {
+        SelfUpdateSchedule::EveryMinutes(n) => n.saturating_mul(60),
+        SelfUpdateSchedule::EveryHours(n) => n.saturating_mul(3_600),
+    }
+    .max(1);
+
+    loop {
+        if SELF_UPDATE_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            log_message("info self-update-skip-running reason=still-running");
+            thread::sleep(Duration::from_secs(interval_secs));
+            continue;
+        }
+
+        let started_at = current_unix_secs();
+        let result = run_self_update_command(&command, dry_run);
+
+        match result {
+            Ok(status) => {
+                let exit_label = status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string());
+                let level = if status.success() { "info" } else { "warn" };
+                log_message(&format!(
+                    "{level} self-update-run-finished exit={} success={} dry_run={} elapsed={}s",
+                    exit_label,
+                    status.success(),
+                    dry_run,
+                    current_unix_secs().saturating_sub(started_at)
+                ));
+            }
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-run-error err={} dry_run={} elapsed={}s",
+                    err,
+                    dry_run,
+                    current_unix_secs().saturating_sub(started_at)
+                ));
+            }
+        }
+
+        SELF_UPDATE_RUNNING.store(false, Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(interval_secs));
+    }
+}
+
+fn run_self_update_command(command: &str, dry_run: bool) -> Result<ExitStatus, String> {
+    let mut cmd = Command::new(command);
+    if dry_run {
+        cmd.arg("--dry-run");
+        cmd.env(ENV_SELF_UPDATE_DRY_RUN, "1");
+    }
+
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::inherit());
+
+    cmd.status().map_err(|e| format!("spawn-failed: {e}"))
+}
+
+fn start_self_update_report_importer() {
+    if SELF_UPDATE_IMPORTER_STARTED.set(()).is_err() {
+        return;
+    }
+
+    thread::spawn(|| {
+        loop {
+            if let Err(err) = import_self_update_reports_once() {
+                log_message(&format!("warn self-update-import-error err={err}"));
+            }
+            thread::sleep(Duration::from_secs(SELF_UPDATE_IMPORT_INTERVAL_SECS));
+        }
+    });
 }
 
 fn spawn_server_for_stream(stream: TcpStream) -> Result<(), String> {
@@ -4638,6 +4848,11 @@ enum TaskMeta {
         #[serde(default)]
         dry_run: bool,
     },
+    #[serde(rename = "self-update-run")]
+    SelfUpdateRun {
+        #[serde(default)]
+        dry_run: bool,
+    },
     #[serde(rename = "maintenance-prune")]
     MaintenancePrune {
         max_age_hours: u64,
@@ -4763,6 +4978,34 @@ struct TaskDetailResponse {
 #[derive(Debug, Serialize)]
 struct TaskEventsHint {
     task_id: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SelfUpdateReport {
+    #[serde(rename = "type")]
+    report_type: Option<String>,
+    #[serde(default)]
+    started_at: Option<i64>,
+    #[serde(default)]
+    finished_at: Option<i64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i64>,
+    #[serde(default)]
+    dry_run: Option<bool>,
+    #[serde(default)]
+    binary_path: Option<String>,
+    #[serde(default)]
+    release_tag: Option<String>,
+    #[serde(default)]
+    stderr_tail: Option<String>,
+    #[serde(default)]
+    runner_host: Option<String>,
+    #[serde(default)]
+    runner_pid: Option<i64>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6179,11 +6422,24 @@ fn manual_api_token() -> String {
 }
 
 fn container_systemd_dir() -> PathBuf {
-    env::var(ENV_CONTAINER_DIR)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTAINER_DIR))
+    if let Ok(raw) = env::var(ENV_CONTAINER_DIR) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    if let Ok(home) = env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return Path::new(trimmed)
+                .join(".config")
+                .join("containers")
+                .join("systemd");
+        }
+    }
+
+    PathBuf::from(DEFAULT_CONTAINER_DIR)
 }
 
 fn auto_update_log_dir() -> Option<PathBuf> {
@@ -6202,6 +6458,18 @@ fn auto_update_log_dir() -> Option<PathBuf> {
             .join("podman-auto-update")
             .join("logs"),
     )
+}
+
+fn self_update_report_dir() -> PathBuf {
+    if let Ok(raw) = env::var(ENV_SELF_UPDATE_REPORT_DIR) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    let state_dir = env::var(ENV_STATE_DIR).unwrap_or_else(|_| DEFAULT_STATE_DIR.to_string());
+    Path::new(&state_dir).join("self-update-reports")
 }
 
 fn query_flag(ctx: &RequestContext, names: &[&str]) -> bool {
@@ -8943,6 +9211,292 @@ fn append_task_log(
     });
 }
 
+fn import_self_update_reports_once() -> Result<(), String> {
+    let dir = self_update_report_dir();
+    let dir_display = dir.to_string_lossy().to_string();
+
+    if dir_display.trim().is_empty() {
+        return Err("self-update-report-dir-empty".to_string());
+    }
+
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return Err(format!(
+            "self-update-report-dir-create-failed dir={} err={err}",
+            dir_display
+        ));
+    }
+
+    let read_dir = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(err) => {
+            return Err(format!(
+                "self-update-report-dir-read-failed dir={} err={err}",
+                dir_display
+            ));
+        }
+    };
+
+    let mut last_error: Option<String> = None;
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-entry-error dir={} err={err}",
+                    dir_display
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let raw = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-read path={} err={err}",
+                    path.display()
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let raw_value: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-parse path={} err={err}",
+                    path.display()
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let report: SelfUpdateReport = match serde_json::from_value(raw_value.clone()) {
+            Ok(r) => r,
+            Err(err) => {
+                log_message(&format!(
+                    "warn self-update-import-structure path={} err={err}",
+                    path.display()
+                ));
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let report_type_ok = report
+            .report_type
+            .as_deref()
+            .map(|t| t == "self-update-run")
+            .unwrap_or(false);
+        if !report_type_ok {
+            log_message(&format!(
+                "warn self-update-import-skip path={} reason=type-mismatch",
+                path.display()
+            ));
+            last_error = Some("type-mismatch".to_string());
+            continue;
+        }
+
+        let now = current_unix_secs() as i64;
+        let started_at = report.started_at.or(report.finished_at).unwrap_or(now);
+        let finished_at = report.finished_at.unwrap_or(started_at);
+        let created_at = started_at.min(finished_at);
+
+        let status_raw = report
+            .status
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let normalized = status_raw.to_ascii_lowercase();
+        let succeeded = matches!(
+            normalized.as_str(),
+            "succeeded" | "success" | "ok" | "passed"
+        );
+        let task_status = if succeeded { "succeeded" } else { "failed" };
+        let exit_label = report
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let dry_run = report.dry_run.unwrap_or(false);
+
+        let summary = if succeeded {
+            if dry_run {
+                if let Some(tag) = report.release_tag.as_ref().filter(|t| !t.trim().is_empty()) {
+                    format!("Self-update dry-run from GitHub Release succeeded ({tag})")
+                } else {
+                    "Self-update dry-run from GitHub Release succeeded".to_string()
+                }
+            } else if let Some(tag) = report.release_tag.as_ref().filter(|t| !t.trim().is_empty()) {
+                format!("Self-update from GitHub Release succeeded ({tag})")
+            } else {
+                "Self-update from GitHub Release succeeded".to_string()
+            }
+        } else if dry_run {
+            format!("Self-update dry-run failed (exit={exit_label})")
+        } else {
+            format!("Self-update failed (exit={exit_label})")
+        };
+
+        let unit_name = SELF_UPDATE_UNIT.to_string();
+        let unit_slug = unit_name
+            .trim_end_matches(".service")
+            .trim_matches('/')
+            .to_string();
+        let binary_path = report.binary_path.clone();
+        let runner_pid = report.runner_pid;
+        let extra_fields = report.extra.clone();
+
+        let meta_value = TaskMeta::SelfUpdateRun { dry_run };
+        let meta_str = match serde_json::to_string(&meta_value) {
+            Ok(v) => v,
+            Err(err) => {
+                last_error = Some(err.to_string());
+                continue;
+            }
+        };
+
+        let log_meta = json!({
+            "report": raw_value,
+            "source_file": file_name,
+            "binary_path": binary_path,
+            "runner_pid": runner_pid,
+            "extra": extra_fields,
+            "dry_run": dry_run,
+        });
+        let log_meta_str = serde_json::to_string(&log_meta).unwrap_or_else(|_| "{}".to_string());
+
+        let task_id = format!("tsk_{}", next_request_id());
+        let task_id_clone = task_id.clone();
+        let kind = "self-update".to_string();
+        let summary_clone = summary.clone();
+        let unit_name_clone = unit_name.clone();
+        let unit_slug_clone = unit_slug.clone();
+        let trigger_source = "self-update-runner".to_string();
+        let trigger_reason = report.release_tag.clone();
+        let stderr_tail = report.stderr_tail.clone();
+        let runner_host = report.runner_host.clone();
+        let request_id = Some(file_name.clone());
+        let task_status_clone = task_status.to_string();
+
+        let db_result = with_db(|pool| async move {
+            let mut tx = pool.begin().await?;
+
+            sqlx::query(
+                "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+                 updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+                 trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+                 can_force_stop, can_retry, is_long_running, retry_of) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(&kind)
+            .bind(&task_status_clone)
+            .bind(created_at)
+            .bind(Some(started_at))
+            .bind(Some(finished_at))
+            .bind(Some(finished_at))
+            .bind(Some(summary_clone.clone()))
+            .bind(&meta_str)
+            .bind(&trigger_source)
+            .bind(&request_id)
+            .bind(Some("/self-update-report".to_string()))
+            .bind(runner_host.clone())
+            .bind(trigger_reason.clone())
+            .bind(Option::<i64>::None)
+            .bind(0_i64)
+            .bind(0_i64)
+            .bind(0_i64)
+            .bind(Some(0_i64))
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_units \
+                 (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+                  duration_ms, message, error) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(&unit_name_clone)
+            .bind(Some(unit_slug_clone))
+            .bind(&unit_name_clone)
+            .bind(&task_status_clone)
+            .bind(Some("completed"))
+            .bind(Some(started_at))
+            .bind(Some(finished_at))
+            .bind(Some(
+                finished_at.saturating_sub(started_at).saturating_mul(1000),
+            ))
+            .bind(Some(summary_clone.clone()))
+            .bind(if succeeded { None } else { stderr_tail.clone() })
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(finished_at)
+            .bind(if succeeded { "info" } else { "error" })
+            .bind("self-update-run")
+            .bind(&task_status_clone)
+            .bind(summary_clone)
+            .bind(Some(unit_name_clone))
+            .bind(log_meta_str)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok::<(), sqlx::Error>(())
+        });
+
+        if let Err(err) = db_result {
+            log_message(&format!(
+                "warn self-update-import-db path={} err={err}",
+                path.display()
+            ));
+            last_error = Some(err.to_string());
+            continue;
+        }
+
+        let imported_name = format!("{file_name}.imported");
+        let imported_path = path.with_file_name(imported_name);
+        if let Err(err) = fs::rename(&path, &imported_path) {
+            log_message(&format!(
+                "warn self-update-import-rename path={} err={err}",
+                path.display()
+            ));
+            last_error = Some(err.to_string());
+        }
+    }
+
+    if let Some(err) = last_error {
+        return Err(err);
+    }
+
+    Ok(())
+}
+
 fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
     let task_id_owned = task_id.to_string();
     let (units,): (Vec<String>,) = with_db(|pool| async move {
@@ -10004,7 +10558,7 @@ fn unit_configured_image(unit: &str) -> Option<String> {
         return None;
     }
 
-    let fallback = Path::new(DEFAULT_CONTAINER_DIR).join(format!("{trimmed}.container"));
+    let fallback = container_systemd_dir().join(format!("{trimmed}.container"));
     parse_container_image(&fallback)
 }
 

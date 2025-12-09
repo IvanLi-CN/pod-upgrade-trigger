@@ -1,0 +1,23 @@
+# User-level oneshot updater for pod-upgrade-trigger
+# Copy to ~/.config/systemd/user/pod-upgrade-trigger-updater.service and adjust paths/env.
+# ExecStart must point to the deployed script path (e.g. /srv/pod-upgrade-trigger/scripts/update-pod-upgrade-trigger-from-release.sh).
+# Override TARGET_BIN/PODUP_RELEASE_BASE_URL/PODUP_RELEASE_TAG via Environment= or EnvironmentFile=; do not bake host-specific paths into the script itself.
+
+[Unit]
+Description=Update pod-upgrade-trigger binary from GitHub Release (user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Example: ExecStart=%h/Projects/pod-upgrade-trigger/scripts/update-pod-upgrade-trigger-from-release.sh
+# Adjust to your actual install path, ensure the script is executable.
+ExecStart=%h/Projects/pod-upgrade-trigger/scripts/update-pod-upgrade-trigger-from-release.sh
+# Optionally override target binary location or release source:
+#Environment=TARGET_BIN=%h/.local/bin/pod-upgrade-trigger
+#Environment=PODUP_RELEASE_BASE_URL=https://mirror.example.com/pod-upgrade-trigger
+#Environment=PODUP_RELEASE_TAG=v1.2.3
+#EnvironmentFile=%h/.config/pod-upgrade-trigger-updater.env
+
+[Install]
+WantedBy=default.target

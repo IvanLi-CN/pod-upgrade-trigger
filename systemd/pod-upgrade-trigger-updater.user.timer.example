@@ -1,0 +1,17 @@
+# User-level timer to trigger pod-upgrade-trigger-updater.service
+# Copy to ~/.config/systemd/user/pod-upgrade-trigger-updater.timer, then enable with:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pod-upgrade-trigger-updater.timer
+
+[Unit]
+Description=Periodic updater for pod-upgrade-trigger (user service)
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=6h
+Persistent=true
+# If the host was offline, run the missed trigger once at boot.
+Unit=pod-upgrade-trigger-updater.service
+
+[Install]
+WantedBy=default.target
