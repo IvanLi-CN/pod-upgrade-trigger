@@ -27,17 +27,27 @@
   - 启动命令：
     - `ExecStart=/home/<user>/.local/bin/pod-upgrade-trigger http-server`
   - 监听地址：
-    - `127.0.0.1:25111`（或 `PODUP_HTTP_ADDR=127.0.0.1:25111`）。
+    - 默认 `0.0.0.0:25111`（或不设置 `PODUP_HTTP_ADDR`，使用程序默认值），便于容器内的 webhook-proxy 通过 `host.containers.internal:25111` 访问宿主。
 
 ### 2.2 上游与网络
 
 - Traefik / webhook-proxy：
-  - 继续将现有域名 / 路由反向代理到 `127.0.0.1:25111`。
-  - 对外 API/回调 URL 不变，避免上游系统改动。
+  - 维持现有链路：Traefik（容器） → `webhook-proxy:9700` → `host.containers.internal:25111`。
+  - 不修改任何 upstream 配置，对外 API/回调 URL 不变；只是将 25111 上的提供者从容器进程切换为宿主 user systemd 进程。
+  - 若未来考虑移除 webhook-proxy、让 Traefik 直连宿主，需要单独设计与评估（不在本方案内）。
 - 不再长期运行 `pod-upgrade-trigger` 容器：
   - 容器镜像可以继续存在，用于测试或其它用途，但**不再作为生产服务的长期进程**。
 
-### 2.3 宿主环境前提
+### 2.3 端口占用与切换顺序
+
+- 容器版与宿主版不能同时监听 `25111`。
+- 正确的并行验证与切换步骤：
+  1. 先用临时端口（例如 `25211`）执行 `pod-upgrade-trigger http-server --http-addr 0.0.0.0:25211` 做功能验证，容器版继续占用 `25111`。
+  2. 验证通过后停止容器版（如 `systemctl --user stop pod-upgrade-trigger.service` 或对应 Podman unit）。
+  3. 启用并启动宿主版：`systemctl --user enable --now pod-upgrade-trigger-http.service`，占用 `0.0.0.0:25111`。
+  4. 全程不改 Traefik / webhook-proxy 配置，它们仍探测宿主 `25111`。
+
+### 2.4 宿主环境前提
 
 - 宿主机需要满足：
   - 支持 user systemd（`systemctl --user` 可用，必要时启用 linger）。
@@ -138,10 +148,11 @@
 - 内容：
   - 在仓库中添加 `pod-upgrade-trigger-http.service` 示例（`systemd/` 或 `docs/` 示例）。
     - 示例 user unit：`systemd/pod-upgrade-trigger-http.user.service.example`，配套 env 示例：`systemd/pod-upgrade-trigger-http.env.example`。
+    - env 示例直接拷贝现网容器 env 的字段，仅在可见地址（保持 `0.0.0.0:25111` 以兼容 webhook-proxy）和自更新变量上做增补。
   - 在当前机器上手动：
     - 将 Release 二进制放到 `/home/<user>/.local/bin/pod-upgrade-trigger`。
-    - 配置并启用 `systemctl --user enable --now pod-upgrade-trigger-http.service`。
-  - Traefik / webhook-proxy 配置切换到 `127.0.0.1:25111` 并验证。
+    - 如需先行验证，先用 `pod-upgrade-trigger http-server --http-addr 0.0.0.0:25211`（临时端口）跑一遍；验证通过后停止容器版 unit，再启用 `systemctl --user enable --now pod-upgrade-trigger-http.service` 占用 `25111`。
+  - Traefik / webhook-proxy 配置保持不变（Traefik → webhook-proxy:9700 → host.containers.internal:25111），仅替换 25111 上的进程提供者。
 - 验证：
   - 功能回归：所有现有 webhook / API 路径正常工作。
   - 日志与监控：确认 journald 中能看到服务日志。
@@ -197,7 +208,7 @@
 - 自更新执行器脚本：`scripts/self-update-runner.sh`。它调用 `scripts/update-pod-upgrade-trigger-from-release.sh`，不会访问 SQLite；每次运行结束都会生成一份 JSON 报告（即使失败）。支持 dry-run：通过 `--dry-run` 或 `PODUP_SELF_UPDATE_DRY_RUN=1|true|yes|on` 只检查下载与校验，不替换二进制也不重启服务，仍会输出报告。
 - 报告目录：
   - `PODUP_SELF_UPDATE_REPORT_DIR` 设置且非空时优先使用；
-  - 否则落在 `${PODUP_STATE_DIR:-/srv/pod-upgrade-trigger}/self-update-reports`；
+  - 否则落在 `${PODUP_STATE_DIR:-/srv/app/data}/self-update-reports`；
   - 文件名 `self-update-<timestamp>-<pid>.json`（先写 `.json.tmp` 再 `mv` 原子落盘）。
 - 报告字段（最小集）：`type="self-update-run"`、`dry_run`（布尔，缺省视为 false）、`started_at`、`finished_at`、`status`、`exit_code`、`binary_path`、`release_tag`、`stderr_tail`、`runner_host`、`runner_pid`，时间为 Unix 秒。
 - 内建调度（主程序线程）：
