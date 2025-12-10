@@ -4,7 +4,7 @@ test.describe('Dashboard and navigation', () => {
   test('loads dashboard and basic navigation', async ({ page }) => {
     await page.goto('/')
 
-    await expect(page.getByText('Webhook Control')).toBeVisible()
+    await expect(page.getByText('Pod Upgrade Trigger')).toBeVisible()
 
     await expect(page.getByText('Service healthy')).toBeVisible({ timeout: 10_000 })
 

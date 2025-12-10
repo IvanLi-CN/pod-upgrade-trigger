@@ -22,7 +22,7 @@ function TopStatusBar() {
       <div className="navbar-start gap-2 px-4">
         <span className="flex items-center gap-2 text-lg font-title font-semibold">
           <Icon icon="mdi:cat" className="text-2xl text-primary" />
-          Webhook Control
+          Pod Upgrade Trigger
         </span>
         <span className="badge badge-sm badge-outline hidden sm:inline-flex">
           {health === 'ok' ? 'Healthy' : health === 'error' ? 'Degraded' : 'Checking…'}

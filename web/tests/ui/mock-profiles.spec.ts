@@ -142,7 +142,7 @@ test.describe('Mock profile: degraded', () => {
   test('propagates degraded health and SSE error from mocks to UI', async ({ page }) => {
     await gotoProfile(page, '/', 'degraded')
 
-    await expect(page.getByText('Webhook Control')).toBeVisible()
+    await expect(page.getByText('Pod Upgrade Trigger')).toBeVisible()
 
     await expect(
       page.getByRole('banner').getByText('Degraded'),
