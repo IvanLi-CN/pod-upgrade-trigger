@@ -159,7 +159,7 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
 
 1. **首页加载与导航框架**
    - 打开 `/`：
-     - 顶部显示标题 “Webhook Control”；
+     - 顶部显示标题 “Pod Upgrade Trigger”；
      - Health badge 初始为 `Healthy`（`/health` 200）；
      - Scheduler 显示 interval（如 `900s`）与 tick（无事件时允许为 `--`）；
      - SSE badge 在 `/sse/hello` 成功后显示 `SSE ok`。
