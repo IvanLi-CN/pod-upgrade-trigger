@@ -7709,6 +7709,9 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
         _ => return Ok(false),
     };
 
+    let is_index = relative == PathBuf::from("index.html");
+    let relative_label = relative.to_string_lossy();
+
     let dist_dir = frontend_dist_dir();
     let asset_path = dist_dir.join(&relative);
 
@@ -7726,7 +7729,7 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
                 content_type,
                 len as usize,
                 "frontend",
-                Some(json!({ "asset": relative.to_string_lossy() })),
+                Some(json!({ "asset": relative_label })),
             )?;
             return Ok(true);
         }
@@ -7740,12 +7743,67 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
             content_type,
             &body,
             "frontend",
-            Some(json!({ "asset": relative.to_string_lossy() })),
+            Some(json!({ "asset": relative_label })),
         )?;
         return Ok(true);
     }
 
-    if relative == PathBuf::from("index.html") {
+    let rel_str = relative_label.trim_start_matches('/');
+    if let Some(data) = EmbeddedWeb::get_asset(rel_str) {
+        let content_type = content_type_for(&relative);
+        if head_only {
+            respond_head(
+                ctx,
+                200,
+                "OK",
+                content_type,
+                data.len(),
+                "frontend",
+                Some(json!({ "asset": relative_label })),
+            )?;
+            return Ok(true);
+        }
+
+        respond_binary(
+            ctx,
+            200,
+            "OK",
+            content_type,
+            data.as_ref(),
+            "frontend",
+            Some(json!({ "asset": relative_label })),
+        )?;
+        return Ok(true);
+    }
+
+    if is_index {
+        if let Some(data) = EmbeddedWeb::get_asset("index.html") {
+            let content_type = content_type_for(&relative);
+            if head_only {
+                respond_head(
+                    ctx,
+                    200,
+                    "OK",
+                    content_type,
+                    data.len(),
+                    "frontend",
+                    Some(json!({ "asset": relative_label })),
+                )?;
+                return Ok(true);
+            }
+
+            respond_binary(
+                ctx,
+                200,
+                "OK",
+                content_type,
+                data.as_ref(),
+                "frontend",
+                Some(json!({ "asset": relative_label })),
+            )?;
+            return Ok(true);
+        }
+
         log_message("500 web-ui missing index.html");
         respond_text(
             ctx,
@@ -7753,7 +7811,7 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
             "InternalServerError",
             "web ui not built",
             "frontend",
-            Some(json!({ "asset": relative.to_string_lossy() })),
+            Some(json!({ "asset": relative_label })),
         )?;
         return Ok(true);
     }
