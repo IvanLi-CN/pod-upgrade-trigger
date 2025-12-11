@@ -7,6 +7,7 @@
 - 现状：Traefik（容器） → `webhook-proxy:9700` → `host.containers.internal:25111` → 容器版 `pod-upgrade-trigger`（Quadlet unit）。
 - 目标：保持入口链路不变，只将 25111 上的提供者切换为宿主 user systemd 进程（`pod-upgrade-trigger-http.service`）。
 - 核心要求：复用现有 SQLite DB 与状态目录，避免悄悄创建新 DB；切换按“临时端口验证 → 停容器 → 起宿主”顺序执行，并提供可回滚路径。
+- Web UI：Release 二进制已内嵌 `web/dist`，宿主部署无需单独同步前端；若在 `${PODUP_STATE_DIR}/web/dist` 提供自定义 bundle 会优先于内嵌版本，删除后自动回退。
 
 ## 2. 现网架构（As-Is）
 
@@ -45,16 +46,17 @@
 
 1. **准备二进制与脚本**
    - 将 `pod-upgrade-trigger` 安装到 `~/.local/bin/pod-upgrade-trigger`（保持可执行）。
-- 确认更新脚本存在：`/srv/pod-upgrade-trigger/update-pod-upgrade-trigger-from-release.sh`。
-- 确认自更新执行器：`/srv/pod-upgrade-trigger/self-update-runner.sh`。
+   - 前端已随 Release 二进制内嵌，无需额外同步 `web/dist`；如需覆盖 UI，可在 `${PODUP_STATE_DIR}/web/dist` 提供自定义构建，移除即可回退到内嵌版本。
+   - 确认更新脚本存在：`/srv/pod-upgrade-trigger/update-pod-upgrade-trigger-from-release.sh`。
+   - 确认自更新执行器：`/srv/pod-upgrade-trigger/self-update-runner.sh`。
 
 2. **准备 host env**
-- 拷贝容器 env：`cp /srv/pod-upgrade-trigger/pod-upgrade-trigger.env ~/.config/pod-upgrade-trigger-http.env`。
-  - 保留原有 `PODUP_STATE_DIR` / `PODUP_DB_URL` / `PODUP_PUBLIC_BASE` 等字段。
-  - 在末尾补充自更新配置（参考 `systemd/pod-upgrade-trigger-http.env.example`）：
-    - `PODUP_SELF_UPDATE_COMMAND=/srv/pod-upgrade-trigger/self-update-runner.sh`
-    - `PODUP_SELF_UPDATE_CRON=0 */6 * * *`（示例）
-    - `PODUP_SELF_UPDATE_DRY_RUN=1`（初始建议 dry-run）
+   - 拷贝容器 env：`cp /srv/pod-upgrade-trigger/pod-upgrade-trigger.env ~/.config/pod-upgrade-trigger-http.env`。
+   - 保留原有 `PODUP_STATE_DIR` / `PODUP_DB_URL` / `PODUP_PUBLIC_BASE` 等字段。
+   - 在末尾补充自更新配置（参考 `systemd/pod-upgrade-trigger-http.env.example`）：
+     - `PODUP_SELF_UPDATE_COMMAND=/srv/pod-upgrade-trigger/self-update-runner.sh`
+     - `PODUP_SELF_UPDATE_CRON=0 */6 * * *`（示例）
+     - `PODUP_SELF_UPDATE_DRY_RUN=1`（初始建议 dry-run）
 
 3. **临时端口验证（避免 25111 冲突）**
    - 在宿主运行：
@@ -63,8 +65,8 @@
    - 验证 `/health`、核心 API 与任务/事件查询；确认读取的仍是旧 DB（任务历史可见）。
 
 4. **配置 user systemd unit**
-- 复制示例：`install -m 644 systemd/pod-upgrade-trigger-http.user.service.example ~/.config/systemd/user/pod-upgrade-trigger-http.service`。
-- 确认 `ExecStart=/home/<user>/.local/bin/pod-upgrade-trigger http-server`。
+   - 复制示例：`install -m 644 systemd/pod-upgrade-trigger-http.user.service.example ~/.config/systemd/user/pod-upgrade-trigger-http.service`。
+   - 确认 `ExecStart=/home/<user>/.local/bin/pod-upgrade-trigger http-server`。
    - 将 `EnvironmentFile=` 指向 `~/.config/pod-upgrade-trigger-http.env`。
    - `systemctl --user daemon-reload`。
 

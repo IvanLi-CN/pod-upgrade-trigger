@@ -3,6 +3,8 @@ use hmac::{Hmac, Mac};
 use regex::Regex;
 use reqwest::Client;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+#[cfg(not(debug_assertions))]
+use rust_embed::RustEmbed;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,6 +13,7 @@ use sha2::Sha256;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
@@ -95,6 +98,25 @@ const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
 const WEBHOOK_STATUS_LOOKBACK: u64 = 500;
+
+#[cfg_attr(not(debug_assertions), derive(RustEmbed))]
+#[cfg_attr(not(debug_assertions), folder = "web/dist")]
+struct EmbeddedWeb;
+
+impl EmbeddedWeb {
+    pub fn get_asset(path: &str) -> Option<Cow<'static, [u8]>> {
+        #[cfg(not(debug_assertions))]
+        {
+            return Self::get(path).map(|file| file.data);
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let _ = path;
+            None
+        }
+    }
+}
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DB_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -7687,6 +7709,9 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
         _ => return Ok(false),
     };
 
+    let is_index = relative == PathBuf::from("index.html");
+    let relative_label = relative.to_string_lossy();
+
     let dist_dir = frontend_dist_dir();
     let asset_path = dist_dir.join(&relative);
 
@@ -7704,7 +7729,7 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
                 content_type,
                 len as usize,
                 "frontend",
-                Some(json!({ "asset": relative.to_string_lossy() })),
+                Some(json!({ "asset": relative_label })),
             )?;
             return Ok(true);
         }
@@ -7718,12 +7743,67 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
             content_type,
             &body,
             "frontend",
-            Some(json!({ "asset": relative.to_string_lossy() })),
+            Some(json!({ "asset": relative_label })),
         )?;
         return Ok(true);
     }
 
-    if relative == PathBuf::from("index.html") {
+    let rel_str = relative_label.trim_start_matches('/');
+    if let Some(data) = EmbeddedWeb::get_asset(rel_str) {
+        let content_type = content_type_for(&relative);
+        if head_only {
+            respond_head(
+                ctx,
+                200,
+                "OK",
+                content_type,
+                data.len(),
+                "frontend",
+                Some(json!({ "asset": relative_label })),
+            )?;
+            return Ok(true);
+        }
+
+        respond_binary(
+            ctx,
+            200,
+            "OK",
+            content_type,
+            data.as_ref(),
+            "frontend",
+            Some(json!({ "asset": relative_label })),
+        )?;
+        return Ok(true);
+    }
+
+    if is_index {
+        if let Some(data) = EmbeddedWeb::get_asset("index.html") {
+            let content_type = content_type_for(&relative);
+            if head_only {
+                respond_head(
+                    ctx,
+                    200,
+                    "OK",
+                    content_type,
+                    data.len(),
+                    "frontend",
+                    Some(json!({ "asset": relative_label })),
+                )?;
+                return Ok(true);
+            }
+
+            respond_binary(
+                ctx,
+                200,
+                "OK",
+                content_type,
+                data.as_ref(),
+                "frontend",
+                Some(json!({ "asset": relative_label })),
+            )?;
+            return Ok(true);
+        }
+
         log_message("500 web-ui missing index.html");
         respond_text(
             ctx,
@@ -7731,7 +7811,7 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
             "InternalServerError",
             "web ui not built",
             "frontend",
-            Some(json!({ "asset": relative.to_string_lossy() })),
+            Some(json!({ "asset": relative_label })),
         )?;
         return Ok(true);
     }

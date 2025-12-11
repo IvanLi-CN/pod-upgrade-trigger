@@ -15,7 +15,7 @@ The service stores durable data under `PODUP_STATE_DIR` (defaults to
 | --- | --- |
 | `data/pod-upgrade-trigger.db` | SQLite 数据库，包含请求事件、限流计数与镜像锁 |
 | `last_payload.bin` | Dump of the last signature-mismatched payload for debugging |
-| `web/dist` | Optional static assets served on `/` when the web UI bundle is deployed |
+| `web/dist` | Optional static assets served on `/` when present on disk; overrides the embedded Web UI bundle |
 
 Run the daemon as a normal HTTP service for most deployments. The recommended
 unit is `pod-upgrade-trigger http-server`, which listens on `PODUP_HTTP_ADDR`
@@ -60,7 +60,23 @@ To try the built-in web UI locally:
 
 Then open `http://127.0.0.1:25111/` in your browser. In the top status bar,
 enter `dev-token` as the manual token to access admin-only APIs via the UI.
-The binary automatically serves `./web/dist` (or the built-in `/srv/app/web` bundle when packaged), and no Web UI override environment variable is supported.
+The binary automatically serves UI assets in this order: `${PODUP_STATE_DIR}/web/dist` → `$CWD/web/dist` → the embedded bundle packaged in the release binary. No Web UI override environment variable is supported. Routes like `/`, `/events`, `/tasks`, and `/settings` will render from whichever source is found first; removing the on-disk bundle falls back to the embedded UI.
+
+### Release build with embedded Web UI
+
+Release artifacts embed the frontend bundle so host systemd deployments only need the binary. Build steps (example):
+
+```bash
+cd web
+bun install --frozen-lockfile || bun install
+bun run build
+cd ..
+cargo build --release --bin pod-upgrade-trigger
+```
+
+`build.rs` checks for `web/dist/index.html` during `cargo build --release` and will fail the build with a clear message if the bundle is missing.
+
+Host systemd deployments only need the release binary plus env files; `/` will render the embedded UI unless a disk `web/dist` is present.
 
 ## ForwardAuth and dev mode
 
