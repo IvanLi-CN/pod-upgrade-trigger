@@ -6326,6 +6326,28 @@ fn create_cli_maintenance_prune_task(max_age_hours: u64, dry_run: bool) -> Resul
     }
 }
 
+fn collect_run_task_env() -> Vec<String> {
+    // Keep DB/state/container/manual-related settings in sync between the HTTP
+    // process and background run-task workers.
+    const KEYS: &[&str] = &[
+        ENV_DB_URL,
+        ENV_STATE_DIR,
+        ENV_CONTAINER_DIR,
+        ENV_MANUAL_UNITS,
+        ENV_MANUAL_AUTO_UPDATE_UNIT,
+    ];
+
+    let mut envs = Vec::new();
+    for key in KEYS {
+        if let Ok(value) = env::var(key) {
+            if !value.trim().is_empty() {
+                envs.push(format!("{key}={value}"));
+            }
+        }
+    }
+    envs
+}
+
 fn spawn_manual_task(task_id: &str, action: &str) -> Result<(), String> {
     // Test hook: allow integration tests to force dispatch failures for
     // specific manual task actions (e.g. "manual-trigger", "manual-service",
@@ -6349,13 +6371,17 @@ fn spawn_manual_task(task_id: &str, action: &str) -> Result<(), String> {
     ));
 
     // For manual tasks我们不单独创建 transient unit 名称，复用 run-task 调用。
-    let args = vec![
-        "--user".to_string(),
-        "--quiet".to_string(),
-        exe_str.to_string(),
-        "run-task".to_string(),
-        task_id.to_string(),
-    ];
+    let mut args = Vec::new();
+    args.push("--user".to_string());
+    args.push("--quiet".to_string());
+
+    for env_kv in collect_run_task_env() {
+        args.push(format!("--setenv={env_kv}"));
+    }
+
+    args.push(exe_str.to_string());
+    args.push("run-task".to_string());
+    args.push(task_id.to_string());
 
     let status = Command::new("systemd-run")
         .args(&args)
