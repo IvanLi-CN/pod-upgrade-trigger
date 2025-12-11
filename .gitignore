@@ -19,3 +19,4 @@ tests/mock-bin/log.txt
 # Playwright / UI test artifacts (future)
 /web/playwright-report/
 /web/test-results/
+/web/storybook-static/
