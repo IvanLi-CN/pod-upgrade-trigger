@@ -12,10 +12,15 @@ import { ApiProvider, useApi } from './hooks/useApi'
 import { ToastProvider, ToastViewport } from './components/Toast'
 import { TokenProvider, useToken } from './hooks/useToken'
 import MockConsole from './mocks/MockConsole'
+import { useVersionCheck } from './hooks/useVersionCheck'
 
 function TopStatusBar() {
   const { health, scheduler, sseStatus, now } = useAppStatus()
   const { token, setToken } = useToken()
+  const version = useVersionCheck()
+
+  const latestTag = version.latest?.releaseTag
+  const showNewVersion = version.hasUpdate === true && latestTag
 
   return (
     <header className="navbar sticky top-0 z-20 border-b border-base-300 bg-base-100/90 backdrop-blur">
@@ -24,6 +29,17 @@ function TopStatusBar() {
           <Icon icon="mdi:cat" className="text-2xl text-primary" />
           Pod Upgrade Trigger
         </span>
+        {showNewVersion ? (
+          <a
+            className="badge badge-warning badge-sm gap-1"
+            href={`https://github.com/ivanli-cn/pod-upgrade-trigger/releases/tag/${encodeURIComponent(latestTag)}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <Icon icon="mdi:arrow-up-bold-circle-outline" className="text-base" />
+            新版本 {latestTag} 可用
+          </a>
+        ) : null}
         <span className="badge badge-sm badge-outline hidden sm:inline-flex">
           {health === 'ok' ? 'Healthy' : health === 'error' ? 'Degraded' : 'Checking…'}
         </span>

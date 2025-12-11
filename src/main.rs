@@ -1,6 +1,9 @@
 use hex::decode;
 use hmac::{Hmac, Mac};
 use regex::Regex;
+use reqwest::Client;
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use semver::Version;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -86,6 +89,8 @@ const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
 const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
 const ENV_AUTO_UPDATE_LOG_DIR: &str = "PODUP_AUTO_UPDATE_LOG_DIR";
 const ENV_SELF_UPDATE_REPORT_DIR: &str = "PODUP_SELF_UPDATE_REPORT_DIR";
+const GITHUB_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/ivanli-cn/pod-upgrade-trigger/releases/latest";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
@@ -101,6 +106,7 @@ static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static SELF_UPDATE_IMPORTER_STARTED: OnceLock<()> = OnceLock::new();
 static SELF_UPDATE_SCHEDULER_STARTED: OnceLock<()> = OnceLock::new();
 static SELF_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -120,6 +126,33 @@ struct RequestContext {
 struct DbInitStatus {
     url: String,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CurrentVersion {
+    package: String,
+    release_tag: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct LatestRelease {
+    release_tag: String,
+    published_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct VersionComparison {
+    current: CurrentVersion,
+    latest: LatestRelease,
+    has_update: Option<bool>,
+    checked_at: i64,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseResponse {
+    tag_name: Option<String>,
+    published_at: Option<String>,
 }
 
 struct ForwardAuthConfig {
@@ -204,6 +237,105 @@ fn is_admin_request(ctx: &RequestContext) -> bool {
         Some(value) => value == expected,
         None => false,
     }
+}
+
+fn current_version() -> CurrentVersion {
+    let package = env!("CARGO_PKG_VERSION").to_string();
+    // Placeholder strategy: derive release_tag from package. In future this can
+    // read an explicit PODUP_RELEASE_TAG to reflect the packaged release tag.
+    let release_tag = Some(format!("v{package}"));
+    CurrentVersion {
+        package,
+        release_tag,
+    }
+}
+
+fn normalize_version(input: &str) -> &str {
+    input.trim_start_matches('v').trim_start_matches('V').trim()
+}
+
+fn compare_versions(current: &CurrentVersion, latest: &LatestRelease) -> VersionComparison {
+    let current_norm = normalize_version(&current.package);
+    let latest_norm = normalize_version(&latest.release_tag);
+
+    let parsed_current = Version::parse(current_norm);
+    let parsed_latest = Version::parse(latest_norm);
+
+    let (has_update, reason) = match (parsed_current, parsed_latest) {
+        (Ok(c), Ok(l)) => (Some(l > c), "semver".to_string()),
+        _ => (None, "uncomparable".to_string()),
+    };
+
+    VersionComparison {
+        current: current.clone(),
+        latest: latest.clone(),
+        has_update,
+        checked_at: current_unix_secs() as i64,
+        reason,
+    }
+}
+
+fn github_http_client() -> Result<&'static Client, String> {
+    if let Some(client) = HTTP_CLIENT.get() {
+        return Ok(client);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    let ua = format!("{LOG_TAG}/{}", env!("CARGO_PKG_VERSION"));
+    let ua_val = HeaderValue::from_str(&ua).map_err(|e| e.to_string())?;
+    headers.insert(USER_AGENT, ua_val);
+
+    let client = Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let _ = HTTP_CLIENT.set(client);
+    HTTP_CLIENT
+        .get()
+        .ok_or_else(|| "http client unavailable".to_string())
+}
+
+fn latest_release_from_response(raw: GitHubReleaseResponse) -> Result<LatestRelease, String> {
+    let tag = raw
+        .tag_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "missing tag_name".to_string())?;
+
+    Ok(LatestRelease {
+        release_tag: tag.to_string(),
+        published_at: raw.published_at,
+    })
+}
+
+async fn fetch_latest_release() -> Result<LatestRelease, String> {
+    let client = github_http_client()?;
+    let response = client
+        .get(GITHUB_LATEST_RELEASE_URL)
+        .send()
+        .await
+        .map_err(|e| format!("http-error: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("http-status {status} body={snippet}"));
+    }
+
+    let raw: GitHubReleaseResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("json-parse-error: {e}"))?;
+
+    latest_release_from_response(raw)
 }
 
 fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
@@ -1245,6 +1377,8 @@ fn handle_connection() -> Result<(), String> {
         handle_task_logs_sse(&ctx)?;
     } else if ctx.path == "/api/config" {
         handle_config_api(&ctx)?;
+    } else if ctx.path == "/api/version/check" {
+        handle_version_check_api(&ctx)?;
     } else if ctx.path == "/api/settings" {
         handle_settings_api(&ctx)?;
     } else if ctx.path == "/api/events" {
@@ -7647,6 +7781,59 @@ fn handle_config_api(ctx: &RequestContext) -> Result<(), String> {
     respond_json(ctx, 200, "OK", &response, "config-api", None)
 }
 
+fn handle_version_check_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "GET" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "version-check",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "version-check")? {
+        return Ok(());
+    }
+
+    let current = current_version();
+    let runtime = DB_RUNTIME.get_or_init(|| Runtime::new().expect("failed to create runtime"));
+
+    let latest = match runtime.block_on(fetch_latest_release()) {
+        Ok(latest) => latest,
+        Err(err) => {
+            log_message(&format!("503 version-check-github-error {err}"));
+            let payload = json!({
+                "error": "version-check-failed",
+                "message": err,
+            });
+            respond_json(
+                ctx,
+                503,
+                "ServiceUnavailable",
+                &payload,
+                "version-check",
+                Some(json!({ "reason": "github" })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let comparison = compare_versions(&current, &latest);
+
+    let payload = json!({
+        "current": comparison.current,
+        "latest": comparison.latest,
+        "has_update": comparison.has_update,
+        "checked_at": comparison.checked_at,
+        "compare_reason": comparison.reason,
+    });
+
+    respond_json(ctx, 200, "OK", &payload, "version-check", None)
+}
+
 fn frontend_dist_dir() -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
@@ -10690,6 +10877,101 @@ mod tests {
         fs::create_dir_all(&log_dir).unwrap();
         let log_dir_str = log_dir.to_string_lossy().into_owned();
         (dir, log_dir_str)
+    }
+
+    #[test]
+    fn compare_versions_semver_update_detection() {
+        let current = CurrentVersion {
+            package: "0.1.0".to_string(),
+            release_tag: Some("v0.1.0".to_string()),
+        };
+        let latest = LatestRelease {
+            release_tag: "v0.2.0".to_string(),
+            published_at: None,
+        };
+
+        let result = compare_versions(&current, &latest);
+        assert_eq!(result.has_update, Some(true));
+        assert_eq!(result.reason, "semver");
+    }
+
+    #[test]
+    fn compare_versions_semver_no_update_or_downgrade() {
+        let current_same = CurrentVersion {
+            package: "0.2.0".to_string(),
+            release_tag: Some("v0.2.0".to_string()),
+        };
+        let latest_same = LatestRelease {
+            release_tag: "v0.2.0".to_string(),
+            published_at: None,
+        };
+        let res_same = compare_versions(&current_same, &latest_same);
+        assert_eq!(res_same.has_update, Some(false));
+        assert_eq!(res_same.reason, "semver");
+
+        let current_newer = CurrentVersion {
+            package: "0.3.0".to_string(),
+            release_tag: Some("v0.3.0".to_string()),
+        };
+        let latest_older = LatestRelease {
+            release_tag: "v0.2.0".to_string(),
+            published_at: None,
+        };
+        let res_downgrade = compare_versions(&current_newer, &latest_older);
+        assert_eq!(res_downgrade.has_update, Some(false));
+        assert_eq!(res_downgrade.reason, "semver");
+    }
+
+    #[test]
+    fn compare_versions_uncomparable_on_invalid_input() {
+        let current = CurrentVersion {
+            package: "not-a-version".to_string(),
+            release_tag: Some("vX".to_string()),
+        };
+        let latest = LatestRelease {
+            release_tag: "v0.2.0".to_string(),
+            published_at: None,
+        };
+
+        let result = compare_versions(&current, &latest);
+        assert_eq!(result.has_update, None);
+        assert_eq!(result.reason, "uncomparable");
+
+        let current_valid = CurrentVersion {
+            package: "0.1.0".to_string(),
+            release_tag: Some("v0.1.0".to_string()),
+        };
+        let latest_invalid = LatestRelease {
+            release_tag: "release-x".to_string(),
+            published_at: None,
+        };
+        let result_invalid_latest = compare_versions(&current_valid, &latest_invalid);
+        assert_eq!(result_invalid_latest.has_update, None);
+        assert_eq!(result_invalid_latest.reason, "uncomparable");
+    }
+
+    #[test]
+    fn github_latest_release_response_parses() {
+        let raw_json = r#"
+        {
+            "tag_name": "v1.2.3",
+            "published_at": "2025-02-01T11:22:33Z"
+        }
+        "#;
+
+        let raw: GitHubReleaseResponse = serde_json::from_str(raw_json).unwrap();
+        let latest = latest_release_from_response(raw).expect("should parse");
+
+        assert_eq!(latest.release_tag, "v1.2.3");
+        assert_eq!(latest.published_at.as_deref(), Some("2025-02-01T11:22:33Z"));
+    }
+
+    #[test]
+    fn github_latest_release_missing_tag_is_error() {
+        let raw_json = r#"{ "published_at": "2025-02-01T11:22:33Z" }"#;
+        let raw: GitHubReleaseResponse = serde_json::from_str(raw_json).unwrap();
+        let err = latest_release_from_response(raw).unwrap_err();
+        assert!(err.contains("tag"), "expected missing tag error, got {err}");
     }
 
     #[test]
