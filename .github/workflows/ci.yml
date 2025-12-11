@@ -256,11 +256,71 @@ jobs:
       - name: Cargo build (release)
         run: cargo build --release --locked
 
+  check-release-skip:
+    name: Check Release Skip Conditions
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip_release: ${{ steps.check.outputs.result }}
+    steps:
+      - name: Evaluate skip conditions
+        id: check
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const core = require('@actions/core');
+
+            const eventName = context.eventName;
+            let shouldSkip = false;
+
+            if (eventName === 'push') {
+              const headCommit = context.payload.head_commit || {};
+              const message = headCommit.message || '';
+              if (message.includes('[skip-release]')) {
+                core.info('Found [skip-release] in head commit message; skipping release.');
+                shouldSkip = true;
+              }
+
+              if (!shouldSkip) {
+                const sha = context.sha;
+                const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: sha,
+                });
+
+                if (prs.length > 0) {
+                  const mainPrs = prs.filter(
+                    (pr) => pr.base.ref === 'main' && pr.merge_commit_sha === sha,
+                  );
+                  const targetPr = mainPrs[0] || prs[0];
+                  const labels = targetPr.labels || [];
+                  if (labels.some((label) => label.name === 'skip-release')) {
+                    core.info('Found skip-release label on associated PR; skipping release.');
+                    shouldSkip = true;
+                  }
+                } else {
+                  core.info(`No pull requests associated with commit ${sha}.`);
+                }
+              }
+            }
+
+            core.setOutput('result', shouldSkip);
+
   release:
     name: Publish Release
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
-    needs: [lint, unit-tests, e2e-tests, ui-e2e-tests]
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/main' &&
+       needs.check-release-skip.outputs.should_skip_release != 'true')
+    needs:
+      - lint
+      - unit-tests
+      - e2e-tests
+      - ui-e2e-tests
+      - check-release-skip
     permissions:
       contents: write
     timeout-minutes: 45
