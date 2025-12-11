@@ -26,6 +26,9 @@
   - 运行用户：`deploy`（或等价非 root 用户）。
   - 启动命令：
     - `ExecStart=/home/<user>/.local/bin/pod-upgrade-trigger http-server`
+  - Web UI 提供方式：
+    - Release 二进制已内嵌前端 bundle（详见 `docs/specs/web-ui-embedding.md`），无需在宿主单独同步 `web/dist`；
+    - 若在 `${PODUP_STATE_DIR}/web/dist`（或 WorkingDirectory 下的 `web/dist`）提供自定义构建，则会优先使用磁盘版本；删除磁盘版本即回退到内嵌 UI。
   - 监听地址：
     - 默认 `0.0.0.0:25111`（或不设置 `PODUP_HTTP_ADDR`，使用程序默认值），便于容器内的 webhook-proxy 通过 `host.containers.internal:25111` 访问宿主。
 
@@ -71,6 +74,7 @@
     - 当前 M2 实现的附件列表固定为：
       - `pod-upgrade-trigger-x86_64-unknown-linux-gnu`（可执行二进制）
       - `pod-upgrade-trigger-x86_64-unknown-linux-gnu.sha256`（对应的 SHA256 校验文件）
+    - 二进制内嵌了 `web/dist` 前端 bundle；host systemd 部署不再需要额外分发 `web/dist`。如需覆盖，可在 `${PODUP_STATE_DIR}/web/dist` 放置自定义构建，仍会优先于内嵌版本。
   - Release 标签与版本号：
     - 使用 SemVer（如 `v1.2.3`）。
     - 可视需求维护一个 `latest` tag 或通过 GitHub API 获取“最新稳定版本”。
