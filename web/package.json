@@ -12,7 +12,10 @@
     "preview": "vite preview",
     "test:ui:e2e": "playwright test",
     "dev:mock": "VITE_ENABLE_MOCKS=true vite",
-    "preview:mock": "VITE_ENABLE_MOCKS=true vite preview"
+    "preview:mock": "VITE_ENABLE_MOCKS=true vite preview",
+    "storybook": "storybook dev -p 6006",
+    "storybook:build": "storybook build",
+    "test:storybook": "vitest run --config vitest.storybook.config.ts"
   },
   "dependencies": {
     "@iconify/icons-mdi": "^1.2.48",
@@ -26,6 +29,7 @@
     "@biomejs/biome": "^2.3.5",
     "@eslint/js": "^9.39.1",
     "@faker-js/faker": "^10.1.0",
+    "@testing-library/react": "^16.1.0",
     "@playwright/test": "^1.51.0",
     "@tailwindcss/postcss": "^4.1.17",
     "@types/lodash-es": "^4.17.12",
@@ -44,7 +48,14 @@
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.46.3",
     "vite": "^7.2.2",
-    "zod": "^4.1.12"
+    "zod": "^4.1.12",
+    "storybook": "^8.6.14",
+    "@storybook/react-vite": "^8.6.14",
+    "@storybook/addon-essentials": "^8.6.14",
+    "@storybook/experimental-addon-test": "^8.6.14",
+    "@storybook/test": "^8.6.14",
+    "@vitest/browser": "3.0.4",
+    "vitest": "3.0.4"
   },
   "msw": {
     "workerDirectory": [
