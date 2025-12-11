@@ -3,6 +3,8 @@ use hmac::{Hmac, Mac};
 use regex::Regex;
 use reqwest::Client;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+#[cfg(not(debug_assertions))]
+use rust_embed::RustEmbed;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -11,6 +13,7 @@ use sha2::Sha256;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
@@ -95,6 +98,25 @@ const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
 const EVENTS_MAX_PAGE_SIZE: u64 = 500;
 const EVENTS_MAX_LIMIT: u64 = 500;
 const WEBHOOK_STATUS_LOOKBACK: u64 = 500;
+
+#[cfg_attr(not(debug_assertions), derive(RustEmbed))]
+#[cfg_attr(not(debug_assertions), folder = "web/dist")]
+struct EmbeddedWeb;
+
+impl EmbeddedWeb {
+    pub fn get_asset(path: &str) -> Option<Cow<'static, [u8]>> {
+        #[cfg(not(debug_assertions))]
+        {
+            return Self::get(path).map(|file| file.data);
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let _ = path;
+            None
+        }
+    }
+}
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DB_RUNTIME: OnceLock<Runtime> = OnceLock::new();
