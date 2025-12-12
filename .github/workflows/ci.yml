@@ -243,7 +243,7 @@ jobs:
 
       - name: Set PR effective version
         if: github.event_name == 'pull_request'
-        run: echo "APP_EFFECTIVE_VERSION=pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::7}" >> \"$GITHUB_ENV\"
+        run: echo "APP_EFFECTIVE_VERSION=pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@v1
