@@ -29,4 +29,3 @@ fn version_subcommand_outputs_current_release_tag() {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert_eq!(stdout, expected_tag());
 }
-
