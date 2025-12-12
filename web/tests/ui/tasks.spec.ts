@@ -42,7 +42,9 @@ test.describe('Tasks page (mock)', () => {
     await manualRow.click()
 
     await expect(page.getByText('任务详情', { exact: true })).toBeVisible()
-    await expect(page.getByText('nightly manual upgrade')).toBeVisible()
+    await expect(
+      page.locator('p', { hasText: 'nightly manual upgrade' }).first(),
+    ).toBeVisible()
 
     await expect(page.getByText('创建 ·')).toBeVisible()
     await expect(page.getByText('起止 ·')).toBeVisible()
@@ -129,6 +131,48 @@ test.describe('Tasks page (mock)', () => {
         'warning: using cached image layer metadata',
       ),
     ).toBeVisible()
+  })
+
+  test('shows meta.result_message details in the timeline (collapsible)', async ({ page }) => {
+    await page.goto('/tasks?mock=enabled&mock=profile=happy-path')
+    await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+    await expect(page.getByText('任务列表')).toBeVisible()
+
+    const rows = page.locator('table tbody tr')
+    await expect(rows.first()).toBeVisible()
+
+    const failingRow = rows
+      .filter({
+        hasText: 'Manual service failure demo · meta.result_message (svc-alpha)',
+      })
+      .first()
+    await expect(failingRow).toBeVisible()
+
+    await failingRow.click()
+
+    const logsTimelineSection = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(logsTimelineSection).toBeVisible()
+
+    const manualServiceCard = logsTimelineSection
+      .locator('div')
+      .filter({ hasText: 'manual-service-run' })
+      .filter({ hasText: 'Manual service task failed' })
+      .first()
+    await expect(manualServiceCard).toBeVisible()
+
+    const expand = manualServiceCard.getByRole('button', { name: '展开详情' })
+    await expect(expand).toBeVisible()
+    await expand.click()
+
+    await expect(
+      manualServiceCard.getByText(
+        'LAST_LINE: Failed to start svc-alpha.service: Permission denied',
+      ),
+    ).toBeVisible()
+    await expect(manualServiceCard.getByText('result_status · failed')).toBeVisible()
   })
 
   test('supports stopping a running task and updates status and logs', async ({ page }) => {

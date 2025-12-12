@@ -539,6 +539,75 @@ function buildTasks(
     ],
   )
 
+  // Deterministic failing manual-service task to exercise meta.result_message rendering.
+  if (profile === 'happy-path') {
+    addTask(
+      {
+        kind: 'manual',
+        status: 'failed',
+        created_at: baseTs + 720,
+        started_at: baseTs + 722,
+        finished_at: baseTs + 740,
+        updated_at: baseTs + 740,
+        summary: 'Manual service failure demo · meta.result_message (svc-alpha)',
+        trigger: {
+          source: 'manual',
+          path: '/api/manual/services/svc-alpha',
+          caller: 'ui-e2e',
+          reason: 'meta result_message demo',
+        },
+        can_stop: false,
+        can_force_stop: false,
+        can_retry: true,
+        is_long_running: false,
+        retry_of: null,
+        units: [
+          {
+            unit: 'svc-alpha.service',
+            slug: 'svc-alpha',
+            display_name: 'Alpha Deploy',
+            status: 'failed',
+            phase: 'done',
+            started_at: baseTs + 722,
+            finished_at: baseTs + 740,
+            duration_ms: 18_000,
+            message: 'Manual service task failed',
+            error: 'exit=1 (see result_message)',
+          },
+        ],
+      },
+      [
+        {
+          ts: baseTs + 722,
+          level: 'info',
+          action: 'task-created',
+          status: 'failed',
+          summary: 'Manual service task accepted from UI',
+          unit: null,
+          meta: { caller: 'ui-e2e', reason: 'meta result_message demo' },
+        },
+        {
+          ts: baseTs + 738,
+          level: 'error',
+          action: 'manual-service-run',
+          status: 'failed',
+          summary: 'Manual service task failed',
+          unit: null,
+          meta: {
+            unit: 'svc-alpha.service',
+            image: 'ghcr.io/example/svc-alpha:main',
+            result_status: 'failed',
+            result_message:
+              'systemd unit start failed.\n' +
+              'Hint: run systemctl --user status svc-alpha.service\n' +
+              'Hint: run journalctl --user -u svc-alpha.service -n 100\n' +
+              'LAST_LINE: Failed to start svc-alpha.service: Permission denied',
+          },
+        },
+      ],
+    )
+  }
+
   // Webhook-triggered task with a failed unit.
   addTask(
     {

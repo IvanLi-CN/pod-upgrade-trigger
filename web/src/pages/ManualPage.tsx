@@ -15,6 +15,7 @@ import type {
 } from '../domain/tasks'
 import { isCommandMeta } from '../domain/tasks'
 import { AutoUpdateWarningsBlock } from '../components/AutoUpdateWarningsBlock'
+import { TaskLogMetaDetails } from '../components/TaskLogMetaDetails'
 
 type ManualService = {
   slug: string
@@ -1247,6 +1248,12 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                                   <p className="text-[11px] text-base-content/80">
                                     {log.summary}
                                   </p>
+                                  {!isTaskDispatchFailed ? (
+                                    <TaskLogMetaDetails
+                                      meta={log.meta}
+                                      unitAlreadyShown={Boolean(log.unit)}
+                                    />
+                                  ) : null}
                                   {hasNoSummaryHint ? (
                                     <p className="text-[10px] text-warning">
                                       no JSONL summary found
