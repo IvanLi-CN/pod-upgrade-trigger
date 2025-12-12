@@ -29,6 +29,8 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
     scenario_manual_auto_update_failure().await?;
+    scenario_manual_task_command_meta_and_unit_errors().await?;
+    scenario_manual_task_unit_failure_diagnostics().await?;
     scenario_manual_dispatch_failure().await?;
     scenario_scheduler_loop().await?;
     scenario_scheduler_dispatch_failure().await?;
@@ -858,6 +860,396 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
                 && line.contains("podman-auto-update.service")
         }),
         "expected busctl StartUnit invocation for failing manual auto-update unit"
+    );
+
+    Ok(())
+}
+
+async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    // --- Manual service: failing unit operation records command meta + unit error ---
+    let service_body = json!({
+        "token": env.manual_token(),
+        "dry_run": false,
+        "caller": "ci",
+        "reason": "unit-fail",
+    });
+    let service = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/svc-beta")
+            .header("content-type", "application/json")
+            .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
+        },
+    )?;
+    assert_eq!(service.status, 202, "manual service should accept request");
+    let service_json = service.json_body()?;
+    let service_task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !service_task_id.is_empty(),
+        "manual service failure scenario must include task_id"
+    );
+
+    let service_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{service_task_id}")))?;
+    assert_eq!(service_detail.status, 200);
+    let body = service_detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let service_run_log = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("manual-service-run")))
+        .expect("manual-service-run log entry exists");
+    assert!(
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
+        "diagnostics must be disabled by default (unit-diagnose-status should be absent)"
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
+        "diagnostics must be disabled by default (unit-diagnose-journal should be absent)"
+    );
+    let meta = service_run_log
+        .get("meta")
+        .cloned()
+        .unwrap_or_else(|| Value::Null);
+    assert_eq!(meta.get("type"), Some(&Value::from("command")));
+    let exit = meta
+        .get("exit")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !exit.is_empty(),
+        "manual-service-run meta.exit should be non-empty"
+    );
+    let stderr = meta
+        .get("stderr")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        stderr.contains("simulated busctl fail for svc-beta.service"),
+        "expected simulated busctl failure in manual-service-run meta.stderr, got: {stderr}"
+    );
+    assert_eq!(meta.get("runner"), Some(&Value::from("busctl")));
+    assert_eq!(meta.get("purpose"), Some(&Value::from("restart")));
+
+    let units = body["units"].as_array().cloned().unwrap_or_default();
+    let svc_beta = units
+        .iter()
+        .find(|u| u.get("unit") == Some(&Value::from("svc-beta.service")))
+        .expect("task should include svc-beta.service unit summary");
+    let unit_error = svc_beta
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        unit_error.contains("exit=") && unit_error.contains("simulated busctl fail"),
+        "expected concise unit error summary, got: {unit_error}"
+    );
+
+    // --- Manual trigger: per-unit command-meta logs + error summary on failure ---
+    env.clear_mock_log()?;
+    let trigger_body = json!({
+        "token": env.manual_token(),
+        "all": true,
+        "dry_run": false,
+        "caller": "ci",
+        "reason": "unit-fail",
+    });
+    let trigger = env.send_request_with_env(
+        HttpRequest::post("/api/manual/trigger")
+            .header("content-type", "application/json")
+            .body(trigger_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
+        },
+    )?;
+    assert_eq!(trigger.status, 202, "manual trigger should accept request");
+    let trigger_json = trigger.json_body()?;
+    let trigger_task_id = trigger_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !trigger_task_id.is_empty(),
+        "manual trigger scenario must include task_id"
+    );
+
+    let trigger_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{trigger_task_id}")))?;
+    assert_eq!(trigger_detail.status, 200);
+    let body = trigger_detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        logs.iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("manual-trigger-run"))),
+        "manual trigger task should include manual-trigger-run summary log"
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
+        "diagnostics must be disabled by default (unit-diagnose-status should be absent)"
+    );
+    assert!(
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
+        "diagnostics must be disabled by default (unit-diagnose-journal should be absent)"
+    );
+    let unit_log = logs
+        .iter()
+        .find(|entry| {
+            entry.get("action") == Some(&Value::from("manual-trigger-unit-run"))
+                && entry.get("unit") == Some(&Value::from("svc-beta.service"))
+        })
+        .expect("manual-trigger-unit-run log entry for failing svc-beta.service exists");
+    let meta = unit_log.get("meta").cloned().unwrap_or(Value::Null);
+    assert_eq!(meta.get("type"), Some(&Value::from("command")));
+    let exit = meta
+        .get("exit")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !exit.is_empty(),
+        "manual-trigger-unit-run meta.exit should be non-empty"
+    );
+    let stderr = meta
+        .get("stderr")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        stderr.contains("simulated busctl fail for svc-beta.service"),
+        "expected simulated busctl failure in manual-trigger-unit-run meta.stderr, got: {stderr}"
+    );
+
+    let units = body["units"].as_array().cloned().unwrap_or_default();
+    let svc_beta = units
+        .iter()
+        .find(|u| u.get("unit") == Some(&Value::from("svc-beta.service")))
+        .expect("manual trigger task should include svc-beta.service unit summary");
+    let unit_message = svc_beta
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let unit_error = svc_beta
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !unit_error.is_empty() && unit_error.contains("simulated busctl fail"),
+        "manual trigger failed unit should populate error summary, got: {unit_error}"
+    );
+    assert!(
+        !unit_message.contains("simulated busctl fail") && !unit_message.contains("stderr="),
+        "manual trigger unit message should stay high-level and not duplicate stderr, got: {unit_message}"
+    );
+
+    Ok(())
+}
+
+async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    // --- Manual service: enable diagnostics and assert status/journal logs + argv ---
+    env.clear_mock_log()?;
+    let service_body = json!({
+        "token": env.manual_token(),
+        "dry_run": false,
+        "caller": "ci",
+        "reason": "unit-fail-diagnostics",
+    });
+    let service = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/svc-beta")
+            .header("content-type", "application/json")
+            .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
+            cmd.env("PODUP_TASK_DIAGNOSTICS", "1");
+            cmd.env("PODUP_TASK_DIAGNOSTICS_JOURNAL_LINES", "123");
+        },
+    )?;
+    assert_eq!(service.status, 202, "manual service should accept request");
+    let service_json = service.json_body()?;
+    let service_task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !service_task_id.is_empty(),
+        "manual service diagnostics scenario must include task_id"
+    );
+
+    let service_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{service_task_id}")))?;
+    assert_eq!(service_detail.status, 200);
+    let body = service_detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+
+    let status_log = logs
+        .iter()
+        .find(|entry| {
+            entry.get("action") == Some(&Value::from("unit-diagnose-status"))
+                && entry.get("unit") == Some(&Value::from("svc-beta.service"))
+        })
+        .expect("manual-service failing unit should include unit-diagnose-status log");
+    let status_meta = status_log.get("meta").cloned().unwrap_or(Value::Null);
+    assert_eq!(status_meta.get("type"), Some(&Value::from("command")));
+    assert_eq!(status_meta.get("runner"), Some(&Value::from("systemctl")));
+    assert_eq!(
+        status_meta.get("purpose"),
+        Some(&Value::from("diagnose-status"))
+    );
+    assert_eq!(
+        status_meta.get("unit"),
+        Some(&Value::from("svc-beta.service"))
+    );
+    assert_eq!(
+        status_meta.get("command"),
+        Some(&Value::from(
+            "systemctl --user status svc-beta.service --no-pager --full"
+        ))
+    );
+    let status_argv = status_meta
+        .get("argv")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        status_argv,
+        vec![
+            Value::from("systemctl"),
+            Value::from("--user"),
+            Value::from("status"),
+            Value::from("svc-beta.service"),
+            Value::from("--no-pager"),
+            Value::from("--full"),
+        ]
+    );
+
+    let journal_log = logs
+        .iter()
+        .find(|entry| {
+            entry.get("action") == Some(&Value::from("unit-diagnose-journal"))
+                && entry.get("unit") == Some(&Value::from("svc-beta.service"))
+        })
+        .expect("manual-service failing unit should include unit-diagnose-journal log");
+    let journal_meta = journal_log.get("meta").cloned().unwrap_or(Value::Null);
+    assert_eq!(journal_meta.get("type"), Some(&Value::from("command")));
+    assert_eq!(journal_meta.get("runner"), Some(&Value::from("journalctl")));
+    assert_eq!(
+        journal_meta.get("purpose"),
+        Some(&Value::from("diagnose-journal"))
+    );
+    assert_eq!(
+        journal_meta.get("command"),
+        Some(&Value::from(
+            "journalctl --user -u svc-beta.service -n 123 --no-pager --output=short-precise"
+        ))
+    );
+    let journal_argv = journal_meta
+        .get("argv")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        journal_argv.iter().any(|v| v == &Value::from("-n"))
+            && journal_argv.iter().any(|v| v == &Value::from("123")),
+        "expected journalctl argv to include -n 123, got: {journal_argv:?}"
+    );
+
+    let mock_lines = env.read_mock_log()?;
+    assert!(
+        mock_lines.iter().any(|line| {
+            line.contains("systemctl --user status svc-beta.service --no-pager --full")
+        }),
+        "expected systemctl status diagnose invocation in mock log"
+    );
+    assert!(
+        mock_lines
+            .iter()
+            .any(|line| { line.contains("journalctl --user -u svc-beta.service -n 123") }),
+        "expected journalctl diagnose invocation with -n 123 in mock log"
+    );
+
+    // --- Manual trigger: enable diagnostics and assert at least svc-beta.service gets diagnose logs ---
+    env.clear_mock_log()?;
+    let trigger_body = json!({
+        "token": env.manual_token(),
+        "all": true,
+        "dry_run": false,
+        "caller": "ci",
+        "reason": "unit-fail-diagnostics",
+    });
+    let trigger = env.send_request_with_env(
+        HttpRequest::post("/api/manual/trigger")
+            .header("content-type", "application/json")
+            .body(trigger_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
+            cmd.env("PODUP_TASK_DIAGNOSTICS", "1");
+            cmd.env("PODUP_TASK_DIAGNOSTICS_JOURNAL_LINES", "123");
+        },
+    )?;
+    assert_eq!(trigger.status, 202, "manual trigger should accept request");
+    let trigger_json = trigger.json_body()?;
+    let trigger_task_id = trigger_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !trigger_task_id.is_empty(),
+        "manual trigger diagnostics scenario must include task_id"
+    );
+
+    let trigger_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{trigger_task_id}")))?;
+    assert_eq!(trigger_detail.status, 200);
+    let body = trigger_detail.json_body()?;
+    assert_eq!(body["status"], Value::from("failed"));
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    assert!(
+        logs.iter().any(|entry| {
+            entry.get("action") == Some(&Value::from("unit-diagnose-status"))
+                && entry.get("unit") == Some(&Value::from("svc-beta.service"))
+        }),
+        "manual-trigger failing unit should include unit-diagnose-status log for svc-beta.service"
+    );
+    assert!(
+        logs.iter().any(|entry| {
+            entry.get("action") == Some(&Value::from("unit-diagnose-journal"))
+                && entry.get("unit") == Some(&Value::from("svc-beta.service"))
+        }),
+        "manual-trigger failing unit should include unit-diagnose-journal log for svc-beta.service"
+    );
+
+    let mock_lines = env.read_mock_log()?;
+    assert!(
+        mock_lines
+            .iter()
+            .any(|line| { line.contains("journalctl --user -u svc-beta.service -n 123") }),
+        "expected journalctl diagnose invocation with -n 123 in manual-trigger mock log"
     );
 
     Ok(())

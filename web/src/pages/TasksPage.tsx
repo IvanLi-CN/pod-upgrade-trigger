@@ -14,6 +14,7 @@ import { isCommandMeta } from '../domain/tasks'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
 import { AutoUpdateWarningsBlock } from '../components/AutoUpdateWarningsBlock'
+import { TaskLogMetaDetails } from '../components/TaskLogMetaDetails'
 
 type TaskCategory = 'all' | 'manual' | 'webhook' | 'automatic' | 'maintenance'
 
@@ -1088,6 +1089,12 @@ export default function TasksPage() {
                                   <p className="text-[11px] text-base-content/80">
                                     {log.summary}
                                   </p>
+                                  {!isTaskDispatchFailed ? (
+                                    <TaskLogMetaDetails
+                                      meta={log.meta}
+                                      unitAlreadyShown={Boolean(log.unit)}
+                                    />
+                                  ) : null}
                                   {hasNoSummaryHint ? (
                                     <p className="text-[10px] text-warning">
                                       no JSONL summary found

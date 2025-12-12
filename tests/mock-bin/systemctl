@@ -26,4 +26,12 @@ if [[ "$*" =~ --user\ (start|restart)\ (.+) ]]; then
   fi
 fi
 
+if [[ "$*" =~ --user\ status\ (.+)\ --no-pager\ --full ]]; then
+  unit="${BASH_REMATCH[1]}"
+  echo "MOCK systemctl status for $unit"
+  echo "Loaded: loaded (/mock/$unit; enabled)"
+  echo "Active: failed (Result: exit-code)"
+  exit 0
+fi
+
 exit 0

@@ -194,4 +194,54 @@ test.describe('Manual triggers', () => {
     // Non-dry run returns task_id and should open the Manual task drawer
     await expect(page.getByText('任务中心')).toBeVisible()
   })
+
+  test('shows meta.result_message details in Manual task drawer timeline (collapsible)', async ({ page }) => {
+    await openManualPage(page)
+
+    const svcRow = page.locator('form', { hasText: 'svc-alpha.service' }).first()
+    await svcRow.getByLabel('Dry').uncheck()
+    await svcRow.getByRole('button', { name: '触发' }).click()
+
+    await expect(page.getByText('任务中心')).toBeVisible()
+
+    const tasksListTab = page.getByRole('button', { name: '任务列表' })
+    await expect(tasksListTab).toBeVisible()
+    await tasksListTab.click()
+
+    const listSection = page.locator('section').filter({ hasText: '任务列表' }).first()
+    await expect(listSection).toBeVisible()
+
+    const failingRow = listSection
+      .locator('table tbody tr')
+      .filter({
+        hasText: 'Manual service failure demo · meta.result_message (svc-alpha)',
+      })
+      .first()
+    await expect(failingRow).toBeVisible()
+    await failingRow.click()
+
+    const logsTimelineSection = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+    await expect(logsTimelineSection).toBeVisible()
+
+    const manualServiceCard = logsTimelineSection
+      .locator('div')
+      .filter({ hasText: 'manual-service-run' })
+      .filter({ hasText: 'Manual service task failed' })
+      .first()
+    await expect(manualServiceCard).toBeVisible()
+
+    const expand = manualServiceCard.getByRole('button', { name: '展开详情' })
+    await expect(expand).toBeVisible()
+    await expand.click()
+
+    await expect(
+      manualServiceCard.getByText(
+        'LAST_LINE: Failed to start svc-alpha.service: Permission denied',
+      ),
+    ).toBeVisible()
+    await expect(manualServiceCard.getByText('result_status · failed')).toBeVisible()
+  })
 })
