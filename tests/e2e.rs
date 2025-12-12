@@ -887,7 +887,10 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
     )?;
     assert_eq!(service.status, 202, "manual service should accept request");
     let service_json = service.json_body()?;
-    let service_task_id = service_json["task_id"].as_str().unwrap_or_default().to_string();
+    let service_task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
         !service_task_id.is_empty(),
         "manual service failure scenario must include task_id"
@@ -905,11 +908,15 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .find(|entry| entry.get("action") == Some(&Value::from("manual-service-run")))
         .expect("manual-service-run log entry exists");
     assert!(
-        !logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
         "diagnostics must be disabled by default (unit-diagnose-status should be absent)"
     );
     assert!(
-        !logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
         "diagnostics must be disabled by default (unit-diagnose-journal should be absent)"
     );
     let meta = service_run_log
@@ -922,7 +929,10 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    assert!(!exit.is_empty(), "manual-service-run meta.exit should be non-empty");
+    assert!(
+        !exit.is_empty(),
+        "manual-service-run meta.exit should be non-empty"
+    );
     let stderr = meta
         .get("stderr")
         .and_then(|v| v.as_str())
@@ -969,13 +979,17 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
     )?;
     assert_eq!(trigger.status, 202, "manual trigger should accept request");
     let trigger_json = trigger.json_body()?;
-    let trigger_task_id = trigger_json["task_id"].as_str().unwrap_or_default().to_string();
+    let trigger_task_id = trigger_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
         !trigger_task_id.is_empty(),
         "manual trigger scenario must include task_id"
     );
 
-    let trigger_detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{trigger_task_id}")))?;
+    let trigger_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{trigger_task_id}")))?;
     assert_eq!(trigger_detail.status, 200);
     let body = trigger_detail.json_body()?;
     assert_eq!(body["status"], Value::from("failed"));
@@ -987,11 +1001,15 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         "manual trigger task should include manual-trigger-run summary log"
     );
     assert!(
-        !logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
         "diagnostics must be disabled by default (unit-diagnose-status should be absent)"
     );
     assert!(
-        !logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
+        !logs
+            .iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
         "diagnostics must be disabled by default (unit-diagnose-journal should be absent)"
     );
     let unit_log = logs
@@ -1008,7 +1026,10 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    assert!(!exit.is_empty(), "manual-trigger-unit-run meta.exit should be non-empty");
+    assert!(
+        !exit.is_empty(),
+        "manual-trigger-unit-run meta.exit should be non-empty"
+    );
     let stderr = meta
         .get("stderr")
         .and_then(|v| v.as_str())
@@ -1070,7 +1091,10 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
     )?;
     assert_eq!(service.status, 202, "manual service should accept request");
     let service_json = service.json_body()?;
-    let service_task_id = service_json["task_id"].as_str().unwrap_or_default().to_string();
+    let service_task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
         !service_task_id.is_empty(),
         "manual service diagnostics scenario must include task_id"
@@ -1097,7 +1121,10 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
         status_meta.get("purpose"),
         Some(&Value::from("diagnose-status"))
     );
-    assert_eq!(status_meta.get("unit"), Some(&Value::from("svc-beta.service")));
+    assert_eq!(
+        status_meta.get("unit"),
+        Some(&Value::from("svc-beta.service"))
+    );
     assert_eq!(
         status_meta.get("command"),
         Some(&Value::from(
@@ -1160,9 +1187,9 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
         "expected systemctl status diagnose invocation in mock log"
     );
     assert!(
-        mock_lines.iter().any(|line| {
-            line.contains("journalctl --user -u svc-beta.service -n 123")
-        }),
+        mock_lines
+            .iter()
+            .any(|line| { line.contains("journalctl --user -u svc-beta.service -n 123") }),
         "expected journalctl diagnose invocation with -n 123 in mock log"
     );
 
@@ -1187,13 +1214,17 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
     )?;
     assert_eq!(trigger.status, 202, "manual trigger should accept request");
     let trigger_json = trigger.json_body()?;
-    let trigger_task_id = trigger_json["task_id"].as_str().unwrap_or_default().to_string();
+    let trigger_task_id = trigger_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
         !trigger_task_id.is_empty(),
         "manual trigger diagnostics scenario must include task_id"
     );
 
-    let trigger_detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{trigger_task_id}")))?;
+    let trigger_detail =
+        env.send_request(HttpRequest::get(&format!("/api/tasks/{trigger_task_id}")))?;
     assert_eq!(trigger_detail.status, 200);
     let body = trigger_detail.json_body()?;
     assert_eq!(body["status"], Value::from("failed"));
@@ -1215,9 +1246,9 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
 
     let mock_lines = env.read_mock_log()?;
     assert!(
-        mock_lines.iter().any(|line| {
-            line.contains("journalctl --user -u svc-beta.service -n 123")
-        }),
+        mock_lines
+            .iter()
+            .any(|line| { line.contains("journalctl --user -u svc-beta.service -n 123") }),
         "expected journalctl diagnose invocation with -n 123 in manual-trigger mock log"
     );
 

@@ -8864,7 +8864,14 @@ fn capture_unit_failure_diagnostics(unit: &str, journal_lines: i64) -> Vec<Prepa
 
     // A) systemctl --user status <unit> --no-pager --full
     let status_command = format!("systemctl --user status {unit} --no-pager --full");
-    let status_argv = ["systemctl", "--user", "status", unit, "--no-pager", "--full"];
+    let status_argv = [
+        "systemctl",
+        "--user",
+        "status",
+        unit,
+        "--no-pager",
+        "--full",
+    ];
     let status_result = run_quiet_command({
         let mut cmd = Command::new("systemctl");
         cmd.arg("--user")
@@ -8894,9 +8901,8 @@ fn capture_unit_failure_diagnostics(unit: &str, journal_lines: i64) -> Vec<Prepa
 
     // B) journalctl --user -u <unit> -n <N> --no-pager --output=short-precise
     let n_str = journal_lines.to_string();
-    let journal_command = format!(
-        "journalctl --user -u {unit} -n {journal_lines} --no-pager --output=short-precise"
-    );
+    let journal_command =
+        format!("journalctl --user -u {unit} -n {journal_lines} --no-pager --output=short-precise");
     let journal_argv = [
         "journalctl",
         "--user",
@@ -9151,7 +9157,10 @@ fn unit_error_summary_from_exec_error(err: &str) -> Option<String> {
     }
 }
 
-fn unit_action_result_from_operation(unit: &str, outcome: &Result<CommandExecResult, String>) -> UnitActionResult {
+fn unit_action_result_from_operation(
+    unit: &str,
+    outcome: &Result<CommandExecResult, String>,
+) -> UnitActionResult {
     match outcome {
         Ok(result) if result.success() => UnitActionResult {
             unit: unit.to_string(),
@@ -10407,7 +10416,11 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
             )
             .bind(&task_id_upd)
             .bind(now)
-            .bind(if unit_status == "failed" { "error" } else { "info" })
+            .bind(if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            })
             .bind("manual-trigger-unit-run")
             .bind(unit_status)
             .bind(if unit_status == "failed" {
@@ -10434,10 +10447,7 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
                     .bind(entry.status)
                     .bind(&entry.summary)
                     .bind(Some(unit.clone()))
-                    .bind(
-                        serde_json::to_string(&entry.meta)
-                            .unwrap_or_else(|_| "{}".to_string()),
-                    )
+                    .bind(serde_json::to_string(&entry.meta).unwrap_or_else(|_| "{}".to_string()))
                     .execute(&mut *tx)
                     .await?;
                 }
