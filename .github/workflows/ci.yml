@@ -213,11 +213,14 @@ jobs:
         run: ./scripts/test-ui-e2e-mock.sh
 
   build:
-    name: PR Build Check
+    name: Build Frontend & Backend
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: |
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
     needs: [lint, unit-tests, e2e-tests]
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -238,6 +241,10 @@ jobs:
         working-directory: web
         run: bun run build
 
+      - name: Set PR effective version
+        if: github.event_name == 'pull_request'
+        run: echo "APP_EFFECTIVE_VERSION=pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::7}" >> \"$GITHUB_ENV\"
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
@@ -255,7 +262,16 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cargo build (release)
-        run: cargo build --release --locked
+        run: cargo build --release --locked --bin pod-upgrade-trigger
+
+      - name: Upload release binary artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binary
+          path: target/release/pod-upgrade-trigger
+          retention-days: 1
+          if-no-files-found: error
 
   check-release-skip:
     name: Check Release Skip Conditions
@@ -320,6 +336,7 @@ jobs:
       - e2e-tests
       - ui-e2e-tests
       - check-release-skip
+      - build
     permissions:
       contents: write
     timeout-minutes: 45
@@ -371,15 +388,22 @@ jobs:
         if: env.TAG_EXISTS != 'true'
         run: git push origin "v${APP_EFFECTIVE_VERSION}"
 
-      - name: Build release binary
-        run: cargo build --release --locked --bin pod-upgrade-trigger
+      - name: Download release binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binary
+          path: release-artifacts
 
       - name: Prepare release artifacts
         run: |
           set -euo pipefail
           ARTIFACT_DIR="release-artifacts"
-          mkdir -p "$ARTIFACT_DIR"
-          cp target/release/pod-upgrade-trigger "$ARTIFACT_DIR/pod-upgrade-trigger-x86_64-unknown-linux-gnu"
+          BIN_PATH="$ARTIFACT_DIR/pod-upgrade-trigger"
+          if [ ! -f "$BIN_PATH" ]; then
+            echo "Expected binary $BIN_PATH not found" >&2
+            exit 1
+          fi
+          mv "$BIN_PATH" "$ARTIFACT_DIR/pod-upgrade-trigger-x86_64-unknown-linux-gnu"
           strip "$ARTIFACT_DIR/pod-upgrade-trigger-x86_64-unknown-linux-gnu" || true
           cd "$ARTIFACT_DIR"
           sha256sum pod-upgrade-trigger-x86_64-unknown-linux-gnu > pod-upgrade-trigger-x86_64-unknown-linux-gnu.sha256
