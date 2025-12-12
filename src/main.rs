@@ -92,6 +92,10 @@ const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
 const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
 const ENV_AUTO_UPDATE_LOG_DIR: &str = "PODUP_AUTO_UPDATE_LOG_DIR";
 const ENV_SELF_UPDATE_REPORT_DIR: &str = "PODUP_SELF_UPDATE_REPORT_DIR";
+const ENV_TASK_DIAGNOSTICS: &str = "PODUP_TASK_DIAGNOSTICS";
+const ENV_TASK_DIAGNOSTICS_JOURNAL_LINES: &str = "PODUP_TASK_DIAGNOSTICS_JOURNAL_LINES";
+const TASK_DIAGNOSTICS_JOURNAL_LINES_DEFAULT: i64 = 100;
+const TASK_DIAGNOSTICS_JOURNAL_LINES_MAX: i64 = 1000;
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/ivanli-cn/pod-upgrade-trigger/releases/latest";
 const EVENTS_DEFAULT_PAGE_SIZE: u64 = 50;
@@ -760,6 +764,21 @@ fn parse_env_bool(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn task_diagnostics_enabled() -> bool {
+    parse_env_bool(ENV_TASK_DIAGNOSTICS)
+}
+
+fn task_diagnostics_journal_lines_from_env() -> i64 {
+    let raw = env::var(ENV_TASK_DIAGNOSTICS_JOURNAL_LINES)
+        .ok()
+        .unwrap_or_default();
+    let raw = raw.trim();
+
+    let parsed = raw.parse::<i64>().ok().filter(|n| *n > 0);
+    let lines = parsed.unwrap_or(TASK_DIAGNOSTICS_JOURNAL_LINES_DEFAULT);
+    lines.clamp(1, TASK_DIAGNOSTICS_JOURNAL_LINES_MAX)
 }
 
 fn start_self_update_scheduler() {
@@ -8799,6 +8818,127 @@ fn run_quiet_command(mut command: Command) -> Result<CommandExecResult, String> 
     })
 }
 
+struct PreparedTaskLog {
+    level: &'static str,
+    action: &'static str,
+    status: &'static str,
+    summary: String,
+    unit: String,
+    meta: Value,
+}
+
+fn build_unit_diagnostics_command_meta(
+    unit: &str,
+    runner: &str,
+    purpose: &str,
+    command: &str,
+    argv: &[&str],
+    outcome: &Result<CommandExecResult, String>,
+) -> Value {
+    let extra = json!({
+        "runner": runner,
+        "purpose": purpose,
+        "unit": unit,
+    });
+
+    match outcome {
+        Ok(result) => build_command_meta(command, argv, result, Some(extra)),
+        Err(err) => merge_task_meta(
+            json!({
+                "type": "command",
+                "command": command,
+                "argv": argv,
+                "error": err,
+            }),
+            extra,
+        ),
+    }
+}
+
+fn capture_unit_failure_diagnostics(unit: &str, journal_lines: i64) -> Vec<PreparedTaskLog> {
+    if !task_diagnostics_enabled() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::with_capacity(2);
+
+    // A) systemctl --user status <unit> --no-pager --full
+    let status_command = format!("systemctl --user status {unit} --no-pager --full");
+    let status_argv = ["systemctl", "--user", "status", unit, "--no-pager", "--full"];
+    let status_result = run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user")
+            .arg("status")
+            .arg(unit)
+            .arg("--no-pager")
+            .arg("--full");
+        cmd
+    });
+    let status_ok = matches!(status_result.as_ref(), Ok(res) if res.success());
+    let status_meta = build_unit_diagnostics_command_meta(
+        unit,
+        "systemctl",
+        "diagnose-status",
+        &status_command,
+        &status_argv,
+        &status_result,
+    );
+    entries.push(PreparedTaskLog {
+        level: if status_ok { "info" } else { "warning" },
+        action: "unit-diagnose-status",
+        status: if status_ok { "succeeded" } else { "failed" },
+        summary: "Unit diagnostics: systemctl status".to_string(),
+        unit: unit.to_string(),
+        meta: status_meta,
+    });
+
+    // B) journalctl --user -u <unit> -n <N> --no-pager --output=short-precise
+    let n_str = journal_lines.to_string();
+    let journal_command = format!(
+        "journalctl --user -u {unit} -n {journal_lines} --no-pager --output=short-precise"
+    );
+    let journal_argv = [
+        "journalctl",
+        "--user",
+        "-u",
+        unit,
+        "-n",
+        n_str.as_str(),
+        "--no-pager",
+        "--output=short-precise",
+    ];
+    let journal_result = run_quiet_command({
+        let mut cmd = Command::new("journalctl");
+        cmd.arg("--user")
+            .arg("-u")
+            .arg(unit)
+            .arg("-n")
+            .arg(&n_str)
+            .arg("--no-pager")
+            .arg("--output=short-precise");
+        cmd
+    });
+    let journal_ok = matches!(journal_result.as_ref(), Ok(res) if res.success());
+    let journal_meta = build_unit_diagnostics_command_meta(
+        unit,
+        "journalctl",
+        "diagnose-journal",
+        &journal_command,
+        &journal_argv,
+        &journal_result,
+    );
+    entries.push(PreparedTaskLog {
+        level: if journal_ok { "info" } else { "warning" },
+        action: "unit-diagnose-journal",
+        status: if journal_ok { "succeeded" } else { "failed" },
+        summary: "Unit diagnostics: journalctl".to_string(),
+        unit: unit.to_string(),
+        meta: journal_meta,
+    });
+
+    entries
+}
+
 fn podman_health() -> Result<(), String> {
     PODMAN_HEALTH
         .get_or_init(|| {
@@ -10111,6 +10251,13 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
     let mut unit_operation_metas: Vec<Value> = Vec::with_capacity(units.len());
     let mut unit_operation_purposes: Vec<UnitOperationPurpose> = Vec::with_capacity(units.len());
     let mut unit_error_summaries: Vec<Option<String>> = Vec::with_capacity(units.len());
+    let diagnostics_enabled = task_diagnostics_enabled();
+    let diagnostics_journal_lines = if diagnostics_enabled {
+        task_diagnostics_journal_lines_from_env()
+    } else {
+        TASK_DIAGNOSTICS_JOURNAL_LINES_DEFAULT
+    };
+    let mut diagnostics_logs: Vec<Vec<PreparedTaskLog>> = Vec::with_capacity(units.len());
 
     for unit in &units {
         let purpose = if unit == &manual_auto_update {
@@ -10120,6 +10267,8 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         };
         let run = run_unit_operation(unit, purpose);
         let unit_result = unit_action_result_from_operation(unit, &run.result);
+        let needs_diagnostics =
+            diagnostics_enabled && matches!(unit_result.status.as_str(), "failed" | "error");
 
         let meta = build_unit_operation_command_meta(
             unit,
@@ -10143,6 +10292,14 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         unit_operation_metas.push(meta);
         unit_operation_purposes.push(run.purpose);
         unit_error_summaries.push(unit_error);
+        if needs_diagnostics {
+            diagnostics_logs.push(capture_unit_failure_diagnostics(
+                unit,
+                diagnostics_journal_lines,
+            ));
+        } else {
+            diagnostics_logs.push(Vec::new());
+        }
     }
 
     let mut succeeded = 0usize;
@@ -10168,6 +10325,7 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
     let metas_upd = unit_operation_metas;
     let purposes_upd = unit_operation_purposes;
     let errors_upd = unit_error_summaries;
+    let diagnostics_upd = diagnostics_logs;
 
     let _ = with_db(|pool| async move {
         let mut tx = pool.begin().await?;
@@ -10198,12 +10356,21 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         .execute(&mut *tx)
         .await?;
 
-        for (((unit, res), meta), (purpose, unit_error)) in units_upd
-            .iter()
-            .zip(results.iter())
-            .zip(metas_upd.iter())
-            .zip(purposes_upd.iter().zip(errors_upd.iter()))
-        {
+        for idx in 0..units_upd.len() {
+            let Some(unit) = units_upd.get(idx) else {
+                continue;
+            };
+            let Some(res) = results.get(idx) else {
+                continue;
+            };
+            let Some(meta) = metas_upd.get(idx) else {
+                continue;
+            };
+            let Some(purpose) = purposes_upd.get(idx) else {
+                continue;
+            };
+            let unit_error = errors_upd.get(idx).cloned().unwrap_or(None);
+            let diag_entries = diagnostics_upd.get(idx);
             let unit_status = match res.status.as_str() {
                 "triggered" => "succeeded",
                 "dry-run" => "skipped",
@@ -10224,7 +10391,7 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
                 None
             })
             .bind(if unit_status == "failed" {
-                unit_error.clone()
+                unit_error
             } else {
                 None
             })
@@ -10252,6 +10419,29 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
             .bind(serde_json::to_string(meta).unwrap_or_else(|_| "{}".to_string()))
             .execute(&mut *tx)
             .await?;
+
+            if let Some(diag_entries) = diag_entries {
+                for entry in diag_entries {
+                    sqlx::query(
+                        "INSERT INTO task_logs \
+                         (task_id, ts, level, action, status, summary, unit, meta) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&task_id_upd)
+                    .bind(now)
+                    .bind(entry.level)
+                    .bind(entry.action)
+                    .bind(entry.status)
+                    .bind(&entry.summary)
+                    .bind(Some(unit.clone()))
+                    .bind(
+                        serde_json::to_string(&entry.meta)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    )
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
 
         sqlx::query(
@@ -10402,6 +10592,21 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         },
         meta,
     );
+
+    if unit_status == "failed" {
+        let journal_lines = task_diagnostics_journal_lines_from_env();
+        for entry in capture_unit_failure_diagnostics(&unit_owned, journal_lines) {
+            append_task_log(
+                task_id,
+                entry.level,
+                entry.action,
+                entry.status,
+                &entry.summary,
+                Some(&entry.unit),
+                entry.meta,
+            );
+        }
+    }
 
     Ok(())
 }
