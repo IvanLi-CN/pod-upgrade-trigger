@@ -1369,12 +1369,22 @@ fn handle_connection() -> Result<(), String> {
 
         let db = db_status();
         let podman = podman_health();
+        let is_admin = is_admin_request(&ctx);
+        let safe_db_error = db
+            .error
+            .as_ref()
+            .map(|_| "database initialization failed".to_string());
 
         let mut issues = Vec::new();
         if let Some(err) = &db.error {
+            let message = if is_admin {
+                err.clone()
+            } else {
+                "database initialization failed".to_string()
+            };
             issues.push(json!({
                 "component": "database",
-                "message": err,
+                "message": message,
                 "hint": format!("Set {ENV_DB_URL} or {ENV_STATE_DIR} to a writable path"),
             }));
         }
@@ -1387,9 +1397,13 @@ fn handle_connection() -> Result<(), String> {
         }
 
         let status = if issues.is_empty() { 200 } else { 503 };
+        let db_payload = json!({
+            "url": if is_admin { Some(db.url) } else { None },
+            "error": if is_admin { db.error } else { safe_db_error },
+        });
         let payload = json!({
             "status": if issues.is_empty() { "ok" } else { "degraded" },
-            "db": { "url": db.url, "error": db.error },
+            "db": db_payload,
             "podman": {
                 "ok": podman.is_ok(),
                 "error": podman.err(),
