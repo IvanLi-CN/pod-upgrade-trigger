@@ -213,7 +213,7 @@ jobs:
         run: ./scripts/test-ui-e2e-mock.sh
 
   build:
-    name: Build Artifacts
+    name: PR Build Check
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: [lint, unit-tests, e2e-tests]
