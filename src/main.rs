@@ -521,6 +521,15 @@ fn main() {
     let remaining: Vec<String> = args.collect();
 
     match command.as_str() {
+        "version" => {
+            let current = current_version();
+            if let Some(tag) = current.release_tag {
+                println!("{tag}");
+            } else {
+                println!("{}", current.package);
+            }
+            std::process::exit(0);
+        }
         "server" => run_server(),
         "http-server" => run_http_server_cli(&remaining),
         "run-task" => run_background_cli(&remaining),
@@ -1254,6 +1263,7 @@ fn print_usage(exe: &str) {
     eprintln!(
         "  http-server                  Run the persistent HTTP server bound to PODUP_HTTP_ADDR"
     );
+    eprintln!("  version                      Print the current version");
     eprintln!("  scheduler [options]          Run the periodic auto-update trigger");
     eprintln!("  trigger-units <units...>     Restart specific units immediately");
     eprintln!("  trigger-all [options]        Restart all configured units");
