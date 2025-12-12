@@ -8888,6 +8888,193 @@ fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum UnitOperationPurpose {
+    Start,
+    Restart,
+}
+
+impl UnitOperationPurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Restart => "restart",
+        }
+    }
+
+    fn busctl_method(self) -> &'static str {
+        match self {
+            Self::Start => "StartUnit",
+            Self::Restart => "RestartUnit",
+        }
+    }
+}
+
+struct UnitOperationRun {
+    runner: &'static str,
+    purpose: UnitOperationPurpose,
+    command: String,
+    argv: Vec<String>,
+    runner_command: Option<String>,
+    result: Result<CommandExecResult, String>,
+}
+
+fn run_unit_operation(unit: &str, purpose: UnitOperationPurpose) -> UnitOperationRun {
+    let command = format!("systemctl --user {} {unit}", purpose.as_str());
+    let argv = vec![
+        "systemctl".to_string(),
+        "--user".to_string(),
+        purpose.as_str().to_string(),
+        unit.to_string(),
+    ];
+
+    let busctl_runner_command = format!(
+        "busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager {} ss {unit} replace",
+        purpose.busctl_method()
+    );
+
+    if let Ok(result) = run_quiet_command({
+        let mut cmd = Command::new("busctl");
+        cmd.arg("--user")
+            .arg("call")
+            .arg("org.freedesktop.systemd1")
+            .arg("/org/freedesktop/systemd1")
+            .arg("org.freedesktop.systemd1.Manager")
+            .arg(purpose.busctl_method())
+            .arg("ss")
+            .arg(unit)
+            .arg("replace");
+        cmd
+    }) {
+        return UnitOperationRun {
+            runner: "busctl",
+            purpose,
+            command,
+            argv,
+            runner_command: Some(busctl_runner_command),
+            result: Ok(result),
+        };
+    }
+
+    let result = run_quiet_command({
+        let mut cmd = Command::new("systemctl");
+        cmd.arg("--user").arg(purpose.as_str()).arg(unit);
+        cmd
+    });
+
+    UnitOperationRun {
+        runner: "systemctl",
+        purpose,
+        command,
+        argv,
+        runner_command: None,
+        result,
+    }
+}
+
+const UNIT_ERROR_SUMMARY_MAX_CHARS: usize = 1024;
+
+fn truncate_unit_error_summary(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in text.chars().take(UNIT_ERROR_SUMMARY_MAX_CHARS) {
+        out.push(ch);
+    }
+    out
+}
+
+fn unit_error_summary_from_command_result(result: &CommandExecResult) -> Option<String> {
+    if result.success() {
+        return None;
+    }
+    let mut detail = format!("exit={}", exit_code_string(&result.status));
+    if !result.stderr.is_empty() {
+        detail.push_str(" stderr=");
+        detail.push_str(&result.stderr);
+    }
+    let detail = truncate_unit_error_summary(&detail);
+    if detail.is_empty() {
+        None
+    } else {
+        Some(detail)
+    }
+}
+
+fn unit_error_summary_from_exec_error(err: &str) -> Option<String> {
+    let detail = truncate_unit_error_summary(err.trim());
+    if detail.is_empty() {
+        None
+    } else {
+        Some(detail)
+    }
+}
+
+fn unit_action_result_from_operation(unit: &str, outcome: &Result<CommandExecResult, String>) -> UnitActionResult {
+    match outcome {
+        Ok(result) if result.success() => UnitActionResult {
+            unit: unit.to_string(),
+            status: "triggered".into(),
+            message: None,
+        },
+        Ok(result) => {
+            let detail = unit_error_summary_from_command_result(result);
+            UnitActionResult {
+                unit: unit.to_string(),
+                status: "failed".into(),
+                message: detail,
+            }
+        }
+        Err(err) => UnitActionResult {
+            unit: unit.to_string(),
+            status: "error".into(),
+            message: Some(truncate_unit_error_summary(err)),
+        },
+    }
+}
+
+fn build_unit_operation_command_meta(
+    unit: &str,
+    image: Option<&str>,
+    runner: &str,
+    purpose: UnitOperationPurpose,
+    command: &str,
+    argv: &[String],
+    runner_command: Option<&str>,
+    outcome: &Result<CommandExecResult, String>,
+    result_status: &str,
+    result_message: &Option<String>,
+) -> Value {
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+
+    let mut extra = json!({
+        "unit": unit,
+        "image": image,
+        "runner": runner,
+        "purpose": purpose.as_str(),
+        "result_status": result_status,
+        "result_message": result_message,
+    });
+
+    if let Some(rc) = runner_command {
+        extra["runner_command"] = Value::String(rc.to_string());
+    }
+
+    match outcome {
+        Ok(result) => build_command_meta(command, &argv_refs, result, Some(extra)),
+        Err(err) => {
+            let meta = json!({
+                "type": "command",
+                "command": command,
+                "argv": argv_refs,
+                "error": err,
+            });
+            merge_task_meta(meta, extra)
+        }
+    }
+}
+
 /// Best-effort graceful stop of a systemd unit backing a running task.
 fn stop_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
     run_quiet_command({
@@ -9311,6 +9498,89 @@ fn update_task_state_with_unit(
         .bind(&unit_status_owned)
         .bind(now)
         .bind(&summary_owned)
+        .bind(&task_id_owned)
+        .bind(&unit_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_owned)
+        .bind(now)
+        .bind(&log_level_owned)
+        .bind(&log_action_owned)
+        .bind(&status_owned)
+        .bind(&summary_owned)
+        .bind(Some(unit_owned))
+        .bind(meta_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+}
+
+fn update_task_state_with_unit_error(
+    task_id: &str,
+    new_status: &str,
+    unit: &str,
+    unit_status: &str,
+    summary: &str,
+    unit_error: Option<&str>,
+    log_action: &str,
+    log_level: &str,
+    meta: Value,
+) {
+    let task_id_owned = task_id.to_string();
+    let unit_owned = unit.to_string();
+    let status_owned = new_status.to_string();
+    let unit_status_owned = unit_status.to_string();
+    let summary_owned = summary.to_string();
+    let unit_error_owned = unit_error.map(|s| s.to_string());
+    let log_action_owned = log_action.to_string();
+    let log_level_owned = log_level.to_string();
+    let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+    let now = current_unix_secs() as i64;
+
+    let _ = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "UPDATE tasks \
+             SET status = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?, summary = ? \
+             WHERE task_id = ?",
+        )
+        .bind(&status_owned)
+        .bind(now)
+        .bind(now)
+        .bind(&summary_owned)
+        .bind(&task_id_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE task_logs \
+             SET status = ? \
+             WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+        )
+        .bind(&status_owned)
+        .bind(&task_id_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE task_units \
+             SET status = ?, finished_at = COALESCE(finished_at, ?), message = ?, error = ? \
+             WHERE task_id = ? AND unit = ?",
+        )
+        .bind(&unit_status_owned)
+        .bind(now)
+        .bind(&summary_owned)
+        .bind(unit_error_owned)
         .bind(&task_id_owned)
         .bind(&unit_owned)
         .execute(&mut *tx)
@@ -9836,9 +10106,43 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         return Ok(());
     }
 
+    let manual_auto_update = manual_auto_update_unit();
     let mut results = Vec::with_capacity(units.len());
+    let mut unit_operation_metas: Vec<Value> = Vec::with_capacity(units.len());
+    let mut unit_operation_purposes: Vec<UnitOperationPurpose> = Vec::with_capacity(units.len());
+    let mut unit_error_summaries: Vec<Option<String>> = Vec::with_capacity(units.len());
+
     for unit in &units {
-        results.push(trigger_single_unit(unit, false));
+        let purpose = if unit == &manual_auto_update {
+            UnitOperationPurpose::Start
+        } else {
+            UnitOperationPurpose::Restart
+        };
+        let run = run_unit_operation(unit, purpose);
+        let unit_result = unit_action_result_from_operation(unit, &run.result);
+
+        let meta = build_unit_operation_command_meta(
+            unit,
+            None,
+            run.runner,
+            run.purpose,
+            &run.command,
+            &run.argv,
+            run.runner_command.as_deref(),
+            &run.result,
+            &unit_result.status,
+            &unit_result.message,
+        );
+
+        let unit_error = match &run.result {
+            Ok(res) => unit_error_summary_from_command_result(res),
+            Err(err) => unit_error_summary_from_exec_error(err),
+        };
+
+        results.push(unit_result);
+        unit_operation_metas.push(meta);
+        unit_operation_purposes.push(run.purpose);
+        unit_error_summaries.push(unit_error);
     }
 
     let mut succeeded = 0usize;
@@ -9861,6 +10165,9 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
 
     let task_id_upd = task_id.to_string();
     let units_upd = units.clone();
+    let metas_upd = unit_operation_metas;
+    let purposes_upd = unit_operation_purposes;
+    let errors_upd = unit_error_summaries;
 
     let _ = with_db(|pool| async move {
         let mut tx = pool.begin().await?;
@@ -9891,7 +10198,12 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         .execute(&mut *tx)
         .await?;
 
-        for (unit, res) in units_upd.iter().zip(results.iter()) {
+        for (((unit, res), meta), (purpose, unit_error)) in units_upd
+            .iter()
+            .zip(results.iter())
+            .zip(metas_upd.iter())
+            .zip(purposes_upd.iter().zip(errors_upd.iter()))
+        {
             let unit_status = match res.status.as_str() {
                 "triggered" => "succeeded",
                 "dry-run" => "skipped",
@@ -9901,14 +10213,43 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
 
             sqlx::query(
                 "UPDATE task_units \
-                 SET status = ?, finished_at = COALESCE(finished_at, ?), message = ? \
+                 SET status = ?, finished_at = COALESCE(finished_at, ?), message = ?, error = ? \
                  WHERE task_id = ? AND unit = ?",
             )
             .bind(unit_status)
             .bind(now)
-            .bind(&res.message)
+            .bind(if unit_status == "failed" {
+                Some(format!("{} failed", purpose.as_str()))
+            } else {
+                None
+            })
+            .bind(if unit_status == "failed" {
+                unit_error.clone()
+            } else {
+                None
+            })
             .bind(&task_id_upd)
             .bind(unit)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO task_logs \
+                 (task_id, ts, level, action, status, summary, unit, meta) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_upd)
+            .bind(now)
+            .bind(if unit_status == "failed" { "error" } else { "info" })
+            .bind("manual-trigger-unit-run")
+            .bind(unit_status)
+            .bind(if unit_status == "failed" {
+                format!("Manual trigger unit {} failed", purpose.as_str())
+            } else {
+                format!("Manual trigger unit {} succeeded", purpose.as_str())
+            })
+            .bind(Some(unit.clone()))
+            .bind(serde_json::to_string(meta).unwrap_or_else(|_| "{}".to_string()))
             .execute(&mut *tx)
             .await?;
         }
@@ -10000,7 +10341,13 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         }
     }
 
-    let result = trigger_single_unit(&unit_owned, false);
+    let purpose = if unit_owned == manual_auto_update_unit() {
+        UnitOperationPurpose::Start
+    } else {
+        UnitOperationPurpose::Restart
+    };
+    let run = run_unit_operation(&unit_owned, purpose);
+    let result = unit_action_result_from_operation(&unit_owned, &run.result);
     let unit_status = match result.status.as_str() {
         "triggered" => "succeeded",
         "dry-run" => "skipped",
@@ -10018,19 +10365,35 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         "Manual service task succeeded".to_string()
     };
 
-    let meta = json!({
-        "unit": unit_owned,
-        "image": image,
-        "result_status": result.status,
-        "result_message": result.message,
-    });
+    let meta = build_unit_operation_command_meta(
+        &unit_owned,
+        image,
+        run.runner,
+        run.purpose,
+        &run.command,
+        &run.argv,
+        run.runner_command.as_deref(),
+        &run.result,
+        &result.status,
+        &result.message,
+    );
 
-    update_task_state_with_unit(
+    let unit_error = if unit_status == "failed" {
+        match &run.result {
+            Ok(res) => unit_error_summary_from_command_result(res),
+            Err(err) => unit_error_summary_from_exec_error(err),
+        }
+    } else {
+        None
+    };
+
+    update_task_state_with_unit_error(
         task_id,
         task_status,
         &unit_owned,
         unit_status,
         &summary,
+        unit_error.as_deref(),
         "manual-service-run",
         if unit_status == "failed" {
             "error"
