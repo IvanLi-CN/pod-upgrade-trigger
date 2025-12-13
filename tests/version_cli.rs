@@ -1,7 +1,19 @@
 use std::process::Command;
 
 fn expected_tag() -> String {
-    format!("v{}", env!("CARGO_PKG_VERSION"))
+    if let Some(tag) = option_env!("PODUP_BUILD_TAG") {
+        let trimmed = tag.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let version = option_env!("PODUP_BUILD_VERSION")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+
+    format!("v{version}")
 }
 
 #[test]

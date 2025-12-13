@@ -220,6 +220,8 @@ jobs:
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       github.event_name == 'workflow_dispatch'
     needs: [lint, unit-tests, e2e-tests]
+    outputs:
+      app_effective_version: ${{ steps.compute_version.outputs.app_effective_version }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -245,6 +247,22 @@ jobs:
         if: github.event_name == 'pull_request'
         run: echo "APP_EFFECTIVE_VERSION=pr-${{ github.event.pull_request.number }}-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
+      - name: Compute effective version
+        if: github.event_name != 'pull_request'
+        id: compute_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./.github/scripts/compute-version.sh
+          app_version="$(grep -E '^APP_EFFECTIVE_VERSION=' "$GITHUB_ENV" | tail -n 1 | cut -d= -f2-)"
+          if [[ -z "${app_version}" ]]; then
+            echo "Failed to read APP_EFFECTIVE_VERSION from GITHUB_ENV" >&2
+            exit 1
+          fi
+          echo "app_effective_version=${app_version}" >> "$GITHUB_OUTPUT"
+          echo "PODUP_BUILD_VERSION=${app_version}" >> "$GITHUB_ENV"
+          echo "PODUP_BUILD_TAG=v${app_version}" >> "$GITHUB_ENV"
+
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
@@ -263,6 +281,22 @@ jobs:
 
       - name: Cargo build (release)
         run: cargo build --release --locked --bin pod-upgrade-trigger
+
+      - name: Verify release binary reports expected version
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${PODUP_BUILD_TAG:-}"
+          if [[ -z "${expected}" ]]; then
+            echo "PODUP_BUILD_TAG is empty; expected version injection variables to be set." >&2
+            exit 1
+          fi
+          actual="$(target/release/pod-upgrade-trigger --version | head -n 1 | tr -d '\r')"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "release binary version mismatch: expected=${expected} actual=${actual}" >&2
+            exit 1
+          fi
 
       - name: Upload release binary artifact
         if: github.event_name != 'pull_request'
@@ -337,6 +371,8 @@ jobs:
       - ui-e2e-tests
       - check-release-skip
       - build
+    env:
+      APP_EFFECTIVE_VERSION: ${{ needs.build.outputs.app_effective_version }}
     permissions:
       contents: write
     timeout-minutes: 45
@@ -365,9 +401,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Compute effective version
+      - name: Validate effective version
         shell: bash
-        run: ./.github/scripts/compute-version.sh
+        run: |
+          set -euo pipefail
+          if [[ -z "${APP_EFFECTIVE_VERSION:-}" ]]; then
+            echo "APP_EFFECTIVE_VERSION is empty; expected build job output." >&2
+            exit 1
+          fi
+          if ! [[ "${APP_EFFECTIVE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "APP_EFFECTIVE_VERSION must be semver X.Y.Z; got: ${APP_EFFECTIVE_VERSION}" >&2
+            exit 1
+          fi
 
       - name: Create tag
         shell: bash

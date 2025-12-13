@@ -9,7 +9,7 @@
 - 更新脚本通过 GitHub API `releases/latest` 获取最新 release tag，下载对应二进制和校验文件，并在非 dry-run 模式下替换现有二进制；
 - 每次执行后生成 JSON 报告文件，由主程序周期性导入到 SQLite `tasks` 表，在 UI 的 `/tasks` 中以 kind=`self-update` / type=`self-update-run` 呈现。
 
-现有 Web UI 能够从 `/api/settings` 读取当前运行的包版本（`version.package = env!("CARGO_PKG_VERSION")`）以及构建时间，但不会主动提示“有新版本可用”。同时，自更新链路目前由脚本自行调用 GitHub API 决定更新目标版本，主程序并未作为版本信息的统一“真相源”。
+现有 Web UI 能够从 `/api/settings` 读取当前运行版本与构建时间，但当前版本字段历史上使用过 `CARGO_PKG_VERSION` 作为来源，可能与 GitHub Release tag 不一致（例如 Release 已是 `v0.1.43`，但 `--version` 仍显示 `v0.1.0`）。本设计在提供版本检查入口的同时，明确 **GitHub Release tag 为版本真相源**：在 Release 构建时将版本注入二进制，使“当前版本”可稳定对齐 Release，并避免与自更新脚本的 `PODUP_RELEASE_TAG`（目标版本）混淆。
 
 本设计希望：
 
@@ -35,6 +35,7 @@
 - 后端：
   - 在主程序中实现统一的“版本信息获取 + 最新 Release 查询 + 版本比较”逻辑；
   - 新增一个专用版本检查 API（`GET /api/version/check`），返回当前版本与最新版本信息；
+  - 引入编译期版本变量 `PODUP_BUILD_VERSION` / `PODUP_BUILD_TAG` 作为“当前运行版本”来源，并在 CI 构建 Release 二进制时注入，确保与 GitHub Release tag 一致；
   - 定义清晰的错误行为和日志输出策略。
 - 前端：
   - 新增版本检查 Hook，监听页面聚焦事件并实现“自上次检查已过 1 小时才触发” 的节流逻辑；
@@ -44,6 +45,7 @@
 
 - 不在本次变更中：
   - 修改自更新脚本 `scripts/update-pod-upgrade-trigger-from-release.sh` 的行为；
+  - 改变 `PODUP_RELEASE_TAG` 的语义（它仍仅用于 updater 指定“目标版本”，不参与主程序“当前版本”展示）；
   - 修改内建自更新调度线程（scheduler）的具体运行逻辑；
   - 引入 UI 内“一键触发自更新”的操作；
   - 定义多发布通道（beta/stable 等）的复杂版本策略。
@@ -55,7 +57,7 @@
 ### 当前行为概览
 
 - `/api/settings`：
-  - 返回当前进程的包版本 `version.package = env!("CARGO_PKG_VERSION")` 和构建时间 `version.build_timestamp`；
+  - 返回当前运行版本与构建时间，其中 `version.package` 优先来自编译期注入的 `PODUP_BUILD_VERSION`，未注入时回退到 `CARGO_PKG_VERSION`；
   - 不访问 GitHub，也不判断是否存在新版本。
 - 自更新链路：
   - `start_self_update_scheduler()` 根据环境变量配置，启动后台线程，周期性执行 `PODUP_SELF_UPDATE_COMMAND`；
@@ -82,8 +84,8 @@
 
 ```rust
 struct CurrentVersion {
-    package: String,             // 例如 "0.1.0"
-    release_tag: Option<String>, // 例如 "v0.1.0"，可选
+    package: String,             // 例如 "0.1.43"
+    release_tag: Option<String>, // 例如 "v0.1.43"，可选
 }
 
 struct LatestRelease {
@@ -103,8 +105,9 @@ struct VersionComparison {
 获取当前版本：
 
 - `CurrentVersion`：
-  - `package`：使用 `env!("CARGO_PKG_VERSION")`；
-  - `release_tag`：预留从环境变量（例如未来的 `PODUP_RELEASE_TAG`）读取的能力；现阶段可以为空或与 `package` 映射规则保持简单。
+  - `package`：优先使用编译期注入的 `PODUP_BUILD_VERSION`；未注入时回退到 `env!("CARGO_PKG_VERSION")`；
+  - `release_tag`：优先使用编译期注入的 `PODUP_BUILD_TAG`；若仅有 `package`，则使用 `v{package}` 映射生成；
+  - 注意：不读取运行时的 `PODUP_RELEASE_TAG` 作为“当前版本”，该变量仅用于 updater 指定“目标 release tag”。
 
 获取最新 release：
 
@@ -139,6 +142,17 @@ struct VersionComparison {
   - 记录详细日志（包括 HTTP 状态码、错误类别等）；
   - 对外 API 返回合适的错误状态码（例如 502/503），由前端视为“版本信息暂不可用”，避免影响其他管理操作。
 
+### 构建与发布：编译期版本注入（Release tag 对齐）
+
+为保证“当前运行版本”与 GitHub Release tag 一致，Release 二进制需要在**构建期**写入版本信息：
+
+- CI 在构建 Release 二进制之前计算 `APP_EFFECTIVE_VERSION=X.Y.Z`；
+- 将其映射为：
+  - `PODUP_BUILD_VERSION=X.Y.Z`
+  - `PODUP_BUILD_TAG=vX.Y.Z`
+- 通过 `build.rs` 写入 `cargo:rustc-env=PODUP_BUILD_VERSION=...` 与 `cargo:rustc-env=PODUP_BUILD_TAG=...`，供主程序通过 `option_env!` 读取；
+- 约束：必须保证“先算版本 → 再编译二进制 → 再创建/发布 tag”，避免出现 Release tag 与二进制内嵌版本不一致。
+
 ### 新 HTTP API：`GET /api/version/check`
 
 路径与方法：
@@ -155,11 +169,11 @@ struct VersionComparison {
 ```json
 {
   "current": {
-    "package": "0.1.0",
-    "release_tag": "v0.1.0"
+    "package": "0.1.43",
+    "release_tag": "v0.1.43"
   },
   "latest": {
-    "release_tag": "v0.2.0",
+    "release_tag": "v0.1.44",
     "published_at": "2025-02-01T11:22:33Z"
   },
   "has_update": true,
@@ -170,8 +184,8 @@ struct VersionComparison {
 
 字段说明：
 
-- `current.package`：当前运行的包版本；
-- `current.release_tag`：当前版本对应的 release tag（若可用）；
+- `current.package`：当前运行版本号（Release 构建时来自 `PODUP_BUILD_VERSION`，未注入时回退到 `CARGO_PKG_VERSION`）；
+- `current.release_tag`：当前运行版本对应的 release tag（Release 构建时来自 `PODUP_BUILD_TAG`，未注入时可由 `v{package}` 映射得到）；
 - `latest.release_tag`：GitHub 最新 release 的 tag；
 - `latest.published_at`：最新 release 的发布时间（可用于显示附加信息）；
 - `has_update`：
@@ -201,6 +215,9 @@ struct VersionComparison {
 - 本次改动：
   - 不修改脚本行为，仅在主程序中建立版本检查的“单一真相源”；
   - 将版本比较逻辑封装为可复用模块，为后续重构自更新链路做好准备。
+  - 明确区分：
+    - `PODUP_BUILD_TAG`：当前二进制的发布版本（构建期写入，仅用于展示/比较）；
+    - `PODUP_RELEASE_TAG`：updater 的目标版本（运行时传入，仅用于更新到指定 tag）。
 
 ## 前端设计
 
@@ -298,6 +315,7 @@ type VersionInfo = {
     - 标准 semver 场景（如 `0.1.0`, `0.2.0`）；
     - 带前导 `v` 的 tag（`v0.1.0` vs `0.1.0`）；
     - 无法解析的版本字符串，确认 `has_update = None`；
+  - 针对“当前版本读取”逻辑，覆盖 `PODUP_BUILD_VERSION/TAG` 的优先级与回退策略。
   - 针对 GitHub 响应解析函数，使用固定 JSON 样本验证 `tag_name` / `published_at` 的提取。
 - 集成测试：
   - 在测试环境中对 `/api/version/check` 进行调用：
@@ -331,4 +349,3 @@ type VersionInfo = {
 3. 在 UI 中补充“最近自更新结果”和“下一次检查时间”等辅助信息，将版本提示与 `tasks` 中的 self-update 任务更好地关联起来。
 
 这些步骤可以在当前版本检查接口稳定后，以独立 PR 的形式逐步落实。 
-

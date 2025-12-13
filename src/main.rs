@@ -266,10 +266,16 @@ fn is_admin_request(ctx: &RequestContext) -> bool {
 }
 
 fn current_version() -> CurrentVersion {
-    let package = env!("CARGO_PKG_VERSION").to_string();
-    // Placeholder strategy: derive release_tag from package. In future this can
-    // read an explicit PODUP_RELEASE_TAG to reflect the packaged release tag.
-    let release_tag = Some(format!("v{package}"));
+    let package = option_env!("PODUP_BUILD_VERSION")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+        .to_string();
+    let release_tag = option_env!("PODUP_BUILD_TAG")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| Some(format!("v{package}")));
     CurrentVersion {
         package,
         release_tag,
@@ -311,7 +317,7 @@ fn github_http_client() -> Result<&'static Client, String> {
         ACCEPT,
         HeaderValue::from_static("application/vnd.github+json"),
     );
-    let ua = format!("{LOG_TAG}/{}", env!("CARGO_PKG_VERSION"));
+    let ua = format!("{LOG_TAG}/{}", current_version().package);
     let ua_val = HeaderValue::from_str(&ua).map_err(|e| e.to_string())?;
     headers.insert(USER_AGENT, ua_val);
 
@@ -1874,6 +1880,7 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
     let forward_mode = if cfg.open_mode() { "open" } else { "protected" };
 
     let build_timestamp = option_env!("PODUP_BUILD_TIMESTAMP").map(|s| s.to_string());
+    let current = current_version();
 
     let db_stats = db_path
         .as_ref()
@@ -1935,7 +1942,8 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
             "web_dist": web_dist_stats,
         },
         "version": {
-            "package": env!("CARGO_PKG_VERSION"),
+            "package": current.package,
+            "release_tag": current.release_tag,
             "build_timestamp": build_timestamp,
         },
         "forward_auth": {
