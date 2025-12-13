@@ -17,6 +17,17 @@ import { isCommandMeta } from '../domain/tasks'
 import { AutoUpdateWarningsBlock } from '../components/AutoUpdateWarningsBlock'
 import { TaskLogMetaDetails } from '../components/TaskLogMetaDetails'
 
+type ManualServiceUpdate = {
+  status: 'tag_update_available' | 'latest_ahead' | 'up_to_date' | 'unknown'
+  tag?: string
+  running_digest?: string
+  remote_tag_digest?: string
+  remote_latest_digest?: string
+  checked_at?: number
+  stale?: boolean
+  reason?: string
+}
+
 type ManualService = {
   slug: string
   unit: string
@@ -24,6 +35,7 @@ type ManualService = {
   default_image?: string | null
   github_path?: string
   is_auto_update?: boolean
+  update?: ManualServiceUpdate | null
 }
 
 type ManualServicesResponse = {
@@ -76,6 +88,7 @@ export default function ManualPage() {
   const [allDryRun, setAllDryRun] = useState(false)
   const [allCaller, setAllCaller] = useState('')
   const [allReason, setAllReason] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
   const navigate = useNavigate()
 
   const manualTokenMissing =
@@ -258,6 +271,28 @@ export default function ManualPage() {
     }
   }
 
+  const handleRefresh = async () => {
+    setRefreshing(true)
+    try {
+      const data = await getJson<ManualServicesResponse>('/api/manual/services?refresh=1')
+      if (Array.isArray(data.services)) {
+        setServices(data.services)
+      }
+    } catch (err) {
+      const message =
+        err && typeof err === 'object' && 'message' in err && err.message
+          ? String(err.message)
+          : '刷新失败'
+      pushToast({
+        variant: 'error',
+        title: '更新刷新失败',
+        message,
+      })
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       {manualTokenMissing && (
@@ -325,9 +360,20 @@ export default function ManualPage() {
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
               按单元触发
             </h2>
-            <span className="text-[11px] text-base-content/60">
-              来自 GET /api/manual/services
-            </span>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                className="btn btn-xs"
+                onClick={handleRefresh}
+                disabled={refreshing}
+              >
+                <Icon icon="mdi:refresh" className={refreshing ? 'animate-spin' : ''} />
+                刷新更新状态
+              </button>
+              <span className="hidden text-[11px] text-base-content/60 sm:inline">
+                来自 GET /api/manual/services
+              </span>
+            </div>
           </div>
           <div className="space-y-3">
             {services.length === 0 && (
@@ -399,6 +445,26 @@ type ServiceRowProps = {
   ) => void | Promise<void>
 }
 
+function UpdateBadge({ update }: { update: ManualServiceUpdate }) {
+  if (update.status === 'tag_update_available') {
+    return <span className="badge badge-warning badge-sm">同 tag 有更新</span>
+  }
+  if (update.status === 'latest_ahead') {
+    return <span className="badge badge-info badge-sm">latest 有变化</span>
+  }
+  if (update.status === 'up_to_date') {
+    return <span className="badge badge-success badge-sm">已是最新</span>
+  }
+
+  return (
+    <div className="tooltip" data-tip={update.reason || '未知原因'}>
+      <span className="badge badge-ghost badge-sm border-base-content/20 text-base-content/50">
+        未知
+      </span>
+    </div>
+  )
+}
+
 function ServiceRow({ service, onTrigger }: ServiceRowProps) {
   const [image, setImage] = useState(service.default_image ?? '')
   const [caller, setCaller] = useState('')
@@ -430,6 +496,7 @@ function ServiceRow({ service, onTrigger }: ServiceRowProps) {
         <div className="flex items-center gap-2">
           <span className="font-semibold">{service.display_name}</span>
           <span className="badge badge-ghost badge-xs">{service.unit}</span>
+          {service.update && <UpdateBadge update={service.update} />}
         </div>
         <div className="grid gap-2 md:grid-cols-3">
           <input
