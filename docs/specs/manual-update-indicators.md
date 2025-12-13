@@ -10,7 +10,7 @@
 但 UI 缺少“是否有可更新内容”的提示。主人希望在服务列表项上看到两种不同语义的更新标记：
 
 1. **tag 内有更新**：服务配置的 tag（例如 `:latest` 或 `:v1.2.3`）在 registry 上已经指向了新的镜像，但当前运行中的容器仍在使用旧镜像；此时点击“触发更新”（仍使用原 tag）应能更新到新镜像。
-2. **tag 外有更新**：服务配置的 tag 没有变化（或已跟上），但 `:latest` 指向的镜像与当前 tag 指向的镜像不同；此时仅提示“有跨通道更新”，但不要求在本次方案中提供“改 tag 升级”的能力。
+2. **tag 外有更新**：服务配置的 tag 没有变化（或已跟上），但 `:latest` 指向的镜像与当前 tag 指向的镜像不同；此时仅提示“有更高版本”，但不要求在本次方案中提供“改 tag 升级”的能力。
 
 本设计只做“提示与判断”，不引入“固定 digest”或“切换版本”。
 
@@ -18,7 +18,7 @@
 
 1. 在 Manual 的服务列表项上展示更新状态标记，并区分：
    - `tag_update_available`（tag 内有更新，可直接触发更新解决；UI 文案：**有新版本**）
-   - `latest_ahead`（tag 外有更新，仅提示；UI 文案：**有跨通道更新**）
+   - `latest_ahead`（tag 外有更新，仅提示；UI 文案：**有更高版本**）
    - `up_to_date`（无更新）
    - `unknown`（无法判定）
 2. 后端提供可靠的判定数据：基于“当前运行容器的镜像 digest”与“registry 上某 tag 的 manifest digest”对比。
@@ -57,7 +57,7 @@
    - UI 调用 `GET /api/manual/services` 获取服务列表与 `update` 信息。
    - 列表项显示：
      - `tag_update_available`：显著提示“有新版本”，并暗示可直接触发更新。
-     - `latest_ahead`：提示“有跨通道更新”（即 `latest` 通道与当前 tag 通道不同）。
+     - `latest_ahead`：提示“有更高版本”（即 `latest` 通道与当前 tag 通道不同）。
      - `up_to_date`：提示“已是最新（对当前 tag）”。
      - `unknown`：提示“未知（缺少权限/容器未运行/查询失败）”。
 2. 主人点击“刷新状态”（可选）：
@@ -184,8 +184,8 @@
 
 在每个服务行（ServiceRow）新增一个小型 badge 区域：
 
-- `tag_update_available`：例如 “Update available (tag)” / “有新版本”
-- `latest_ahead`：例如 “Latest differs” / “有跨通道更新”
+- `tag_update_available`：例如 “Update available (tag)” / “有新版本”，并显示当前服务的 tag（例如 `stable` / `v1.2.3`）。
+- `latest_ahead`：例如 “Latest differs” / “有更高版本”，并显示目标 tag（`latest`）。
 - `up_to_date`：例如 “Up to date”
 - `unknown`：例如 “Unknown”
 

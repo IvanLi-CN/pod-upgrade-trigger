@@ -17,37 +17,41 @@ export const TagUpdateAvailable: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    expect(await canvas.findByText('同 tag 有更新')).toBeInTheDocument()
+    expect(await canvas.findByText('有新版本')).toBeInTheDocument()
+    expect(await canvas.findByText('v1.2.3')).toBeInTheDocument()
   },
 }
 
 export const LatestAhead: Story = {
   args: {
-    update: { status: 'latest_ahead' },
+    update: { status: 'latest_ahead', tag: 'v1.2.3' },
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    expect(await canvas.findByText('latest 有变化')).toBeInTheDocument()
+    expect(await canvas.findByText('有更高版本')).toBeInTheDocument()
+    expect(await canvas.findByText('latest')).toBeInTheDocument()
   },
 }
 
 export const UpToDate: Story = {
   args: {
-    update: { status: 'up_to_date' },
+    update: { status: 'up_to_date', tag: 'v1.2.3' },
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     expect(await canvas.findByText('已是最新')).toBeInTheDocument()
+    expect(await canvas.findByText('v1.2.3')).toBeInTheDocument()
   },
 }
 
 export const Unknown: Story = {
   args: {
-    update: { status: 'unknown', reason: '服务未返回远端 digest 信息' },
+    update: { status: 'unknown', tag: 'v1.2.3', reason: '服务未返回远端 digest 信息' },
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     const badge = await canvas.findByText('未知')
+    expect(await canvas.findByText('v1.2.3')).toBeInTheDocument()
     const tooltip = badge.closest('.tooltip')
     expect(tooltip).not.toBeNull()
     expect(tooltip).toHaveAttribute(

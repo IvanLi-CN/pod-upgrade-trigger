@@ -14,8 +14,9 @@ test.describe('Manual triggers', () => {
     await expect(page.getByText('svc-alpha.service').first()).toBeVisible()
     await expect(page.getByText('svc-beta.service').first()).toBeVisible()
 
-    await expect(page.getByText('同 tag 有更新')).toBeVisible()
-    await expect(page.getByText('latest 有变化')).toBeVisible()
+    await expect(page.getByText('有新版本')).toBeVisible()
+    await expect(page.getByText('有更高版本')).toBeVisible()
+    await expect(page.getByText('latest')).toBeVisible()
 
     await page.getByLabel('Dry run').check()
 
