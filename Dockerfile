@@ -24,7 +24,8 @@ COPY src ./src
 RUN cargo fetch
 
 COPY . .
-ENV APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}
+ENV APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION} \
+    PODUP_BUILD_VERSION=${APP_EFFECTIVE_VERSION}
 RUN cargo build --release --locked
 
 # Stage 3: runtime image

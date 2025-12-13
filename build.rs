@@ -2,6 +2,23 @@ use std::env;
 use std::path::Path;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=PODUP_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=PODUP_BUILD_TAG");
+
+    if let Ok(version) = env::var("PODUP_BUILD_VERSION") {
+        let trimmed = version.trim();
+        if !trimmed.is_empty() {
+            println!("cargo:rustc-env=PODUP_BUILD_VERSION={trimmed}");
+        }
+    }
+
+    if let Ok(tag) = env::var("PODUP_BUILD_TAG") {
+        let trimmed = tag.trim();
+        if !trimmed.is_empty() {
+            println!("cargo:rustc-env=PODUP_BUILD_TAG={trimmed}");
+        }
+    }
+
     let profile = env::var("PROFILE").unwrap_or_default();
     if profile != "release" {
         return;
