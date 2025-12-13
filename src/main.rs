@@ -31,6 +31,8 @@ use subtle::ConstantTimeEq;
 use tokio::runtime::Runtime;
 use url::Url;
 
+mod registry_digest;
+
 const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
 const DEFAULT_WEB_DIST_DIR: &str = "web/dist";
@@ -11876,7 +11878,7 @@ mod tests {
         );
         // Ensure that our synthetic JSONL file is considered recent enough for
         // ingestion regardless of test runtime/environment clock skew.
-        set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+        set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "31536000");
 
         let unit = "podman-auto-update.service";
         let task_id = create_manual_auto_update_task(unit, "req-auto-update-test", "/auto-update")
