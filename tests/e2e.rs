@@ -28,6 +28,10 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_task_prune_retention().await?;
     scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
+    scenario_manual_services_update_tag_update_available().await?;
+    scenario_manual_services_update_latest_ahead().await?;
+    scenario_manual_services_update_up_to_date_tag_latest().await?;
+    scenario_manual_services_update_unknown_container_not_found().await?;
     scenario_manual_auto_update_failure().await?;
     scenario_manual_task_command_meta_and_unit_errors().await?;
     scenario_manual_task_unit_failure_diagnostics().await?;
@@ -753,6 +757,7 @@ async fn scenario_manual_api() -> AnyResult<()> {
             !line.contains("podman auto-update --dry-run")
                 && !line.contains("podman ps --filter label=io.containers.autoupdate")
                 && !line.contains("podman ps -a --filter label=io.containers.autoupdate")
+                && !line.contains("podman ps -a --format json")
         })
         .collect();
     assert!(non_discovery.is_empty());
@@ -804,6 +809,236 @@ async fn scenario_manual_api() -> AnyResult<()> {
     assert!(events.iter().any(|row| row.action == "manual-trigger"));
     assert!(events.iter().any(|row| row.action == "manual-service"));
 
+    Ok(())
+}
+
+async fn scenario_manual_services_update_tag_update_available() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-alpha.container"),
+        b"[Container]\nImage=ghcr.io/koha/svc-alpha:stable\nAutoupdate=registry\n",
+    )?;
+
+    let ps_json = json!([
+        {
+            "Id": "cid-alpha-1",
+            "ImageID": "img-alpha-1",
+            "Created": 1000,
+            "State": "running",
+            "Labels": {
+                "io.podman.systemd.unit": "svc-alpha.service",
+                "io.containers.autoupdate": "registry"
+            }
+        }
+    ]);
+    let inspect_json = json!([
+        { "Id": "img-alpha-1", "RepoDigests": [ "ghcr.io/koha/svc-alpha@sha256:aaaaaaaa" ] }
+    ]);
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:stable": "sha256:bbbbbbbb",
+        "ghcr.io/koha/svc-alpha:latest": "sha256:bbbbbbbb"
+    });
+
+    let resp = env.send_request_with_env(HttpRequest::get("/api/manual/services"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+        cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+        cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+    })?;
+    assert_eq!(resp.status, 200);
+    let body = resp.json_body()?;
+    let services = body["services"].as_array().unwrap();
+    let svc = services
+        .iter()
+        .find(|s| s["unit"] == Value::from("svc-alpha.service"))
+        .expect("svc-alpha exists");
+    assert_eq!(svc["update"]["status"], Value::from("tag_update_available"));
+    assert_eq!(svc["update"]["tag"], Value::from("stable"));
+
+    let log = env.read_mock_log()?;
+    let ps_calls = log
+        .iter()
+        .filter(|line| line.starts_with("podman ps -a --format json"))
+        .count();
+    assert_eq!(ps_calls, 1, "expected one podman ps call");
+
+    env.clear_mock_log()?;
+    let registry_mock_refresh = json!({
+        "ghcr.io/koha/svc-alpha:stable": "sha256:cccccccc",
+        "ghcr.io/koha/svc-alpha:latest": "sha256:cccccccc"
+    });
+    let _ =
+        env.send_request_with_env(HttpRequest::get("/api/manual/services?refresh=1"), |cmd| {
+            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+            cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+            cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+            cmd.env(
+                "PODUP_REGISTRY_DIGEST_MOCK",
+                registry_mock_refresh.to_string(),
+            );
+        })?;
+    let log_refresh = env.read_mock_log()?;
+    let refresh_calls = log_refresh
+        .iter()
+        .filter(|line| line.contains("podman ps -a --format json"))
+        .count();
+    assert_eq!(
+        refresh_calls, 1,
+        "refresh=1 should still result in one podman ps call"
+    );
+
+    let pool = env.connect_db().await?;
+    let row = sqlx::query("SELECT digest FROM registry_digest_cache WHERE image = ?")
+        .bind("ghcr.io/koha/svc-alpha:stable")
+        .fetch_optional(&pool)
+        .await?;
+    let digest = row
+        .as_ref()
+        .and_then(|r| r.try_get::<String, _>("digest").ok())
+        .unwrap_or_default();
+    assert_eq!(
+        digest, "sha256:cccccccc",
+        "refresh=1 should force a digest refresh"
+    );
+    Ok(())
+}
+
+async fn scenario_manual_services_update_latest_ahead() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-alpha.container"),
+        b"[Container]\nImage=ghcr.io/koha/svc-alpha:stable\nAutoupdate=registry\n",
+    )?;
+
+    let ps_json = json!([
+        {
+            "Id": "cid-alpha-1",
+            "ImageID": "img-alpha-1",
+            "Created": 1000,
+            "State": "running",
+            "Labels": {
+                "io.podman.systemd.unit": "svc-alpha.service",
+                "io.containers.autoupdate": "registry"
+            }
+        }
+    ]);
+    let inspect_json = json!([
+        { "Id": "img-alpha-1", "RepoDigests": [ "ghcr.io/koha/svc-alpha@sha256:cccccccc" ] }
+    ]);
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:stable": "sha256:cccccccc",
+        "ghcr.io/koha/svc-alpha:latest": "sha256:dddddddd"
+    });
+
+    let resp = env.send_request_with_env(HttpRequest::get("/api/manual/services"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+        cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+        cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+    })?;
+    assert_eq!(resp.status, 200);
+    let body = resp.json_body()?;
+    let services = body["services"].as_array().unwrap();
+    let svc = services
+        .iter()
+        .find(|s| s["unit"] == Value::from("svc-alpha.service"))
+        .expect("svc-alpha exists");
+    assert_eq!(svc["update"]["status"], Value::from("latest_ahead"));
+    assert_eq!(svc["update"]["tag"], Value::from("stable"));
+    Ok(())
+}
+
+async fn scenario_manual_services_update_up_to_date_tag_latest() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-alpha.container"),
+        b"[Container]\nImage=ghcr.io/koha/svc-alpha:latest\nAutoupdate=registry\n",
+    )?;
+
+    let ps_json = json!([
+        {
+            "Id": "cid-alpha-1",
+            "ImageID": "img-alpha-1",
+            "Created": 1000,
+            "State": "running",
+            "Labels": {
+                "io.podman.systemd.unit": "svc-alpha.service",
+                "io.containers.autoupdate": "registry"
+            }
+        }
+    ]);
+    let inspect_json = json!([
+        { "Id": "img-alpha-1", "RepoDigests": [ "ghcr.io/koha/svc-alpha@sha256:eeeeeeee" ] }
+    ]);
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:latest": "sha256:eeeeeeee"
+    });
+
+    let resp = env.send_request_with_env(HttpRequest::get("/api/manual/services"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+        cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+        cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+    })?;
+    assert_eq!(resp.status, 200);
+    let body = resp.json_body()?;
+    let services = body["services"].as_array().unwrap();
+    let svc = services
+        .iter()
+        .find(|s| s["unit"] == Value::from("svc-alpha.service"))
+        .expect("svc-alpha exists");
+    assert_eq!(svc["update"]["status"], Value::from("up_to_date"));
+    assert_eq!(svc["update"]["tag"], Value::from("latest"));
+    Ok(())
+}
+
+async fn scenario_manual_services_update_unknown_container_not_found() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-alpha.container"),
+        b"[Container]\nImage=ghcr.io/koha/svc-alpha:stable\nAutoupdate=registry\n",
+    )?;
+
+    let ps_json = json!([]);
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:stable": "sha256:bbbbbbbb",
+        "ghcr.io/koha/svc-alpha:latest": "sha256:bbbbbbbb"
+    });
+
+    let resp = env.send_request_with_env(HttpRequest::get("/api/manual/services"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+        cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+    })?;
+    assert_eq!(resp.status, 200);
+    let body = resp.json_body()?;
+    let services = body["services"].as_array().unwrap();
+    let svc = services
+        .iter()
+        .find(|s| s["unit"] == Value::from("svc-alpha.service"))
+        .expect("svc-alpha exists");
+    assert_eq!(svc["update"]["status"], Value::from("unknown"));
+    assert_eq!(svc["update"]["reason"], Value::from("container-not-found"));
     Ok(())
 }
 
@@ -1901,6 +2136,7 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
             !line.contains("podman auto-update --dry-run")
                 && !line.contains("podman ps --filter label=io.containers.autoupdate")
                 && !line.contains("podman ps -a --filter label=io.containers.autoupdate")
+                && !line.contains("podman ps -a --format json")
         })
         .collect();
     assert!(non_discovery.is_empty());

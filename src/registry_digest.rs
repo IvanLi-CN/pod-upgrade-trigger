@@ -16,6 +16,7 @@ const DOCKER_CONTENT_DIGEST_HEADER: &str = "docker-content-digest";
 
 pub(crate) const ENV_REGISTRY_DIGEST_CACHE_TTL_SECS: &str = "PODUP_REGISTRY_DIGEST_CACHE_TTL_SECS";
 pub(crate) const DEFAULT_REGISTRY_DIGEST_CACHE_TTL_SECS: u64 = 600;
+const ENV_REGISTRY_DIGEST_MOCK: &str = "PODUP_REGISTRY_DIGEST_MOCK";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RegistryDigestStatus {
@@ -193,7 +194,10 @@ pub(crate) async fn resolve_remote_manifest_digest(
             )
             .await;
             match record {
-                Ok(record) => RegistryDigestRecord { from_cache: false, ..record },
+                Ok(record) => RegistryDigestRecord {
+                    from_cache: false,
+                    ..record
+                },
                 Err(_) => RegistryDigestRecord {
                     image: parsed.normalized_image.clone(),
                     digest: Some(digest),
@@ -229,7 +233,51 @@ pub(crate) async fn resolve_remote_manifest_digest(
     }
 }
 
-async fn refresh_remote_manifest_digest(image: &ParsedImageRef) -> Result<String, RegistryDigestError> {
+async fn refresh_remote_manifest_digest(
+    image: &ParsedImageRef,
+) -> Result<String, RegistryDigestError> {
+    if env::var("PODUP_ENV")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+        .is_some_and(|v| v == "test" || v == "testing")
+    {
+        if let Ok(raw) = env::var(ENV_REGISTRY_DIGEST_MOCK) {
+            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                if let Some(obj) = value.as_object() {
+                    if let Some(entry) = obj.get(&image.normalized_image) {
+                        if let Some(digest) = entry.as_str() {
+                            let trimmed = digest.trim();
+                            if trimmed.starts_with("sha256:") {
+                                return Ok(trimmed.to_string());
+                            }
+                            return Err(RegistryDigestError::DigestMissing);
+                        }
+                        if entry.is_null() {
+                            return Err(RegistryDigestError::DigestMissing);
+                        }
+                        if let Some(err_obj) = entry.as_object() {
+                            if let Some(code) = err_obj.get("error").and_then(|v| v.as_str()) {
+                                return Err(match code.trim() {
+                                    "timeout" => RegistryDigestError::Timeout,
+                                    "unauthorized" => RegistryDigestError::Unauthorized,
+                                    "auth-missing" => RegistryDigestError::AuthMissing,
+                                    "auth-parse" => RegistryDigestError::AuthParse,
+                                    "challenge-parse" => RegistryDigestError::ChallengeParse,
+                                    "bad-response" => RegistryDigestError::BadResponse,
+                                    "digest-missing" => RegistryDigestError::DigestMissing,
+                                    "io-error" => RegistryDigestError::Io,
+                                    "json-error" => RegistryDigestError::Json,
+                                    _ => RegistryDigestError::BadResponse,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let client = registry_http_client().map_err(|_| RegistryDigestError::BadResponse)?;
     let manifest_url = format!(
         "{}://{}/v2/{}/manifests/{}",
@@ -380,7 +428,9 @@ fn parse_auth_params(input: &str) -> HashMap<String, String> {
         if part.is_empty() {
             continue;
         }
-        let Some((k, v)) = part.split_once('=') else { continue };
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         let key = k.trim().to_ascii_lowercase();
         let mut value = v.trim().to_string();
         if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
@@ -418,7 +468,10 @@ async fn fetch_bearer_token(
         return Err(map_status_to_error(response.status()));
     }
 
-    let body: Value = response.json().await.map_err(|_| RegistryDigestError::Json)?;
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_| RegistryDigestError::Json)?;
     let token = body
         .get("token")
         .and_then(|v| v.as_str())
@@ -430,9 +483,12 @@ async fn fetch_bearer_token(
     Ok(token.to_string())
 }
 
-fn load_basic_credentials_for_registry(registry: &str) -> Result<BasicCredentials, RegistryDigestError> {
+fn load_basic_credentials_for_registry(
+    registry: &str,
+) -> Result<BasicCredentials, RegistryDigestError> {
     let auths = load_containers_auth_json().map_err(|e| e)?;
-    let registry_norm = normalize_registry_host(registry).ok_or(RegistryDigestError::AuthMissing)?;
+    let registry_norm =
+        normalize_registry_host(registry).ok_or(RegistryDigestError::AuthMissing)?;
     auths
         .get(&registry_norm)
         .cloned()
@@ -460,8 +516,12 @@ fn load_containers_auth_json() -> Result<HashMap<String, BasicCredentials>, Regi
     };
 
     for (key, entry) in auths.iter() {
-        let Some(registry) = normalize_registry_host(key) else { continue };
-        let Some(obj) = entry.as_object() else { continue };
+        let Some(registry) = normalize_registry_host(key) else {
+            continue;
+        };
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
 
         if let Some(auth) = obj.get("auth").and_then(|v| v.as_str()).map(|s| s.trim()) {
             if let Ok(decoded) = BASE64_STANDARD.decode(auth.as_bytes()) {
@@ -528,7 +588,13 @@ fn normalize_registry_host(input: &str) -> Option<String> {
         return Some(host_port.to_ascii_lowercase());
     }
 
-    Some(trimmed.split('/').next().unwrap_or(trimmed).to_ascii_lowercase())
+    Some(
+        trimmed
+            .split('/')
+            .next()
+            .unwrap_or(trimmed)
+            .to_ascii_lowercase(),
+    )
 }
 
 fn parse_image_ref(input: &str) -> Result<ParsedImageRef, RegistryDigestError> {
@@ -561,8 +627,11 @@ fn parse_image_ref(input: &str) -> Result<ParsedImageRef, RegistryDigestError> {
         });
     }
 
-    let (registry_raw, rest) = raw.split_once('/').ok_or(RegistryDigestError::InvalidImage)?;
-    let registry = normalize_registry_host(registry_raw).ok_or(RegistryDigestError::InvalidImage)?;
+    let (registry_raw, rest) = raw
+        .split_once('/')
+        .ok_or(RegistryDigestError::InvalidImage)?;
+    let registry =
+        normalize_registry_host(registry_raw).ok_or(RegistryDigestError::InvalidImage)?;
     let (repo, tag) = split_repo_tag(rest)?;
     let normalized_image = format!("{registry}/{repo}:{tag}");
     Ok(ParsedImageRef {
@@ -581,9 +650,7 @@ fn split_repo_tag(path: &str) -> Result<(String, String), RegistryDigestError> {
     }
 
     let last_slash = trimmed.rfind('/').unwrap_or(0);
-    let tag_sep = trimmed[last_slash..]
-        .rfind(':')
-        .map(|idx| idx + last_slash);
+    let tag_sep = trimmed[last_slash..].rfind(':').map(|idx| idx + last_slash);
     let Some(tag_sep) = tag_sep else {
         return Err(RegistryDigestError::InvalidImage);
     };
@@ -787,17 +854,11 @@ mod tests {
                     match step.expect_auth {
                         AuthExpectation::None => {}
                         AuthExpectation::Basic(expected) => {
-                            let got = headers
-                                .get("authorization")
-                                .cloned()
-                                .unwrap_or_default();
+                            let got = headers.get("authorization").cloned().unwrap_or_default();
                             assert_eq!(got, format!("Basic {expected}"));
                         }
                         AuthExpectation::Bearer(expected) => {
-                            let got = headers
-                                .get("authorization")
-                                .cloned()
-                                .unwrap_or_default();
+                            let got = headers.get("authorization").cloned().unwrap_or_default();
                             assert_eq!(got, format!("Bearer {expected}"));
                         }
                     }
@@ -866,7 +927,12 @@ mod tests {
         String::from_utf8_lossy(&buf).to_string()
     }
 
-    fn respond(stream: &mut TcpStream, status: u16, headers: &[(&str, String)], body: Option<&str>) {
+    fn respond(
+        stream: &mut TcpStream,
+        status: u16,
+        headers: &[(&str, String)],
+        body: Option<&str>,
+    ) {
         let body = body.unwrap_or("");
         let mut resp = String::new();
         resp.push_str(&format!("HTTP/1.1 {status} OK\r\n"));
@@ -1150,13 +1216,12 @@ mod tests {
         assert_eq!(record.error.as_deref(), Some("digest-missing"));
         assert_eq!(server.hits(), 2);
 
-        let db_error: Option<String> = sqlx::query_scalar(
-            "SELECT error FROM registry_digest_cache WHERE image = ?",
-        )
-        .bind(&parsed.normalized_image)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let db_error: Option<String> =
+            sqlx::query_scalar("SELECT error FROM registry_digest_cache WHERE image = ?")
+                .bind(&parsed.normalized_image)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         let db_error = db_error.unwrap_or_default();
         for forbidden in ["Authorization", "koha", "secret", "t123"] {
             assert!(
