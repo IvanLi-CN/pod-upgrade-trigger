@@ -9,7 +9,6 @@ import {
   useState,
 } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { useToken } from './useToken'
 import { useToast } from '../components/Toast'
 
 type StreamStatus = 'idle' | 'connecting' | 'open' | 'error'
@@ -56,7 +55,6 @@ function isMockEnabled(): boolean {
 type ApiContextValue = {
   status: AppStatus
   mockEnabled: boolean
-  manualTokenConfigured: boolean
   getJson: <T>(input: RequestInfo | URL, init?: RequestInit) => Promise<T>
   postJson: <T>(
     input: RequestInfo | URL,
@@ -75,11 +73,10 @@ export function ApiProvider({ children }: PropsWithChildren) {
     lastIteration: null,
   })
   const [now, setNow] = useState<Date>(new Date())
-  const [manualTokenConfigured, setManualTokenConfigured] = useState(false)
+
   const navigate = useNavigate()
   const location = useLocation()
   const { pushToast } = useToast()
-  const { token } = useToken()
   const originalPathRef = useRef<string | null>(null)
   const mockEnabled = isMockEnabled()
 
@@ -126,9 +123,6 @@ export function ApiProvider({ children }: PropsWithChildren) {
       }
       type SettingsSnapshot = {
         scheduler?: SchedulerSnapshot
-        env?: {
-          PODUP_MANUAL_TOKEN_configured?: boolean
-        }
       }
 
       try {
@@ -153,13 +147,7 @@ export function ApiProvider({ children }: PropsWithChildren) {
           }
         }
 
-        const manualConfigured =
-          data.env && typeof data.env.PODUP_MANUAL_TOKEN_configured === 'boolean'
-            ? data.env.PODUP_MANUAL_TOKEN_configured
-            : false
-
         setScheduler({ intervalSecs, lastIteration })
-        setManualTokenConfigured(manualConfigured)
       } catch {
         // ignore
       }
@@ -184,7 +172,7 @@ export function ApiProvider({ children }: PropsWithChildren) {
     // In mock mode, rely on a one-shot fetch to /sse/hello so degraded profile
     // still surfaces as error even if real EventSource is not available.
     if (mockEnabled) {
-      ;(async () => {
+      ; (async () => {
         try {
           const res = await fetch('/sse/hello')
           if (cancelled) return
@@ -256,51 +244,19 @@ export function ApiProvider({ children }: PropsWithChildren) {
     async <T,>(input: RequestInfo | URL, body: unknown, init?: RequestInit): Promise<T> => {
       const headers: HeadersInit = {
         'Content-Type': 'application/json',
-        Accept: 'application/json',
+        'Accept': 'application/json',
+        'X-Podup-CSRF': '1',
         ...(init?.headers ?? {}),
       }
-
-      let payload: unknown
-      if (body && typeof body === 'object' && body !== null) {
-        const record = body as Record<string, unknown>
-        const hasToken = Object.hasOwn(record, 'token')
-        payload = hasToken ? body : { ...record, token }
-      } else {
-        payload = { token }
-      }
-
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-          ? input.toString()
-          : // Fallback for Request objects or other types
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            ((input as any).url as string | undefined) ?? String(input)
 
       const res = await fetch(input, {
         ...init,
         method: 'POST',
         headers,
-        body: JSON.stringify(payload),
+        body: JSON.stringify(body),
       })
 
       if (res.status === 401) {
-        const isManualApi = url.startsWith('/api/manual/')
-
-        if (isManualApi && manualTokenConfigured) {
-          pushToast({
-            variant: 'error',
-            title: 'Manual token 校验失败',
-            message:
-              'Manual API 返回 401：Manual token 缺失或错误。请检查右上角的 Manual token 输入框，并确认后端已配置 PODUP_MANUAL_TOKEN/PODUP_TOKEN。',
-          })
-          throw {
-            status: 401,
-            message: 'manual-token-invalid',
-          } satisfies ApiError
-        }
-
         handle401()
         throw {
           status: 401,
@@ -318,18 +274,17 @@ export function ApiProvider({ children }: PropsWithChildren) {
 
       return (await res.json()) as T
     },
-    [token, manualTokenConfigured, handle401, pushToast],
+    [handle401],
   )
 
   const value: ApiContextValue = useMemo(
     () => ({
       status: { health, sseStatus, scheduler, now },
       mockEnabled,
-      manualTokenConfigured,
       getJson,
       postJson,
     }),
-    [getJson, health, mockEnabled, now, scheduler, sseStatus, postJson, manualTokenConfigured],
+    [getJson, health, mockEnabled, now, scheduler, sseStatus, postJson],
   )
 
   return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>

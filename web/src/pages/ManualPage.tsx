@@ -3,7 +3,6 @@ import type { FormEvent } from 'react'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
-import { useToken } from '../hooks/useToken'
 import { useToast } from '../components/Toast'
 import type {
   Task,
@@ -61,8 +60,7 @@ type ManualHistoryEntry = {
 }
 
 export default function ManualPage() {
-  const { getJson, postJson, manualTokenConfigured } = useApi()
-  const { token } = useToken()
+  const { getJson, postJson } = useApi()
   const { pushToast } = useToast()
   const [services, setServices] = useState<ManualService[]>([])
   const [history, setHistory] = useState<ManualHistoryEntry[]>([])
@@ -74,21 +72,19 @@ export default function ManualPage() {
   const [refreshing, setRefreshing] = useState(false)
   const navigate = useNavigate()
 
-  const manualTokenMissing =
-    manualTokenConfigured && (!token || token.trim().length === 0)
 
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
-      try {
-        const data = await getJson<ManualServicesResponse>('/api/manual/services')
-        if (!cancelled && Array.isArray(data.services)) {
-          setServices(data.services)
+      ; (async () => {
+        try {
+          const data = await getJson<ManualServicesResponse>('/api/manual/services')
+          if (!cancelled && Array.isArray(data.services)) {
+            setServices(data.services)
+          }
+        } catch (err) {
+          console.error('Failed to load services', err)
         }
-      } catch (err) {
-        console.error('Failed to load services', err)
-      }
-    })()
+      })()
     return () => {
       cancelled = true
     }
@@ -98,9 +94,9 @@ export default function ManualPage() {
     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`
     const requestId =
       response &&
-      typeof response === 'object' &&
-      'request_id' in response &&
-      typeof (response as { request_id: unknown }).request_id === 'string'
+        typeof response === 'object' &&
+        'request_id' in response &&
+        typeof (response as { request_id: unknown }).request_id === 'string'
         ? (response as { request_id: string }).request_id
         : undefined
     const entry: ManualHistoryEntry = {
@@ -278,17 +274,7 @@ export default function ManualPage() {
 
   return (
     <div className="space-y-6">
-      {manualTokenMissing && (
-        <section className="alert alert-warning shadow-sm text-xs leading-relaxed">
-          <div>
-            <span className="font-semibold">Manual token 未配置</span>
-          </div>
-          <div>
-            当前环境已配置 Manual token。使用手动触发和 auto-update 之前，请先在右上角输入正确的{' '}
-            <span className="font-mono">Manual token</span>，否则 Manual API 请求会被拒绝（HTTP 401）。
-          </div>
-        </section>
-      )}
+
       <section className="card bg-base-100 shadow">
         <form className="card-body gap-4" onSubmit={handleTriggerAll}>
           <div className="flex items-center justify-between gap-4">
@@ -823,7 +809,7 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                         <td>
                           <div className="flex items-center gap-1">
                             <span
-                          className={`badge badge-xs ${statusBadgeClass(task.status)}`}
+                              className={`badge badge-xs ${statusBadgeClass(task.status)}`}
                             >
                               {renderTaskStatusLabel(task.status)}
                             </span>
@@ -1022,10 +1008,10 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                       const timelineLogs =
                         autoUpdateSummary && autoUpdateDetails.length > 0
                           ? logs.filter(
-                              (log) =>
-                                log.action !== 'auto-update-warnings' &&
-                                log.action !== 'auto-update-warning',
-                            )
+                            (log) =>
+                              log.action !== 'auto-update-warnings' &&
+                              log.action !== 'auto-update-warning',
+                          )
                           : logs
 
                       return (
@@ -1056,25 +1042,25 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                               const combinedLines =
                                 commandMeta && (commandMeta.stdout || commandMeta.stderr)
                                   ? [
-                                      ...(commandMeta.stdout
-                                        ? commandMeta.stdout.split('\n').map((text) => ({
-                                            stream: 'stdout' as const,
-                                            text,
-                                          }))
-                                        : []),
-                                      ...(commandMeta.stderr
-                                        ? commandMeta.stderr.split('\n').map((text) => ({
-                                            stream: 'stderr' as const,
-                                            text,
-                                          }))
-                                        : []),
-                                    ].filter((entry) => entry.text.length > 0)
+                                    ...(commandMeta.stdout
+                                      ? commandMeta.stdout.split('\n').map((text) => ({
+                                        stream: 'stdout' as const,
+                                        text,
+                                      }))
+                                      : []),
+                                    ...(commandMeta.stderr
+                                      ? commandMeta.stderr.split('\n').map((text) => ({
+                                        stream: 'stderr' as const,
+                                        text,
+                                      }))
+                                      : []),
+                                  ].filter((entry) => entry.text.length > 0)
                                   : []
 
                               const dispatchMeta =
                                 isTaskDispatchFailed &&
-                                log.meta &&
-                                typeof log.meta === 'object'
+                                  log.meta &&
+                                  typeof log.meta === 'object'
                                   ? (log.meta as { [key: string]: unknown })
                                   : null
                               const dispatchSource =
@@ -1093,12 +1079,12 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                               const cardVariantClass = isTaskDispatchFailed
                                 ? 'border-error/70 bg-error/5'
                                 : isImagePrune
-                                ? log.level === 'warning'
-                                  ? 'border-warning/70 bg-warning/5'
-                                  : 'border-info/60 bg-info/5'
-                                : isAutoUpdateRunUnknown
-                                ? 'border-warning/70 bg-warning/5'
-                                : ''
+                                  ? log.level === 'warning'
+                                    ? 'border-warning/70 bg-warning/5'
+                                    : 'border-info/60 bg-info/5'
+                                  : isAutoUpdateRunUnknown
+                                    ? 'border-warning/70 bg-warning/5'
+                                    : ''
 
                               return (
                                 <div
@@ -1256,31 +1242,30 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                                                     （无输出）
                                                   </span>
                                                 ) : (
-                                                <div className="space-y-0.5">
-                                                  {combinedLines.map((entry, index) => (
-                                                    <div
-                                                      key={`${log.id}-${entry.stream}-${index}`}
-                                                      className="flex items-baseline gap-2"
-                                                    >
-                                                      <span
-                                                        className={`badge badge-xs ${
-                                                          entry.stream === 'stderr'
-                                                            ? 'badge-error'
-                                                            : 'badge-neutral'
-                                                        }`}
+                                                  <div className="space-y-0.5">
+                                                    {combinedLines.map((entry, index) => (
+                                                      <div
+                                                        key={`${log.id}-${entry.stream}-${index}`}
+                                                        className="flex items-baseline gap-2"
                                                       >
-                                                        {entry.stream === 'stderr'
-                                                          ? 'ERR'
-                                                          : 'OUT'}
-                                                      </span>
-                                                      <span className="text-[10px] text-base-content/60 tabular-nums">
-                                                        {formatTimeWithMs(log.ts)}
-                                                      </span>
-                                                      <span className="flex-1 whitespace-pre-wrap break-words">
-                                                        {entry.text}
-                                                      </span>
-                                                    </div>
-                                                  ))}
+                                                        <span
+                                                          className={`badge badge-xs ${entry.stream === 'stderr'
+                                                              ? 'badge-error'
+                                                              : 'badge-neutral'
+                                                            }`}
+                                                        >
+                                                          {entry.stream === 'stderr'
+                                                            ? 'ERR'
+                                                            : 'OUT'}
+                                                        </span>
+                                                        <span className="text-[10px] text-base-content/60 tabular-nums">
+                                                          {formatTimeWithMs(log.ts)}
+                                                        </span>
+                                                        <span className="flex-1 whitespace-pre-wrap break-words">
+                                                          {entry.text}
+                                                        </span>
+                                                      </div>
+                                                    ))}
                                                   </div>
                                                 )}
                                               </div>

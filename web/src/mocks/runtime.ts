@@ -14,7 +14,7 @@ export type MockProfile =
   | 'empty-state'
   | 'rate-limit-hot'
   | 'auth-error'
-  | 'manual-token'
+  | 'auth-error'
   | 'degraded'
 
 export type MockEvent = {
@@ -83,7 +83,6 @@ export type SettingsSnapshot = {
   env: {
     PODUP_STATE_DIR?: string
     PODUP_TOKEN_configured?: boolean
-    PODUP_MANUAL_TOKEN_configured?: boolean
     PODUP_GH_WEBHOOK_SECRET_configured?: boolean
   }
   scheduler: {
@@ -371,13 +370,12 @@ function buildLocks(now: number, profile: MockProfile): LockEntry[] {
 }
 
 function buildSettings(now: number, profile: MockProfile): SettingsSnapshot {
-  const manualTokenConfigured = profile === 'manual-token'
+
 
   return {
     env: {
       PODUP_STATE_DIR: '/var/lib/podup',
       PODUP_TOKEN_configured: true,
-      PODUP_MANUAL_TOKEN_configured: manualTokenConfigured,
       PODUP_GH_WEBHOOK_SECRET_configured: profile !== 'auth-error',
     },
     scheduler: {
@@ -1456,13 +1454,13 @@ class RuntimeStore {
     this.#data.taskLogs[taskId] = current.map((log) =>
       log.id === logId
         ? {
-            ...log,
-            ...patch,
-            meta: {
-              ...(log.meta && typeof log.meta === 'object' ? (log.meta as object) : {}),
-              ...(patch.meta && typeof patch.meta === 'object' ? (patch.meta as object) : {}),
-            },
-          }
+          ...log,
+          ...patch,
+          meta: {
+            ...(log.meta && typeof log.meta === 'object' ? (log.meta as object) : {}),
+            ...(patch.meta && typeof patch.meta === 'object' ? (patch.meta as object) : {}),
+          },
+        }
         : log,
     )
     this.#notify()

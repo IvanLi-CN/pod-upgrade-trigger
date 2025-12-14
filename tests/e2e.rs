@@ -28,6 +28,8 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_task_prune_retention().await?;
     scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
+    scenario_csrf_guard().await?;
+    scenario_forwardauth_and_csrf_strict_mode().await?;
     scenario_manual_services_update_tag_update_available().await?;
     scenario_manual_services_update_latest_ahead().await?;
     scenario_manual_services_update_up_to_date_tag_latest().await?;
@@ -45,6 +47,93 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_static_assets().await?;
     scenario_cli_maintenance().await?;
     scenario_http_server().await?;
+    Ok(())
+}
+
+async fn scenario_csrf_guard() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    // Missing CSRF header should fail closed for side-effect admin endpoints.
+    let missing = env.send_request(
+        HttpRequest::post("/api/tasks")
+            .header("content-type", "application/json")
+            .body(b"{}".to_vec()),
+    )?;
+    assert_eq!(
+        missing.status,
+        403,
+        "POST /api/tasks without X-Podup-CSRF must be rejected: {}",
+        missing.body_text()
+    );
+
+    // With CSRF header, the request should proceed.
+    let ok = env.send_request(
+        HttpRequest::post("/api/tasks")
+            .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
+            .body(b"{}".to_vec()),
+    )?;
+    assert_eq!(
+        ok.status, 200,
+        "POST /api/tasks should succeed with CSRF header"
+    );
+    let body = ok.json_body()?;
+    let task_id = body["task_id"].as_str().unwrap_or_default();
+    assert!(!task_id.is_empty(), "tasks-create should return a task_id");
+
+    Ok(())
+}
+
+async fn scenario_forwardauth_and_csrf_strict_mode() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    // Configure ForwardAuth in strict mode (no dev-open).
+    let configure_strict = |cmd: &mut Command| {
+        cmd.env("PODUP_DEV_OPEN_ADMIN", "0");
+        cmd.env("PODUP_FWD_AUTH_HEADER", "x-test-admin");
+        cmd.env("PODUP_FWD_AUTH_ADMIN_VALUE", "yes");
+    };
+
+    // Admin-required GET should reject missing admin header with 401.
+    let no_admin =
+        env.send_request_with_env(HttpRequest::get("/api/manual/services"), configure_strict)?;
+    assert_eq!(no_admin.status, 401);
+
+    // With admin header it should succeed (no CSRF for GET).
+    let admin_ok = env.send_request_with_env(
+        HttpRequest::get("/api/manual/services").header("x-test-admin", "yes"),
+        configure_strict,
+    )?;
+    assert_eq!(admin_ok.status, 200);
+
+    // Admin + missing CSRF should be rejected for POST.
+    let trigger_body = json!({
+        "all": true,
+        "dry_run": true,
+        "caller": "ci",
+        "reason": "csrf-check"
+    });
+    let missing_csrf = env.send_request_with_env(
+        HttpRequest::post("/api/manual/trigger")
+            .header("x-test-admin", "yes")
+            .header("content-type", "application/json")
+            .body(trigger_body.to_string().into_bytes()),
+        configure_strict,
+    )?;
+    assert_eq!(missing_csrf.status, 403);
+
+    let ok = env.send_request_with_env(
+        HttpRequest::post("/api/manual/trigger")
+            .header("x-test-admin", "yes")
+            .header("x-podup-csrf", "1")
+            .header("content-type", "application/json")
+            .body(trigger_body.to_string().into_bytes()),
+        configure_strict,
+    )?;
+    assert_eq!(ok.status, 202);
+
     Ok(())
 }
 
@@ -480,7 +569,8 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
         .await?;
     }
 
-    let rate_limited = env.send_request(HttpRequest::get("/auto-update?token=e2e-manual"))?;
+    let rate_limited =
+        env.send_request(HttpRequest::post("/auto-update").header("x-podup-csrf", "1"))?;
     assert_eq!(rate_limited.status, 429);
 
     sqlx::query("UPDATE rate_limit_tokens SET ts = ts - 200000")
@@ -501,7 +591,8 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
             .await?;
     assert_eq!(remaining, 0);
 
-    let success = env.send_request(HttpRequest::get("/auto-update?token=e2e-manual"))?;
+    let success =
+        env.send_request(HttpRequest::post("/auto-update").header("x-podup-csrf", "1"))?;
     assert_eq!(
         success.status,
         202,
@@ -726,7 +817,6 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let _ = env.send_request(HttpRequest::get("/api/manual/services"))?;
     env.clear_mock_log()?;
     let trigger_body = json!({
-        "token": env.manual_token(),
         "all": true,
         "dry_run": true,
         "caller": "ci",
@@ -735,6 +825,7 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let trigger = env.send_request(
         HttpRequest::post("/api/manual/trigger")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(trigger_body.to_string().into_bytes()),
     )?;
     assert_eq!(trigger.status, 202);
@@ -764,7 +855,6 @@ async fn scenario_manual_api() -> AnyResult<()> {
 
     env.clear_mock_log()?;
     let service_body = json!({
-        "token": env.manual_token(),
         "dry_run": false,
         "image": "ghcr.io/koha/runner:main",
         "caller": "user",
@@ -773,6 +863,7 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let service = env.send_request(
         HttpRequest::post("/api/manual/services/svc-beta")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(service_body.to_string().into_bytes()),
     )?;
     assert_eq!(service.status, 202);
@@ -1049,7 +1140,6 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
 
     // Simulate a failure when starting the manual auto-update unit via D-Bus.
     let body = json!({
-        "token": env.manual_token(),
         "dry_run": false,
         "caller": "ops",
         "reason": "busctl-fail"
@@ -1057,6 +1147,7 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
     let response = env.send_request_with_env(
         HttpRequest::post("/api/manual/services/podman-auto-update.service")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(body.to_string().into_bytes()),
         |cmd| {
             cmd.env("MOCK_BUSCTL_FAIL", "podman-auto-update.service");
@@ -1107,7 +1198,6 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
 
     // --- Manual service: failing unit operation records command meta + unit error ---
     let service_body = json!({
-        "token": env.manual_token(),
         "dry_run": false,
         "caller": "ci",
         "reason": "unit-fail",
@@ -1115,6 +1205,7 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
     let service = env.send_request_with_env(
         HttpRequest::post("/api/manual/services/svc-beta")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(service_body.to_string().into_bytes()),
         |cmd| {
             cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
@@ -1198,7 +1289,6 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
     // --- Manual trigger: per-unit command-meta logs + error summary on failure ---
     env.clear_mock_log()?;
     let trigger_body = json!({
-        "token": env.manual_token(),
         "all": true,
         "dry_run": false,
         "caller": "ci",
@@ -1207,6 +1297,7 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
     let trigger = env.send_request_with_env(
         HttpRequest::post("/api/manual/trigger")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(trigger_body.to_string().into_bytes()),
         |cmd| {
             cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
@@ -1309,7 +1400,6 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
     // --- Manual service: enable diagnostics and assert status/journal logs + argv ---
     env.clear_mock_log()?;
     let service_body = json!({
-        "token": env.manual_token(),
         "dry_run": false,
         "caller": "ci",
         "reason": "unit-fail-diagnostics",
@@ -1317,6 +1407,7 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
     let service = env.send_request_with_env(
         HttpRequest::post("/api/manual/services/svc-beta")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(service_body.to_string().into_bytes()),
         |cmd| {
             cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
@@ -1431,7 +1522,6 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
     // --- Manual trigger: enable diagnostics and assert at least svc-beta.service gets diagnose logs ---
     env.clear_mock_log()?;
     let trigger_body = json!({
-        "token": env.manual_token(),
         "all": true,
         "dry_run": false,
         "caller": "ci",
@@ -1440,6 +1530,7 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
     let trigger = env.send_request_with_env(
         HttpRequest::post("/api/manual/trigger")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(trigger_body.to_string().into_bytes()),
         |cmd| {
             cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
@@ -1497,7 +1588,6 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
 
     // --- Manual trigger dispatch failure (non-dry-run) ---
     let trigger_body = json!({
-        "token": env.manual_token(),
         "all": true,
         "dry_run": false,
         "caller": "ci",
@@ -1506,6 +1596,7 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
     let trigger = env.send_request_with_env(
         HttpRequest::post("/api/manual/trigger")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(trigger_body.to_string().into_bytes()),
         |cmd| {
             cmd.env("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS", "manual-trigger");
@@ -1545,7 +1636,6 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
     // --- Manual service dispatch failure ---
     env.clear_mock_log()?;
     let service_body = json!({
-        "token": env.manual_token(),
         "dry_run": false,
         "image": "ghcr.io/koha/runner:main",
         "caller": "user",
@@ -1554,6 +1644,7 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
     let service = env.send_request_with_env(
         HttpRequest::post("/api/manual/services/svc-beta")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(service_body.to_string().into_bytes()),
         |cmd| {
             cmd.env("PODUP_TEST_MANUAL_DISPATCH_FAIL_ACTIONS", "manual-service");
@@ -1593,7 +1684,6 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
     // --- Manual auto-update run dispatch failure ---
     env.clear_mock_log()?;
     let run_body = json!({
-        "token": env.manual_token(),
         "dry_run": false,
         "caller": "ops",
         "reason": "dispatch-fail-run",
@@ -1601,6 +1691,7 @@ async fn scenario_manual_dispatch_failure() -> AnyResult<()> {
     let run = env.send_request_with_env(
         HttpRequest::post("/api/manual/auto-update/run")
             .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
             .body(run_body.to_string().into_bytes()),
         |cmd| {
             cmd.env(
@@ -2324,10 +2415,6 @@ impl TestEnv {
             .collect())
     }
 
-    fn manual_token(&self) -> &str {
-        &self.manual_token
-    }
-
     fn last_payload_dump(&self) -> &Path {
         &self.debug_payload
     }
@@ -2341,6 +2428,7 @@ impl TestEnv {
         cmd.env("PODUP_MANUAL_UNITS", "svc-alpha.service,svc-beta.service");
         cmd.env("PODUP_DEBUG_PAYLOAD_PATH", &self.debug_payload);
         cmd.env("PODUP_ENV", "test");
+        cmd.env("PODUP_DEV_OPEN_ADMIN", "1");
         cmd.env("PODUP_AUDIT_SYNC", "1");
         cmd.env("PODUP_SCHEDULER_MIN_INTERVAL_SECS", "0");
         cmd.env("PATH", &self.path_override);

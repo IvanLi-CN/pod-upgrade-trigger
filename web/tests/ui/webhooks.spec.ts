@@ -3,16 +3,16 @@ import { expect, test } from '@playwright/test'
 test.describe('Webhooks page', () => {
   test('shows loading state then unit cards', async ({ page }) => {
     await page.route('**/api/webhooks/status', async (route) => {
-      await new Promise((resolve) => setTimeout(resolve, 200))
+      await new Promise((resolve) => setTimeout(resolve, 900))
       await route.continue()
     })
 
     await page.route('**/api/config', async (route) => {
-      await new Promise((resolve) => setTimeout(resolve, 200))
+      await new Promise((resolve) => setTimeout(resolve, 900))
       await route.continue()
     })
 
-    await page.goto('/webhooks')
+    await page.goto('/webhooks', { waitUntil: 'domcontentloaded' })
 
     const loading = page.getByText('Loading config and webhook status…')
     await expect(loading).toBeVisible()

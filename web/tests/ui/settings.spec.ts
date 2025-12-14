@@ -8,9 +8,13 @@ test.describe('Settings page', () => {
     await expect(stateRow.getByText('configured')).toBeVisible()
     await expect(stateRow.getByRole('cell').nth(2)).not.toHaveText('(empty)')
 
-    const manualTokenRow = page.getByRole('row', { name: /PODUP_MANUAL_TOKEN/ })
-    await expect(manualTokenRow.getByText('missing')).toBeVisible()
-    await expect(manualTokenRow.getByText('(empty)')).toBeVisible()
+    const tokenRow = page.getByRole('row', { name: /PODUP_TOKEN/ })
+    await expect(tokenRow.getByText('configured')).toBeVisible()
+    await expect(tokenRow.getByRole('cell').nth(2)).toHaveText('***')
+
+    const webhookSecretRow = page.getByRole('row', { name: /PODUP_GH_WEBHOOK_SECRET/ })
+    await expect(webhookSecretRow.getByText('configured')).toBeVisible()
+    await expect(webhookSecretRow.getByRole('cell').nth(2)).toHaveText('***')
 
     const forwardCard = page.locator('section').filter({ hasText: 'ForwardAuth' }).first()
 

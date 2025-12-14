@@ -10,7 +10,7 @@ async function seedEvents(request: APIRequestContext) {
 
   for (let i = 0; i < 3; i += 1) {
     await request.post('/api/manual/trigger', {
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-podup-csrf': '1' },
       data: {
         all: true,
         dry_run: true,

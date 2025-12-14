@@ -7,7 +7,7 @@
 1. **HTTP Frontend（常驻监听服务器）**
    - 通过 `http-server` 子命令在 `PODUP_HTTP_ADDR`（默认 `0.0.0.0:25111`）上监听 TCP 连接。
    - 对每个进入的连接派生子进程运行 `server` 子命令，在该子进程内从 STDIN 读取请求行、头、主体并写回响应。
-   - 支持 `/health`、`/sse/hello`、GitHub webhook 路由、传统 `/auto-update` 令牌触发以及 `/api/manual/*` JSON API。
+   - 支持 `/health`、`/sse/hello`、GitHub webhook 路由、传统 `/auto-update` 触发入口（兼容旧流程）以及 `/api/manual/*` JSON API。
    - 根据路径决定后续处理逻辑，并通过统一的 `RequestContext` 承载 method/path/query/body 等信息。
 
 2. **GitHub Webhook 处理**
@@ -34,8 +34,9 @@
    - `try_serve_frontend` 会在 `PODUP_STATE_DIR/web/dist`、当前工作目录下的 `web/dist`、编译产物内置的 `/srv/app/web` 等固定位置查找 UI 资源并托管到 `/`、`/assets/*`、`/favicon.ico` 路径，不再允许通过环境变量指向其他前端构建。
 
 7. **安全与鉴权**
-   - GitHub Webhook 依赖 `PODUP_GH_WEBHOOK_SECRET` 进行 HMAC 校验；
-   - 手动 API / `/auto-update` 使用 `PODUP_TOKEN` 或 `PODUP_MANUAL_TOKEN`；
+   - GitHub Webhook（`/github-package-update/*`）依赖 `PODUP_GH_WEBHOOK_SECRET` 进行 HMAC 校验；该接收端点不走 ForwardAuth/CSRF。
+   - 管理/手动触发类 API（主要是 `/api/*`，以及 legacy `/auto-update`）使用 ForwardAuth（`PODUP_FWD_AUTH_HEADER` + `PODUP_FWD_AUTH_ADMIN_VALUE`）鉴权；本地开发可用 `PODUP_DEV_OPEN_ADMIN=1` 绕过。
+   - 对会产生副作用的 Admin API（`POST/PUT/PATCH/DELETE`）额外强制要求 `x-podup-csrf: 1`；若包含 JSON body，还要求 `Content-Type: application/json...`（前缀匹配）。
    - 响应内容通过 `respond_*` 系列函数集中封装，便于统一返回体与事件记录。
 
 8. **事件追踪**

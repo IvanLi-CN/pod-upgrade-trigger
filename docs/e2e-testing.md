@@ -98,7 +98,7 @@
 **约束**
 
 - 不接入真实 systemd/podman，所有命令均走 `tests/mock-bin`。
-- 不依赖真实 ForwardAuth，测试环境统一使用 `DEV_OPEN_ADMIN=1` 或无需配置 ForwardAuth。
+- 不依赖真实 ForwardAuth，测试环境统一使用 `PODUP_DEV_OPEN_ADMIN=1` 或无需配置 ForwardAuth。
 - 每次测试使用独立 `PODUP_STATE_DIR`/SQLite 文件，保证结果可重复、无共享状态污染。
 
 ### 2. 技术选型与总体框架
@@ -122,8 +122,6 @@
 ```bash
 PODUP_STATE_DIR="$STATE_DIR" \
 PODUP_DB_URL="sqlite://$STATE_DIR/pod-upgrade-trigger.db" \
-PODUP_TOKEN="e2e-token" \
-PODUP_MANUAL_TOKEN="e2e-token" \
 PODUP_GH_WEBHOOK_SECRET="e2e-secret" \
 PODUP_MANUAL_UNITS="svc-alpha.service,svc-beta.service" \
 PODUP_DEV_OPEN_ADMIN="1" \
@@ -173,7 +171,7 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
      - 页面不显示原始 “not found”，而是正确的模块 UI。
 
 3. **401 页面行为（严格模式下）**
-   - 在单独配置下启动后端（配置 ForwardAuth，关闭 `DEV_OPEN_ADMIN`）：
+   - 在单独配置下启动后端（配置 ForwardAuth，关闭 `PODUP_DEV_OPEN_ADMIN`）：
      - 未带头访问 `/settings`：
        - `/api/settings` 返回 401；
        - 前端跳转 `/401`，显示 “未授权 · 401” 提示与当前请求路径；
@@ -302,7 +300,7 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
 
 1. **环境变量展示**
    - 根据当前 env 设置：
-     - `PODUP_STATE_DIR / PODUP_TOKEN / PODUP_MANUAL_TOKEN / PODUP_GH_WEBHOOK_SECRET` 的 configured/missing 与 UI 状态一致；
+     - `PODUP_STATE_DIR / PODUP_GH_WEBHOOK_SECRET / PODUP_TOKEN(legacy)` 的 configured/missing 与 UI 状态一致；
      - secret 变量值使用 `***` 掩码显示。
 
 2. **systemd 单元列表**
@@ -310,15 +308,15 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
    - 每行的 “手动触发” 链接跳转 `/manual`，页面滚动到对应行（可选）。
 
 3. **ForwardAuth 信息**
-   - Dev 环境（`DEV_OPEN_ADMIN=1`）：
+   - Dev 环境（`PODUP_DEV_OPEN_ADMIN=1`）：
      - Header 显示 `(not configured)`；
      - Admin value configured 为 `no`；
-     - DEV_OPEN_ADMIN 为 `true`；
+     - PODUP_DEV_OPEN_ADMIN 为 `true`；
      - Mode 为 `open`。
    - 严格模式环境：
      - Header 为配置值；
      - Admin value configured 为 `yes`；
-     - DEV_OPEN_ADMIN 为 `false`；
+     - PODUP_DEV_OPEN_ADMIN 为 `false`；
      - Mode 为 `protected`。
 
 #### G. 401 未授权页面（auth.spec.ts，可选）
