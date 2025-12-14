@@ -31,6 +31,17 @@ export type MockEvent = {
   created_at: number
 }
 
+export type ManualServiceUpdate = {
+  status: 'tag_update_available' | 'latest_ahead' | 'up_to_date' | 'unknown'
+  tag?: string
+  running_digest?: string
+  remote_tag_digest?: string
+  remote_latest_digest?: string
+  checked_at?: number
+  stale?: boolean
+  reason?: string
+}
+
 export type ManualService = {
   slug: string
   unit: string
@@ -38,6 +49,7 @@ export type ManualService = {
   default_image?: string | null
   github_path?: string
   is_auto_update?: boolean
+  update?: ManualServiceUpdate | null
 }
 
 export type WebhookUnit = {
@@ -271,6 +283,10 @@ function buildServices(profile: MockProfile): ManualService[] {
       unit: 'podman-auto-update.service',
       display_name: 'podman-auto-update.service',
       is_auto_update: true,
+      update: {
+        status: 'unknown',
+        reason: 'no-image-config',
+      },
     },
     {
       slug: 'svc-alpha',
@@ -278,6 +294,13 @@ function buildServices(profile: MockProfile): ManualService[] {
       display_name: 'Alpha Deploy',
       default_image: 'ghcr.io/example/svc-alpha:stable',
       github_path: 'example/svc-alpha',
+      update: {
+        status: 'tag_update_available',
+        tag: 'stable',
+        running_digest: 'sha256:111111',
+        remote_tag_digest: 'sha256:222222',
+        checked_at: Math.floor(Date.now() / 1000) - 300,
+      },
     },
     {
       slug: 'svc-beta',
@@ -285,6 +308,14 @@ function buildServices(profile: MockProfile): ManualService[] {
       display_name: 'Beta Deploy',
       default_image: 'ghcr.io/example/svc-beta:stable',
       github_path: 'example/svc-beta',
+      update: {
+        status: 'latest_ahead',
+        tag: 'stable',
+        running_digest: 'sha256:aaaaaa',
+        remote_tag_digest: 'sha256:aaaaaa',
+        remote_latest_digest: 'sha256:bbbbbb',
+        checked_at: Math.floor(Date.now() / 1000) - 600,
+      },
     },
   ]
 }

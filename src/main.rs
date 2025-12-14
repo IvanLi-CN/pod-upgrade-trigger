@@ -24,12 +24,16 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use url::Url;
+
+mod registry_digest;
 
 const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
@@ -128,6 +132,7 @@ static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 static DB_INIT_STATUS: OnceLock<RwLock<DbInitStatus>> = OnceLock::new();
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static PODMAN_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
+static PODMAN_PS_ALL_JSON: OnceLock<Result<Value, String>> = OnceLock::new();
 static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static SELF_UPDATE_IMPORTER_STARTED: OnceLock<()> = OnceLock::new();
 static SELF_UPDATE_SCHEDULER_STARTED: OnceLock<()> = OnceLock::new();
@@ -4351,6 +4356,92 @@ fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
     )
 }
 
+#[derive(Clone, Debug)]
+struct ParsedManualUpdateImage {
+    tag: String,
+    image_tag: String,
+    image_latest: Option<String>,
+}
+
+fn split_repo_tag_for_manual_update(path: &str) -> Result<(String, String), String> {
+    let trimmed = path.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("invalid-image".to_string());
+    }
+
+    let last_slash = trimmed.rfind('/').unwrap_or(0);
+    let tag_sep = trimmed[last_slash..].rfind(':').map(|idx| idx + last_slash);
+    let Some(tag_sep) = tag_sep else {
+        return Err("invalid-image".to_string());
+    };
+
+    let repo = trimmed[..tag_sep].trim().to_string();
+    let tag = trimmed[tag_sep + 1..].trim().to_string();
+    if repo.is_empty() || tag.is_empty() {
+        return Err("invalid-image".to_string());
+    }
+    Ok((repo, tag))
+}
+
+fn parse_manual_update_image(default_image: &str) -> Result<ParsedManualUpdateImage, String> {
+    let raw = default_image.trim();
+    if raw.is_empty() {
+        return Err("image-missing".to_string());
+    }
+
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        let url = Url::parse(raw).map_err(|_| "invalid-image".to_string())?;
+        let scheme = url.scheme();
+        let host = url
+            .host_str()
+            .ok_or_else(|| "invalid-image".to_string())?
+            .to_ascii_lowercase();
+        let host_port = if let Some(port) = url.port() {
+            format!("{host}:{port}")
+        } else {
+            host
+        };
+
+        let path = url.path().trim_start_matches('/').to_string();
+        let (repo, tag) = split_repo_tag_for_manual_update(&path)?;
+
+        let prefix = format!("{scheme}://{host_port}");
+        let image_tag = format!("{prefix}/{repo}:{tag}");
+        let image_latest = if tag.eq_ignore_ascii_case("latest") {
+            None
+        } else {
+            Some(format!("{prefix}/{repo}:latest"))
+        };
+
+        return Ok(ParsedManualUpdateImage {
+            tag,
+            image_tag,
+            image_latest,
+        });
+    }
+
+    let (registry_raw, rest) = raw
+        .split_once('/')
+        .ok_or_else(|| "invalid-image".to_string())?;
+    let registry = registry_raw.trim();
+    if registry.is_empty() {
+        return Err("invalid-image".to_string());
+    }
+    let (repo, tag) = split_repo_tag_for_manual_update(rest)?;
+    let image_tag = format!("{registry}/{repo}:{tag}");
+    let image_latest = if tag.eq_ignore_ascii_case("latest") {
+        None
+    } else {
+        Some(format!("{registry}/{repo}:latest"))
+    };
+
+    Ok(ParsedManualUpdateImage {
+        tag,
+        image_tag,
+        image_latest,
+    })
+}
+
 fn handle_manual_auto_update_run(ctx: &RequestContext) -> Result<(), String> {
     let request: ManualAutoUpdateRunRequest = match parse_json_body(ctx) {
         Ok(body) => body,
@@ -4528,7 +4619,9 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
-    if query_flag(ctx, &["discover", "refresh"]) {
+    let force_refresh = query_flag(ctx, &["discover", "refresh"]);
+
+    if force_refresh {
         DISCOVERY_ATTEMPTED.store(false, Ordering::SeqCst);
         ensure_discovery(true);
     }
@@ -4537,9 +4630,26 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
     let discovered_set: HashSet<String> = discovered.iter().cloned().collect();
     let discovered_detail = discovered_unit_detail();
 
+    let units = manual_unit_list();
+    let running_digests = resolve_running_digests_by_unit(&units);
+
+    #[derive(Clone, Debug)]
+    struct ManualServiceDraft {
+        slug: String,
+        unit: String,
+        display_name: String,
+        default_image: Option<String>,
+        github_path: String,
+        source: String,
+        is_auto_update: bool,
+        update_image: Result<ParsedManualUpdateImage, String>,
+    }
+
     let mut services = Vec::new();
     let auto_update_unit = manual_auto_update_unit();
-    for unit in manual_unit_list() {
+    let mut drafts: Vec<ManualServiceDraft> = Vec::new();
+
+    for unit in units {
         let slug = unit
             .trim()
             .trim_matches('/')
@@ -4554,14 +4664,207 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
             "manual"
         };
 
+        let update_image = default_image
+            .as_deref()
+            .ok_or_else(|| "image-missing".to_string())
+            .and_then(parse_manual_update_image);
+
+        drafts.push(ManualServiceDraft {
+            slug,
+            unit: unit.clone(),
+            display_name,
+            default_image,
+            github_path,
+            source: source.to_string(),
+            is_auto_update: unit == auto_update_unit,
+            update_image,
+        });
+    }
+
+    let ttl_secs = registry_digest::registry_digest_cache_ttl_secs();
+
+    let mut unique_images: Vec<String> = Vec::new();
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        for draft in &drafts {
+            let Ok(parsed) = &draft.update_image else {
+                continue;
+            };
+            if seen.insert(parsed.image_tag.clone()) {
+                unique_images.push(parsed.image_tag.clone());
+            }
+            if let Some(latest) = parsed.image_latest.as_ref() {
+                if seen.insert(latest.clone()) {
+                    unique_images.push(latest.clone());
+                }
+            }
+        }
+    }
+
+    unique_images.sort();
+    unique_images.dedup();
+
+    let remote_records: HashMap<String, registry_digest::RegistryDigestRecord> =
+        if unique_images.is_empty() || db_init_error().is_some() {
+            HashMap::new()
+        } else {
+            with_db(|pool| async move {
+                let sem = Arc::new(Semaphore::new(4));
+                let mut join = JoinSet::new();
+
+                for image in unique_images {
+                    let pool = pool.clone();
+                    let sem = sem.clone();
+                    let image_clone = image.clone();
+                    join.spawn(async move {
+                        let _permit = sem.acquire_owned().await;
+                        let record = registry_digest::resolve_remote_manifest_digest(
+                            &pool,
+                            &image_clone,
+                            ttl_secs,
+                            force_refresh,
+                        )
+                        .await;
+                        (image, record)
+                    });
+                }
+
+                let mut out = HashMap::new();
+                while let Some(next) = join.join_next().await {
+                    if let Ok((image, record)) = next {
+                        out.insert(image, record);
+                    }
+                }
+                Ok::<HashMap<String, registry_digest::RegistryDigestRecord>, sqlx::Error>(out)
+            })
+            .unwrap_or_else(|_| HashMap::new())
+        };
+
+    let db_unavailable = db_init_error().is_some();
+
+    for draft in drafts {
+        let running = running_digests
+            .get(&draft.unit)
+            .cloned()
+            .unwrap_or(RunningDigestInfo {
+                digest: None,
+                reason: Some("container-not-found".to_string()),
+            });
+
+        let mut status = "unknown".to_string();
+        let mut reason = "unknown".to_string();
+
+        let mut tag_value: Value = Value::Null;
+        let mut running_digest_value: Value = Value::Null;
+        let mut remote_tag_digest_value: Value = Value::Null;
+        let mut remote_latest_digest_value: Value = Value::Null;
+        let mut checked_at_value: Value = Value::Null;
+        let mut stale_value: Value = Value::Null;
+
+        if let Ok(parsed) = &draft.update_image {
+            tag_value = Value::String(parsed.tag.clone());
+            if let Some(d) = running.digest.as_ref() {
+                running_digest_value = Value::String(d.clone());
+            }
+
+            let tag_rec = remote_records.get(&parsed.image_tag);
+            let latest_rec = parsed
+                .image_latest
+                .as_ref()
+                .and_then(|img| remote_records.get(img));
+
+            if let Some(rec) = tag_rec {
+                if let Some(d) = rec.digest.as_ref() {
+                    remote_tag_digest_value = Value::String(d.clone());
+                }
+            }
+            if let Some(rec) = latest_rec {
+                if let Some(d) = rec.digest.as_ref() {
+                    remote_latest_digest_value = Value::String(d.clone());
+                }
+            }
+
+            let checked_at = match (tag_rec, latest_rec) {
+                (Some(tag), Some(latest)) => Some(tag.checked_at.max(latest.checked_at)),
+                (Some(tag), None) => Some(tag.checked_at),
+                (None, Some(latest)) => Some(latest.checked_at),
+                (None, None) => None,
+            };
+            if let Some(ts) = checked_at {
+                checked_at_value = Value::Number(ts.into());
+            }
+
+            let stale = match (tag_rec, latest_rec) {
+                (Some(tag), Some(latest)) => Some(tag.stale || latest.stale),
+                (Some(tag), None) => Some(tag.stale),
+                (None, Some(latest)) => Some(latest.stale),
+                (None, None) => None,
+            };
+            if let Some(v) = stale {
+                stale_value = Value::Bool(v);
+            }
+
+            let remote_tag_digest = tag_rec.and_then(|r| r.digest.as_deref());
+            let remote_latest_digest = latest_rec.and_then(|r| r.digest.as_deref());
+
+            match (running.digest.as_deref(), remote_tag_digest) {
+                (Some(running_digest), Some(tag_digest)) => {
+                    if running_digest != tag_digest {
+                        status = "tag_update_available".to_string();
+                        reason = "tag-digest-changed".to_string();
+                    } else if !parsed.tag.eq_ignore_ascii_case("latest")
+                        && remote_latest_digest.is_some()
+                        && remote_latest_digest != Some(tag_digest)
+                    {
+                        status = "latest_ahead".to_string();
+                        reason = "latest-digest-ahead".to_string();
+                    } else {
+                        status = "up_to_date".to_string();
+                        reason = "up-to-date".to_string();
+                    }
+                }
+                _ => {
+                    status = "unknown".to_string();
+                    if db_unavailable {
+                        reason = "db-unavailable".to_string();
+                    } else if running.digest.is_none() {
+                        reason = running
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "digest-missing".to_string());
+                    } else if let Some(rec) = tag_rec {
+                        reason = rec
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "digest-missing".to_string());
+                    } else {
+                        reason = "remote-unavailable".to_string();
+                    }
+                }
+            }
+        } else if let Err(err) = &draft.update_image {
+            status = "unknown".to_string();
+            reason = err.clone();
+        }
+
         services.push(json!({
-            "slug": slug,
-            "unit": unit,
-            "display_name": display_name,
-            "default_image": default_image,
-            "github_path": github_path,
-            "source": source,
-            "is_auto_update": unit == auto_update_unit,
+            "slug": draft.slug,
+            "unit": draft.unit,
+            "display_name": draft.display_name,
+            "default_image": draft.default_image,
+            "github_path": draft.github_path,
+            "source": draft.source,
+            "is_auto_update": draft.is_auto_update,
+            "update": {
+                "status": status,
+                "tag": tag_value,
+                "running_digest": running_digest_value,
+                "remote_tag_digest": remote_tag_digest_value,
+                "remote_latest_digest": remote_latest_digest_value,
+                "checked_at": checked_at_value,
+                "stale": stale_value,
+                "reason": reason,
+            }
         }));
     }
 
@@ -6788,59 +7091,43 @@ fn discover_units_from_dir() -> Result<Vec<DiscoveredUnit>, String> {
 }
 
 fn discover_units_from_podman_ps() -> Result<Vec<DiscoveredUnit>, String> {
-    let output = Command::new("podman")
-        .arg("ps")
-        .arg("-a")
-        .arg("--filter")
-        .arg("label=io.containers.autoupdate")
-        .arg("--format")
-        .arg("json")
-        .output()
-        .map_err(|e| format!("podman ps exec failed: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "podman ps exited {}",
-            exit_code_string(&output.status)
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let parsed: Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("invalid podman ps output: {e}"))?;
+    let parsed = podman_ps_all_json().map_err(|e| format!("podman-ps: {e}"))?;
 
     let mut units = Vec::new();
     if let Some(items) = parsed.as_array() {
         for item in items {
-            // Prefer explicit unit label if present (commonly set by generate systemd/quadlet).
-            if let Some(labels) = item.get("Labels").or_else(|| item.get("labels")) {
-                let autoupdate_label = labels
-                    .get("io.containers.autoupdate")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if matches!(
-                    autoupdate_label.as_str(),
-                    "" | "false" | "no" | "none" | "off" | "0"
-                ) {
-                    continue;
-                }
+            // When sourcing discovery from podman ps we intentionally keep the
+            // same semantics as the old `--filter label=io.containers.autoupdate`
+            // behavior: skip containers without the autoupdate label.
+            let labels = item.get("Labels").or_else(|| item.get("labels"));
+            let labels = labels.and_then(|v| v.as_object());
+            let Some(labels) = labels else {
+                continue;
+            };
 
-                if let Some(unit) = labels
-                    .get("io.podman.systemd.unit")
-                    .or_else(|| labels.get("io.containers.autoupdate.unit"))
-                    .and_then(|v| v.as_str())
-                {
-                    units.push(DiscoveredUnit {
-                        unit: unit.to_string(),
-                        source: "ps",
-                    });
-                    continue;
-                }
+            let autoupdate_label = labels
+                .get("io.containers.autoupdate")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(
+                autoupdate_label.as_str(),
+                "" | "false" | "no" | "none" | "off" | "0"
+            ) {
+                continue;
+            }
+
+            // Prefer explicit unit label if present (commonly set by generate systemd/quadlet).
+            if let Some(unit) = labels
+                .get("io.podman.systemd.unit")
+                .or_else(|| labels.get("io.containers.autoupdate.unit"))
+                .and_then(|v| v.as_str())
+            {
+                units.push(DiscoveredUnit {
+                    unit: unit.to_string(),
+                    source: "ps",
+                });
+                continue;
             }
 
             // Fall back to container name -> <name>.service mapping.
@@ -6881,6 +7168,325 @@ fn discover_units_from_podman_ps() -> Result<Vec<DiscoveredUnit>, String> {
     units.sort_by(|a, b| a.unit.cmp(&b.unit));
     units.dedup_by(|a, b| a.unit == b.unit);
     Ok(units)
+}
+
+fn podman_ps_all_json() -> Result<Value, String> {
+    PODMAN_PS_ALL_JSON
+        .get_or_init(|| {
+            let output = Command::new("podman")
+                .arg("ps")
+                .arg("-a")
+                .arg("--format")
+                .arg("json")
+                .output()
+                .map_err(|_| "exec-failed".to_string())?;
+
+            if !output.status.success() {
+                return Err("non-zero-exit".to_string());
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            if trimmed.is_empty() {
+                return Ok(Value::Array(Vec::new()));
+            }
+
+            serde_json::from_str(trimmed).map_err(|_| "invalid-json".to_string())
+        })
+        .clone()
+}
+
+fn podman_image_inspect_json(image_ids: &[String]) -> Result<Value, String> {
+    if image_ids.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let mut cmd = Command::new("podman");
+    cmd.arg("image").arg("inspect");
+    for id in image_ids {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            cmd.arg(trimmed);
+        }
+    }
+
+    let output = cmd.output().map_err(|_| "exec-failed".to_string())?;
+    if !output.status.success() {
+        return Err("non-zero-exit".to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    serde_json::from_str(trimmed).map_err(|_| "invalid-json".to_string())
+}
+
+#[derive(Clone, Debug)]
+struct RunningDigestInfo {
+    digest: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PodmanContainerCandidate {
+    image_id: Option<String>,
+    is_running: bool,
+    created: i64,
+}
+
+fn container_is_running(item: &Value) -> bool {
+    if let Some(state) = item
+        .get("State")
+        .or_else(|| item.get("state"))
+        .and_then(|v| v.as_str())
+    {
+        let lower = state.trim().to_ascii_lowercase();
+        if lower == "running" {
+            return true;
+        }
+        if matches!(lower.as_str(), "exited" | "stopped" | "dead") {
+            return false;
+        }
+    }
+
+    if let Some(exited) = item
+        .get("Exited")
+        .or_else(|| item.get("exited"))
+        .and_then(|v| v.as_bool())
+    {
+        return !exited;
+    }
+
+    if let Some(status) = item
+        .get("Status")
+        .or_else(|| item.get("status"))
+        .and_then(|v| v.as_str())
+    {
+        let lower = status.trim().to_ascii_lowercase();
+        if lower.contains("up") {
+            return true;
+        }
+        if lower.contains("exited") || lower.contains("dead") {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn container_created_ts(item: &Value) -> i64 {
+    item.get("Created")
+        .or_else(|| item.get("created"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+}
+
+fn container_image_id(item: &Value) -> Option<String> {
+    item.get("ImageID")
+        .or_else(|| item.get("ImageId"))
+        .or_else(|| item.get("imageID"))
+        .or_else(|| item.get("imageId"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn container_unit_label(item: &Value) -> Option<String> {
+    let labels = item.get("Labels").or_else(|| item.get("labels"))?;
+    let obj = labels.as_object()?;
+    obj.get("io.podman.systemd.unit")
+        .or_else(|| obj.get("io.containers.autoupdate.unit"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn resolve_running_digests_by_unit(units: &[String]) -> HashMap<String, RunningDigestInfo> {
+    let mut out = HashMap::new();
+    if units.is_empty() {
+        return out;
+    }
+
+    let ps = match podman_ps_all_json() {
+        Ok(v) => v,
+        Err(_) => {
+            for unit in units {
+                out.insert(
+                    unit.clone(),
+                    RunningDigestInfo {
+                        digest: None,
+                        reason: Some("podman-ps-failed".to_string()),
+                    },
+                );
+            }
+            return out;
+        }
+    };
+
+    let mut by_unit: HashMap<String, Vec<PodmanContainerCandidate>> = HashMap::new();
+    if let Some(items) = ps.as_array() {
+        for item in items {
+            let Some(unit) = container_unit_label(item) else {
+                continue;
+            };
+            by_unit
+                .entry(unit)
+                .or_default()
+                .push(PodmanContainerCandidate {
+                    image_id: container_image_id(item),
+                    is_running: container_is_running(item),
+                    created: container_created_ts(item),
+                });
+        }
+    }
+
+    let mut selected_image_ids: Vec<String> = Vec::new();
+    let mut unit_to_image_id: HashMap<String, Option<String>> = HashMap::new();
+    for unit in units {
+        let Some(candidates) = by_unit.get(unit) else {
+            out.insert(
+                unit.clone(),
+                RunningDigestInfo {
+                    digest: None,
+                    reason: Some("container-not-found".to_string()),
+                },
+            );
+            unit_to_image_id.insert(unit.clone(), None);
+            continue;
+        };
+
+        let mut best_running: Option<&PodmanContainerCandidate> = None;
+        let mut best_any: Option<&PodmanContainerCandidate> = None;
+        for cand in candidates {
+            if best_any
+                .as_ref()
+                .map(|b| cand.created > b.created)
+                .unwrap_or(true)
+            {
+                best_any = Some(cand);
+            }
+            if cand.is_running
+                && best_running
+                    .as_ref()
+                    .map(|b| cand.created > b.created)
+                    .unwrap_or(true)
+            {
+                best_running = Some(cand);
+            }
+        }
+        let chosen = best_running.or(best_any);
+        let image_id = chosen.and_then(|c| c.image_id.clone());
+        if let Some(id) = image_id.as_ref() {
+            selected_image_ids.push(id.clone());
+        }
+        unit_to_image_id.insert(unit.clone(), image_id);
+    }
+
+    selected_image_ids.sort();
+    selected_image_ids.dedup();
+
+    let inspect = match podman_image_inspect_json(&selected_image_ids) {
+        Ok(v) => v,
+        Err(_) => {
+            for unit in units {
+                if let Some(existing) = out.get(unit) {
+                    if existing.reason.as_deref() == Some("container-not-found") {
+                        continue;
+                    }
+                }
+                out.insert(
+                    unit.clone(),
+                    RunningDigestInfo {
+                        digest: None,
+                        reason: Some("podman-image-inspect-failed".to_string()),
+                    },
+                );
+            }
+            return out;
+        }
+    };
+
+    let mut image_id_to_digest: HashMap<String, String> = HashMap::new();
+    if let Some(images) = inspect.as_array() {
+        for image in images {
+            let id = image
+                .get("Id")
+                .or_else(|| image.get("ID"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let Some(id) = id else {
+                continue;
+            };
+
+            let mut digest: Option<String> = None;
+            if let Some(repo_digests) = image.get("RepoDigests").and_then(|v| v.as_array()) {
+                for entry in repo_digests {
+                    let Some(raw) = entry.as_str() else { continue };
+                    let Some((_repo, d)) = raw.split_once('@') else {
+                        continue;
+                    };
+                    let d = d.trim();
+                    if d.starts_with("sha256:") {
+                        digest = Some(d.to_string());
+                        break;
+                    }
+                }
+            }
+            if digest.is_none() {
+                digest = image
+                    .get("Digest")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| s.starts_with("sha256:"));
+            }
+
+            if let Some(d) = digest {
+                image_id_to_digest.insert(id, d);
+            }
+        }
+    }
+
+    for unit in units {
+        if out.contains_key(unit) {
+            continue;
+        }
+        let image_id = unit_to_image_id.get(unit).cloned().unwrap_or(None);
+        let Some(image_id) = image_id else {
+            out.insert(
+                unit.clone(),
+                RunningDigestInfo {
+                    digest: None,
+                    reason: Some("image-id-missing".to_string()),
+                },
+            );
+            continue;
+        };
+        match image_id_to_digest.get(&image_id) {
+            Some(digest) => {
+                out.insert(
+                    unit.clone(),
+                    RunningDigestInfo {
+                        digest: Some(digest.clone()),
+                        reason: None,
+                    },
+                );
+            }
+            None => {
+                out.insert(
+                    unit.clone(),
+                    RunningDigestInfo {
+                        digest: None,
+                        reason: Some("digest-missing".to_string()),
+                    },
+                );
+            }
+        }
+    }
+
+    out
 }
 
 fn discover_podman_units() -> Result<Vec<DiscoveredUnit>, String> {
@@ -11536,8 +12142,17 @@ mod tests {
     use std::fs;
     use std::fs::File;
     use std::io::Write;
-    use std::sync::Once;
+    use std::sync::{Mutex, MutexGuard, Once};
     use tempfile::{NamedTempFile, TempDir};
+
+    static ENV_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_test_lock() -> MutexGuard<'static, ()> {
+        ENV_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env test mutex poisoned")
+    }
 
     fn init_test_db() {
         static INIT: Once = Once::new();
@@ -11778,6 +12393,7 @@ mod tests {
 
     #[test]
     fn github_task_stop_marks_cancelled_and_stops_runner_unit() {
+        let _lock = env_test_lock();
         init_test_db_with_systemctl_mock();
 
         // Create a github-webhook task with a known delivery id so we can
@@ -11864,6 +12480,7 @@ mod tests {
 
     #[test]
     fn auto_update_dry_run_errors_are_ingested_into_task_logs_and_events() {
+        let _lock = env_test_lock();
         init_test_db();
 
         // Point auto-update log dir to a temporary directory.
@@ -11876,7 +12493,7 @@ mod tests {
         );
         // Ensure that our synthetic JSONL file is considered recent enough for
         // ingestion regardless of test runtime/environment clock skew.
-        set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "86400");
+        set_env("PODUP_AUTO_UPDATE_LOG_MAX_AGE_SECS", "31536000");
 
         let unit = "podman-auto-update.service";
         let task_id = create_manual_auto_update_task(unit, "req-auto-update-test", "/auto-update")
@@ -11951,6 +12568,7 @@ mod tests {
 
     #[test]
     fn auto_update_run_task_terminal_states_and_warnings() {
+        let _lock = env_test_lock();
         init_test_db_with_systemctl_mock();
 
         // 1. Summary present, failed == 0 -> succeeded + warnings ingested.
@@ -12229,6 +12847,7 @@ mod tests {
 
     #[test]
     fn task_created_log_status_follows_final_status_for_manual_auto_update() {
+        let _lock = env_test_lock();
         init_test_db_with_systemctl_mock();
 
         // Point auto-update log dir to a temporary directory and seed it with a

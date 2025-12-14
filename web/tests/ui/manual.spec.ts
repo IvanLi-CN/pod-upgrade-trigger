@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-async function openManualPage(page: Parameters<typeof test>[0]['page']) {
+async function openManualPage(page: import('@playwright/test').Page) {
   await page.goto('/manual?mock=enabled&mock=profile=happy-path')
   await expect(page.getByText('触发全部单元')).toBeVisible()
   await expect(page.getByText('按单元触发')).toBeVisible()
@@ -13,6 +13,10 @@ test.describe('Manual triggers', () => {
 
     await expect(page.getByText('svc-alpha.service').first()).toBeVisible()
     await expect(page.getByText('svc-beta.service').first()).toBeVisible()
+
+    await expect(page.getByText('有新版本')).toBeVisible()
+    await expect(page.getByText('有更高版本')).toBeVisible()
+    await expect(page.getByText('latest')).toBeVisible()
 
     await page.getByLabel('Dry run').check()
 
@@ -63,6 +67,21 @@ test.describe('Manual triggers', () => {
 
     await expect(page.getByText('触发失败')).toBeVisible()
     await expect(page.getByText('暂无手动触发记录。')).toBeVisible()
+  })
+
+  test('clicking refresh button triggers refresh request', async ({ page }) => {
+    await openManualPage(page)
+
+    const refreshRequestPromise = page.waitForResponse(
+      (res) =>
+        res.url().includes('/api/manual/services') &&
+        res.url().includes('refresh=1') &&
+        res.status() === 200,
+    )
+
+    await page.getByRole('button', { name: '刷新更新状态' }).click()
+
+    await refreshRequestPromise
   })
 
   test('history entry links to Events view with request_id filter', async ({ page }) => {

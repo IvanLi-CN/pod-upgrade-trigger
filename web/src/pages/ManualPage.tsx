@@ -16,15 +16,10 @@ import type {
 import { isCommandMeta } from '../domain/tasks'
 import { AutoUpdateWarningsBlock } from '../components/AutoUpdateWarningsBlock'
 import { TaskLogMetaDetails } from '../components/TaskLogMetaDetails'
+import { ManualServicesCard } from '../components/manual/ManualServicesCard'
+import type { ManualServiceRowService } from '../components/manual/ManualServiceRow'
 
-type ManualService = {
-  slug: string
-  unit: string
-  display_name: string
-  default_image?: string | null
-  github_path?: string
-  is_auto_update?: boolean
-}
+type ManualService = ManualServiceRowService
 
 type ManualServicesResponse = {
   services: ManualService[]
@@ -76,6 +71,7 @@ export default function ManualPage() {
   const [allDryRun, setAllDryRun] = useState(false)
   const [allCaller, setAllCaller] = useState('')
   const [allReason, setAllReason] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
   const navigate = useNavigate()
 
   const manualTokenMissing =
@@ -258,6 +254,28 @@ export default function ManualPage() {
     }
   }
 
+  const handleRefresh = async () => {
+    setRefreshing(true)
+    try {
+      const data = await getJson<ManualServicesResponse>('/api/manual/services?refresh=1')
+      if (Array.isArray(data.services)) {
+        setServices(data.services)
+      }
+    } catch (err) {
+      const message =
+        err && typeof err === 'object' && 'message' in err && err.message
+          ? String(err.message)
+          : '刷新失败'
+      pushToast({
+        variant: 'error',
+        title: '更新刷新失败',
+        message,
+      })
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       {manualTokenMissing && (
@@ -319,30 +337,12 @@ export default function ManualPage() {
         </form>
       </section>
 
-      <section className="card bg-base-100 shadow">
-        <div className="card-body gap-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
-              按单元触发
-            </h2>
-            <span className="text-[11px] text-base-content/60">
-              来自 GET /api/manual/services
-            </span>
-          </div>
-          <div className="space-y-3">
-            {services.length === 0 && (
-              <p className="text-xs text-base-content/60">暂无可触发的 systemd 单元。</p>
-            )}
-            {services.map((service) => (
-              <ServiceRow
-                key={service.slug}
-                service={service}
-                onTrigger={handleTriggerService}
-              />
-            ))}
-          </div>
-        </div>
-      </section>
+      <ManualServicesCard
+        services={services}
+        refreshing={refreshing}
+        onRefresh={handleRefresh}
+        onTrigger={handleTriggerService}
+      />
 
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-3">
@@ -388,96 +388,6 @@ export default function ManualPage() {
         />
       ) : null}
     </div>
-  )
-}
-
-type ServiceRowProps = {
-  service: ManualService
-  onTrigger: (
-    service: ManualService,
-    params: { dryRun: boolean; image?: string; caller?: string; reason?: string },
-  ) => void | Promise<void>
-}
-
-function ServiceRow({ service, onTrigger }: ServiceRowProps) {
-  const [image, setImage] = useState(service.default_image ?? '')
-  const [caller, setCaller] = useState('')
-  const [reason, setReason] = useState('')
-  const [dryRun, setDryRun] = useState(false)
-  const [pending, setPending] = useState(false)
-
-  const handleSubmit = async (event: FormEvent) => {
-    event.preventDefault()
-    setPending(true)
-    try {
-      await onTrigger(service, {
-        dryRun,
-        image: image.trim() || undefined,
-        caller,
-        reason,
-      })
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return (
-    <form
-      className="flex flex-col gap-2 rounded-lg border border-base-200 bg-base-100 px-3 py-2 text-xs md:flex-row md:items-center"
-      onSubmit={handleSubmit}
-    >
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
-        <div className="flex items-center gap-2">
-          <span className="font-semibold">{service.display_name}</span>
-          <span className="badge badge-ghost badge-xs">{service.unit}</span>
-        </div>
-        <div className="grid gap-2 md:grid-cols-3">
-          <input
-            className="input input-xs input-bordered"
-            placeholder={service.default_image ? 'override image' : 'image (optional)'}
-            value={image}
-            onChange={(event) => setImage(event.target.value)}
-          />
-          <input
-            className="input input-xs input-bordered"
-            placeholder="caller"
-            value={caller}
-            onChange={(event) => setCaller(event.target.value)}
-          />
-          <input
-            className="input input-xs input-bordered"
-            placeholder="reason"
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-          />
-        </div>
-        {service.github_path && (
-          <div className="mt-1 flex items-center gap-1 text-[10px] text-base-content/60">
-            <Icon icon="mdi:github" />
-            <span>{service.github_path}</span>
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-2 md:flex-col md:items-end">
-        <label className="flex cursor-pointer items-center gap-1 text-[11px]">
-          <span>Dry</span>
-          <input
-            type="checkbox"
-            className="toggle toggle-xs"
-            checked={dryRun}
-            onChange={(event) => setDryRun(event.target.checked)}
-          />
-        </label>
-        <button
-          type="submit"
-          className="btn btn-primary btn-xs"
-          disabled={pending}
-        >
-          <Icon icon="mdi:play" className="text-lg" />
-          触发
-        </button>
-      </div>
-    </form>
   )
 }
 
