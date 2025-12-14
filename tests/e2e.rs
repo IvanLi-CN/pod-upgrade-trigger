@@ -61,7 +61,8 @@ async fn scenario_csrf_guard() -> AnyResult<()> {
             .body(b"{}".to_vec()),
     )?;
     assert_eq!(
-        missing.status, 403,
+        missing.status,
+        403,
         "POST /api/tasks without X-Podup-CSRF must be rejected: {}",
         missing.body_text()
     );
@@ -73,7 +74,10 @@ async fn scenario_csrf_guard() -> AnyResult<()> {
             .header("x-podup-csrf", "1")
             .body(b"{}".to_vec()),
     )?;
-    assert_eq!(ok.status, 200, "POST /api/tasks should succeed with CSRF header");
+    assert_eq!(
+        ok.status, 200,
+        "POST /api/tasks should succeed with CSRF header"
+    );
     let body = ok.json_body()?;
     let task_id = body["task_id"].as_str().unwrap_or_default();
     assert!(!task_id.is_empty(), "tasks-create should return a task_id");
@@ -93,7 +97,8 @@ async fn scenario_forwardauth_and_csrf_strict_mode() -> AnyResult<()> {
     };
 
     // Admin-required GET should reject missing admin header with 401.
-    let no_admin = env.send_request_with_env(HttpRequest::get("/api/manual/services"), configure_strict)?;
+    let no_admin =
+        env.send_request_with_env(HttpRequest::get("/api/manual/services"), configure_strict)?;
     assert_eq!(no_admin.status, 401);
 
     // With admin header it should succeed (no CSRF for GET).
@@ -564,9 +569,8 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
         .await?;
     }
 
-    let rate_limited = env.send_request(
-        HttpRequest::post("/auto-update").header("x-podup-csrf", "1"),
-    )?;
+    let rate_limited =
+        env.send_request(HttpRequest::post("/auto-update").header("x-podup-csrf", "1"))?;
     assert_eq!(rate_limited.status, 429);
 
     sqlx::query("UPDATE rate_limit_tokens SET ts = ts - 200000")
