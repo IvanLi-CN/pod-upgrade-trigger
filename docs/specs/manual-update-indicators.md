@@ -118,7 +118,7 @@
 
 优先走“可稳定映射”的 Podman 标签：
 
-1. `podman ps -a --filter label=io.podman.systemd.unit=<unit> --format json`
+1. `podman ps -a --filter label=io.podman.systemd.unit=<unit> --format json`（或 `--filter label=PODMAN_SYSTEMD_UNIT=<unit>`）
 2. 若匹配到多个容器：
    - 若存在 running 容器，优先 running；
    - 否则取最新创建的一个（或返回 unknown，取决于实现复杂度）。
@@ -210,7 +210,7 @@
 
 1. **registry 鉴权策略（已确认）**：复用 rootless 用户的 `~/.config/containers/auth.json`。需要确认运维在生产主机上为运行用户正确配置该文件，并具备拉取/查询 manifest 的权限。
 2. **digest 口径一致性**：本地运行容器能否稳定拿到“与 registry 对齐的 manifest digest”？多架构镜像可能出现 index digest 与 platform digest 不一致，需要明确比较口径。
-3. **unit->container 映射可靠性（已确认方向）**：依赖标准 Quadlet + rootless 部署，优先通过 `io.podman.systemd.unit` label 映射；若 label 缺失则降级为 `unknown` 并提示运维修正。
+3. **unit->container 映射可靠性（已确认方向）**：依赖标准 Quadlet + rootless 部署，优先通过 `io.podman.systemd.unit` / `PODMAN_SYSTEMD_UNIT` label 映射；若 label 缺失则降级为 `unknown` 并提示运维修正。
 4. **性能**：服务数量较多时，首次 refresh 可能触发较多外网 HEAD；需要并发控制与总超时。
 
 ## 测试计划（建议）
