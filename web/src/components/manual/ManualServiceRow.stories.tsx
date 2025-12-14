@@ -11,6 +11,35 @@ const meta: Meta<typeof ManualServiceRow> = {
 export default meta
 type Story = StoryObj<typeof ManualServiceRow>
 
+function expectCurrentVersionBetween({
+  canvasElement,
+  unit,
+  currentTag,
+  updateText,
+}: {
+  canvasElement: HTMLElement
+  unit: string
+  currentTag: string
+  updateText?: string | RegExp
+}) {
+  const titleRow = within(canvasElement)
+    .getByText('Demo service')
+    .closest('div') as HTMLElement | null
+  expect(titleRow).not.toBeNull()
+
+  const row = within(titleRow as HTMLElement)
+  const unitEl = row.getByText(unit)
+  const currentEl = row.getByText(currentTag)
+  expect(unitEl.compareDocumentPosition(currentEl) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+  if (updateText) {
+    const updateEl = row.getByText(updateText)
+    expect(
+      currentEl.compareDocumentPosition(updateEl) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  }
+}
+
 const baseService = {
   slug: 'svc-demo',
   unit: 'demo.service',
@@ -29,6 +58,11 @@ export const NoUpdate: Story = {
     const canvas = within(canvasElement)
     expect(await canvas.findByText('Demo service')).toBeInTheDocument()
     expect(await canvas.findByText('demo.service')).toBeInTheDocument()
+    expectCurrentVersionBetween({
+      canvasElement,
+      unit: 'demo.service',
+      currentTag: 'v1.2.3',
+    })
     expect(canvas.queryByText('有新版本')).not.toBeInTheDocument()
     expect(canvas.queryByText('有更高版本')).not.toBeInTheDocument()
     expect(canvas.queryByText('已是最新')).not.toBeInTheDocument()
@@ -46,8 +80,13 @@ export const TagUpdateAvailable: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    expect(await canvas.findByText('有新版本')).toBeInTheDocument()
-    expect(await canvas.findByText('v9.9.9')).toBeInTheDocument()
+    expect(await canvas.findByText(/有新版本\s*v9\.9\.9/)).toBeInTheDocument()
+    expectCurrentVersionBetween({
+      canvasElement,
+      unit: 'demo.service',
+      currentTag: 'v9.9.9',
+      updateText: /有新版本\s*v9\.9\.9/,
+    })
   },
 }
 
@@ -61,8 +100,13 @@ export const LatestAhead: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    expect(await canvas.findByText('有更高版本')).toBeInTheDocument()
-    expect(await canvas.findByText('latest')).toBeInTheDocument()
+    expect(await canvas.findByText(/有更高版本\s*latest/)).toBeInTheDocument()
+    expectCurrentVersionBetween({
+      canvasElement,
+      unit: 'demo.service',
+      currentTag: 'v1.2.3',
+      updateText: /有更高版本\s*latest/,
+    })
   },
 }
 
@@ -77,7 +121,12 @@ export const UpToDate: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     expect(await canvas.findByText('已是最新')).toBeInTheDocument()
-    expect(await canvas.findByText('v1.2.3')).toBeInTheDocument()
+    expectCurrentVersionBetween({
+      canvasElement,
+      unit: 'demo.service',
+      currentTag: 'v1.2.3',
+      updateText: '已是最新',
+    })
   },
 }
 
@@ -92,6 +141,12 @@ export const Unknown: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     const badge = await canvas.findByText('未知')
+    expectCurrentVersionBetween({
+      canvasElement,
+      unit: 'demo.service',
+      currentTag: 'v1.2.3',
+      updateText: '未知',
+    })
     const tooltip = badge.closest('.tooltip')
     expect(tooltip).not.toBeNull()
     expect(tooltip).toHaveAttribute(
@@ -112,8 +167,15 @@ export const WithGithubPath: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
+    expect(await canvas.findByText('Demo service')).toBeInTheDocument()
     expect(await canvas.findByText('acme/demo/services/demo.service')).toBeInTheDocument()
     expect(await canvas.findByText('已是最新')).toBeInTheDocument()
+    expectCurrentVersionBetween({
+      canvasElement,
+      unit: 'demo.service',
+      currentTag: 'v1.2.3',
+      updateText: '已是最新',
+    })
   },
 }
 
@@ -128,7 +190,13 @@ export const WithoutDefaultImage: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
+    expect(await canvas.findByText('Demo service')).toBeInTheDocument()
     expect(await canvas.findByPlaceholderText('image (optional)')).toBeInTheDocument()
+    expectCurrentVersionBetween({
+      canvasElement,
+      unit: 'demo.service',
+      currentTag: 'v9.9.9',
+      updateText: /有新版本\s*v9\.9\.9/,
+    })
   },
 }
-

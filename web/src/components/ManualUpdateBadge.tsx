@@ -21,16 +21,16 @@ export function ManualUpdateBadge({
   if (update.status === 'tag_update_available') {
     return (
       <div className="flex items-center gap-1">
-        <span className="badge badge-warning badge-sm">有新版本</span>
-        {tag ? <span className="badge badge-ghost badge-sm">{tag}</span> : null}
+        <span className="badge badge-warning badge-sm">
+          {tag ? `有新版本 ${tag}` : '有新版本'}
+        </span>
       </div>
     )
   }
   if (update.status === 'latest_ahead') {
     return (
       <div className="flex items-center gap-1">
-        <span className="badge badge-info badge-sm">有更高版本</span>
-        <span className="badge badge-ghost badge-sm">latest</span>
+        <span className="badge badge-info badge-sm">有更高版本 latest</span>
       </div>
     )
   }
@@ -38,7 +38,6 @@ export function ManualUpdateBadge({
     return (
       <div className="flex items-center gap-1">
         <span className="badge badge-success badge-sm">已是最新</span>
-        {tag ? <span className="badge badge-ghost badge-sm">{tag}</span> : null}
       </div>
     )
   }
@@ -50,7 +49,6 @@ export function ManualUpdateBadge({
           未知
         </span>
       </div>
-      {tag ? <span className="badge badge-ghost badge-sm">{tag}</span> : null}
     </div>
   )
 }

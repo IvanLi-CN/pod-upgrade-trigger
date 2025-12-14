@@ -28,12 +28,29 @@ export type ManualServiceRowProps = {
   ) => void | Promise<void>
 }
 
+function extractTagFromImage(image?: string | null): string | null {
+  const raw = image?.trim()
+  if (!raw) return null
+
+  const ref = raw.split('@')[0]?.trim()
+  if (!ref) return null
+
+  const lastSlash = ref.lastIndexOf('/')
+  const lastColon = ref.lastIndexOf(':')
+  if (lastColon <= lastSlash) return null
+
+  const tag = ref.slice(lastColon + 1).trim()
+  return tag ? tag : null
+}
+
 export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) {
   const [image, setImage] = useState(service.default_image ?? '')
   const [caller, setCaller] = useState('')
   const [reason, setReason] = useState('')
   const [dryRun, setDryRun] = useState(false)
   const [pending, setPending] = useState(false)
+
+  const currentTag = service.update?.tag?.trim() || extractTagFromImage(service.default_image)
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
@@ -59,6 +76,9 @@ export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) 
         <div className="flex items-center gap-2">
           <span className="font-semibold">{service.display_name}</span>
           <span className="badge badge-ghost badge-xs">{service.unit}</span>
+          {currentTag ? (
+            <span className="badge badge-ghost badge-xs text-base-content/60">{currentTag}</span>
+          ) : null}
           <ManualUpdateBadge update={service.update} />
         </div>
         <div className="grid gap-2 md:grid-cols-3">
@@ -106,4 +126,3 @@ export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) 
     </form>
   )
 }
-

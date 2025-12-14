@@ -17,8 +17,7 @@ export const TagUpdateAvailable: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    expect(await canvas.findByText('有新版本')).toBeInTheDocument()
-    expect(await canvas.findByText('v1.2.3')).toBeInTheDocument()
+    expect(await canvas.findByText(/有新版本\s*v1\.2\.3/)).toBeInTheDocument()
   },
 }
 
@@ -28,8 +27,7 @@ export const LatestAhead: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    expect(await canvas.findByText('有更高版本')).toBeInTheDocument()
-    expect(await canvas.findByText('latest')).toBeInTheDocument()
+    expect(await canvas.findByText(/有更高版本\s*latest/)).toBeInTheDocument()
   },
 }
 
@@ -40,7 +38,6 @@ export const UpToDate: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     expect(await canvas.findByText('已是最新')).toBeInTheDocument()
-    expect(await canvas.findByText('v1.2.3')).toBeInTheDocument()
   },
 }
 
@@ -51,7 +48,6 @@ export const Unknown: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     const badge = await canvas.findByText('未知')
-    expect(await canvas.findByText('v1.2.3')).toBeInTheDocument()
     const tooltip = badge.closest('.tooltip')
     expect(tooltip).not.toBeNull()
     expect(tooltip).toHaveAttribute(

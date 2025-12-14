@@ -16,8 +16,8 @@ describe('ManualServicesCard stories', () => {
 
   it('renders mixed update badge states', async () => {
     render(<Mixed />)
-    expect(await screen.findByText('有新版本')).toBeInTheDocument()
-    expect(await screen.findByText('有更高版本')).toBeInTheDocument()
+    expect(await screen.findByText(/有新版本\s*v1\.0\.1/)).toBeInTheDocument()
+    expect(await screen.findByText(/有更高版本\s*latest/)).toBeInTheDocument()
     expect(await screen.findByText('已是最新')).toBeInTheDocument()
     expect(await screen.findByText('未知')).toBeInTheDocument()
   })
@@ -29,4 +29,3 @@ describe('ManualServicesCard stories', () => {
     expect(button.querySelector('.animate-spin')).not.toBeNull()
   })
 })
-

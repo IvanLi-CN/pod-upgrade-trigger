@@ -64,8 +64,8 @@ export const Mixed: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
-    expect(await canvas.findByText('有新版本')).toBeInTheDocument()
-    expect(await canvas.findByText('有更高版本')).toBeInTheDocument()
+    expect(await canvas.findByText(/有新版本\s*v1\.0\.1/)).toBeInTheDocument()
+    expect(await canvas.findByText(/有更高版本\s*latest/)).toBeInTheDocument()
     expect(await canvas.findByText('已是最新')).toBeInTheDocument()
     expect(await canvas.findByText('未知')).toBeInTheDocument()
   },
@@ -93,4 +93,3 @@ export const Refreshing: Story = {
     expect(button.querySelector('.animate-spin')).not.toBeNull()
   },
 }
-
