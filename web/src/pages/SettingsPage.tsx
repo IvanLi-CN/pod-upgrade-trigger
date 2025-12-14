@@ -7,7 +7,6 @@ type SettingsResponse = {
   env: {
     PODUP_STATE_DIR?: string
     PODUP_TOKEN_configured?: boolean
-    PODUP_MANUAL_TOKEN_configured?: boolean
     PODUP_GH_WEBHOOK_SECRET_configured?: boolean
   }
   scheduler: {
@@ -47,14 +46,14 @@ export default function SettingsPage() {
 
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
-      try {
-        const data = await getJson<SettingsResponse>('/api/settings')
-        if (!cancelled) setSettings(data)
-      } catch (err) {
-        console.error('Failed to load settings', err)
-      }
-    })()
+      ; (async () => {
+        try {
+          const data = await getJson<SettingsResponse>('/api/settings')
+          if (!cancelled) setSettings(data)
+        } catch (err) {
+          console.error('Failed to load settings', err)
+        }
+      })()
     return () => {
       cancelled = true
     }
@@ -64,7 +63,7 @@ export default function SettingsPage() {
   const systemd = settings?.systemd
   const forward = settings?.forward_auth
   const tasks = settings?.tasks
-  const manualTokenConfigured = settings?.env.PODUP_MANUAL_TOKEN_configured === true
+
 
   return (
     <div className="space-y-6">
@@ -94,11 +93,6 @@ export default function SettingsPage() {
                   secret
                 />
                 <EnvRow
-                  name="PODUP_MANUAL_TOKEN"
-                  configured={settings?.env.PODUP_MANUAL_TOKEN_configured}
-                  secret
-                />
-                <EnvRow
                   name="PODUP_GH_WEBHOOK_SECRET"
                   configured={settings?.env.PODUP_GH_WEBHOOK_SECRET_configured}
                   secret
@@ -106,11 +100,6 @@ export default function SettingsPage() {
               </tbody>
             </table>
           </div>
-          {manualTokenConfigured && (
-            <p className="mt-2 text-xs text-warning">
-              Manual API 受 Manual token 保护，请在控制台右上角输入该 token 后再使用 Manual 页。
-            </p>
-          )}
         </div>
       </section>
 
@@ -269,9 +258,8 @@ function EnvRow({ name, value, configured, secret }: EnvRowProps) {
       <td className="font-mono text-xs">{name}</td>
       <td>
         <span
-          className={`badge badge-xs ${
-            isConfigured ? 'badge-success' : 'badge-warning'
-          }`}
+          className={`badge badge-xs ${isConfigured ? 'badge-success' : 'badge-warning'
+            }`}
         >
           {isConfigured ? 'configured' : 'missing'}
         </span>

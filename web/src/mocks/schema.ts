@@ -20,7 +20,6 @@ export const settingsSchema = z
       .object({
         PODUP_STATE_DIR: z.string().optional(),
         PODUP_TOKEN_configured: z.boolean().optional(),
-        PODUP_MANUAL_TOKEN_configured: z.boolean().optional(),
         PODUP_GH_WEBHOOK_SECRET_configured: z.boolean().optional(),
       })
       .passthrough(),

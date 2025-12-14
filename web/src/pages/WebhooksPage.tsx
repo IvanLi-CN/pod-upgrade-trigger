@@ -62,45 +62,45 @@ export default function WebhooksPage() {
     let cancelled = false
     const pause = () => new Promise((resolve) => setTimeout(resolve, 120))
 
-    ;(async () => {
-      try {
-        const data = await getJson<WebhooksStatusResponse>('/api/webhooks/status')
-        if (!cancelled) {
-          await pause()
-          setStatus(data)
+      ; (async () => {
+        try {
+          const data = await getJson<WebhooksStatusResponse>('/api/webhooks/status')
+          if (!cancelled) {
+            await pause()
+            setStatus(data)
+          }
+        } catch (err) {
+          console.error('Failed to load webhook status', err)
         }
-      } catch (err) {
-        console.error('Failed to load webhook status', err)
-      }
-    })()
+      })()
 
-    ;(async () => {
-      try {
-        const data = await getJson<ImageLocksResponse>('/api/image-locks')
-        if (!cancelled && Array.isArray(data.locks)) {
-          setLocks(data.locks)
+      ; (async () => {
+        try {
+          const data = await getJson<ImageLocksResponse>('/api/image-locks')
+          if (!cancelled && Array.isArray(data.locks)) {
+            setLocks(data.locks)
+          }
+        } catch (err) {
+          console.error('Failed to load image locks', err)
         }
-      } catch (err) {
-        console.error('Failed to load image locks', err)
-      }
-    })()
+      })()
 
-    ;(async () => {
-      try {
-        const cfg = await getJson<ConfigResponse>('/api/config')
-        if (!cancelled) {
-          await pause()
-          setConfig(cfg)
-          setConfigLoaded(true)
+      ; (async () => {
+        try {
+          const cfg = await getJson<ConfigResponse>('/api/config')
+          if (!cancelled) {
+            await pause()
+            setConfig(cfg)
+            setConfigLoaded(true)
+          }
+        } catch (err) {
+          console.error('Failed to load config for webhooks', err)
+          // fall back to window.location.origin in render
+          if (!cancelled) {
+            setConfigLoaded(true)
+          }
         }
-      } catch (err) {
-        console.error('Failed to load config for webhooks', err)
-        // fall back to window.location.origin in render
-        if (!cancelled) {
-          setConfigLoaded(true)
-        }
-      }
-    })()
+      })()
 
     return () => {
       cancelled = true
@@ -133,7 +133,10 @@ export default function WebhooksPage() {
       }
       const response = await getJson<ReleaseResponse>(
         `/api/image-locks/${encodeURIComponent(bucket)}`,
-        { method: 'DELETE' },
+        {
+          method: 'DELETE',
+          headers: { 'X-Podup-CSRF': '1' },
+        },
       )
 
       if (!response.removed) {
@@ -206,9 +209,8 @@ export default function WebhooksPage() {
               GitHub Webhooks
             </h2>
             <span
-              className={`badge badge-sm ${
-                isSecretOk ? 'badge-success' : 'badge-warning'
-              }`}
+              className={`badge badge-sm ${isSecretOk ? 'badge-success' : 'badge-warning'
+                }`}
             >
               secret {isSecretOk ? 'configured' : 'missing'}
             </span>
@@ -222,78 +224,77 @@ export default function WebhooksPage() {
                 const fullWebhookUrl = buildWebhookUrl(unit)
                 const disabled = !configLoaded
                 return (
-                <div
-                  key={unit.slug}
-                  className="flex flex-col gap-2 rounded-lg border border-base-200 bg-base-100 px-3 py-2 text-xs md:flex-row md:items-center"
-                >
-                  <div className="flex min-w-0 flex-1 flex-col gap-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-semibold">{unit.unit}</span>
-                      <span className="badge badge-ghost badge-xs">{unit.slug}</span>
-                      <span
-                        className={`badge badge-xs ${
-                          unit.hmac_ok ? 'badge-success' : 'badge-error'
-                        }`}
-                      >
-                        HMAC {unit.hmac_ok ? 'OK' : 'Error'}
-                      </span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-1 text-[10px]">
-                      <span className="badge badge-outline badge-xs gap-1">
-                        <Icon icon="mdi:webhook" />
-                        {fullWebhookUrl}
-                      </span>
-                      <span className="badge badge-outline badge-xs gap-1">
-                        <Icon icon="mdi:refresh" />
-                        {unit.redeploy_url}
-                      </span>
-                      {unit.expected_image && (
+                  <div
+                    key={unit.slug}
+                    className="flex flex-col gap-2 rounded-lg border border-base-200 bg-base-100 px-3 py-2 text-xs md:flex-row md:items-center"
+                  >
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold">{unit.unit}</span>
+                        <span className="badge badge-ghost badge-xs">{unit.slug}</span>
+                        <span
+                          className={`badge badge-xs ${unit.hmac_ok ? 'badge-success' : 'badge-error'
+                            }`}
+                        >
+                          HMAC {unit.hmac_ok ? 'OK' : 'Error'}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1 text-[10px]">
                         <span className="badge badge-outline badge-xs gap-1">
-                          <Icon icon="mdi:docker" />
-                          {unit.expected_image}
+                          <Icon icon="mdi:webhook" />
+                          {fullWebhookUrl}
                         </span>
-                      )}
+                        <span className="badge badge-outline badge-xs gap-1">
+                          <Icon icon="mdi:refresh" />
+                          {unit.redeploy_url}
+                        </span>
+                        {unit.expected_image && (
+                          <span className="badge badge-outline badge-xs gap-1">
+                            <Icon icon="mdi:docker" />
+                            {unit.expected_image}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-base-content/70">
+                        <span>last · {formatTs(unit.last_ts ?? null)}</span>
+                        <span>success · {formatTs(unit.last_success_ts ?? null)}</span>
+                        <span>failure · {formatTs(unit.last_failure_ts ?? null)}</span>
+                        {!unit.hmac_ok && unit.hmac_last_error && (
+                          <span className="text-error">
+                            hmac · {unit.hmac_last_error}
+                          </span>
+                        )}
+                      </div>
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-base-content/70">
-                      <span>last · {formatTs(unit.last_ts ?? null)}</span>
-                      <span>success · {formatTs(unit.last_success_ts ?? null)}</span>
-                      <span>failure · {formatTs(unit.last_failure_ts ?? null)}</span>
-                      {!unit.hmac_ok && unit.hmac_last_error && (
-                        <span className="text-error">
-                          hmac · {unit.hmac_last_error}
-                        </span>
-                      )}
+                    <div className="flex items-center gap-2 md:flex-col md:items-end">
+                      <button
+                        type="button"
+                        className="btn btn-xs btn-outline"
+                        onClick={() => handleCopy(fullWebhookUrl)}
+                        disabled={disabled}
+                      >
+                        <Icon icon="mdi:content-copy" className="text-lg" />
+                        复制 URL
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-xs btn-ghost gap-1"
+                        onClick={() => openEventsForUnit(unit)}
+                        disabled={disabled}
+                      >
+                        <Icon icon="mdi:open-in-new" className="text-lg" />
+                        查看事件
+                      </button>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 md:flex-col md:items-end">
-                    <button
-                      type="button"
-                      className="btn btn-xs btn-outline"
-                      onClick={() => handleCopy(fullWebhookUrl)}
-                      disabled={disabled}
-                    >
-                      <Icon icon="mdi:content-copy" className="text-lg" />
-                      复制 URL
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-xs btn-ghost gap-1"
-                      onClick={() => openEventsForUnit(unit)}
-                      disabled={disabled}
-                    >
-                      <Icon icon="mdi:open-in-new" className="text-lg" />
-                      查看事件
-                    </button>
-                  </div>
-                </div>
                 )
               })
-          ) : (
-            <p className="text-xs text-base-content/60">
+            ) : (
+              <p className="text-xs text-base-content/60">
                 未检测到任何 GitHub webhook 单元。请检查 PODUP_MANUAL_UNITS 和 systemd
                 配置。
-            </p>
-          )}
+              </p>
+            )}
           </div>
         </div>
       </section>

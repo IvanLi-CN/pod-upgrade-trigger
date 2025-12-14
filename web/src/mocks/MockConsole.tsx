@@ -8,7 +8,7 @@ const profiles: MockProfile[] = [
   'empty-state',
   'rate-limit-hot',
   'auth-error',
-  'manual-token',
+
   'degraded',
 ]
 

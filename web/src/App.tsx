@@ -10,13 +10,11 @@ import TasksPage from './pages/TasksPage'
 import UnauthorizedPage from './pages/UnauthorizedPage'
 import { ApiProvider, useApi } from './hooks/useApi'
 import { ToastProvider, ToastViewport } from './components/Toast'
-import { TokenProvider, useToken } from './hooks/useToken'
 import MockConsole from './mocks/MockConsole'
 import { useVersionCheck } from './hooks/useVersionCheck'
 
 function TopStatusBar() {
   const { health, scheduler, sseStatus, now } = useAppStatus()
-  const { token, setToken } = useToken()
   const version = useVersionCheck()
 
   const latestTag = version.latest?.releaseTag
@@ -61,22 +59,7 @@ function TopStatusBar() {
         </div>
       </div>
       <div className="navbar-end gap-2 px-4">
-        <form
-          className="flex items-center gap-2"
-          onSubmit={(event) => {
-            event.preventDefault()
-          }}
-        >
-          <label className="input input-sm input-bordered flex items-center gap-2 w-44">
-            <Icon icon="mdi:key-variant" className="text-lg text-base-content/60" />
-            <input
-              className="min-w-0 flex-1 bg-transparent text-base"
-              placeholder="Manual token"
-              value={token ?? ''}
-              onChange={(event) => setToken(event.target.value || null)}
-            />
-          </label>
-        </form>
+
         <span className="hidden text-base text-base-content/70 sm:inline">
           {now.toLocaleTimeString()}
         </span>
@@ -191,11 +174,9 @@ export default function App({ mockEnabled = false }: AppProps) {
   return (
     <BrowserRouter>
       <ToastProvider>
-        <TokenProvider>
-          <ApiProvider>
-            <Layout />
-          </ApiProvider>
-        </TokenProvider>
+        <ApiProvider>
+          <Layout />
+        </ApiProvider>
       </ToastProvider>
       {mockEnabled ? <MockConsole /> : null}
     </BrowserRouter>
