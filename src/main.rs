@@ -75,7 +75,6 @@ const ENV_SELF_UPDATE_DRY_RUN: &str = "PODUP_SELF_UPDATE_DRY_RUN";
 const ENV_STATE_DIR: &str = "PODUP_STATE_DIR";
 const ENV_DB_URL: &str = "PODUP_DB_URL";
 const ENV_TOKEN: &str = "PODUP_TOKEN";
-const ENV_MANUAL_TOKEN: &str = "PODUP_MANUAL_TOKEN";
 const ENV_GH_WEBHOOK_SECRET: &str = "PODUP_GH_WEBHOOK_SECRET";
 const ENV_HTTP_ADDR: &str = "PODUP_HTTP_ADDR";
 const ENV_PUBLIC_BASE_URL: &str = "PODUP_PUBLIC_BASE_URL";
@@ -239,7 +238,7 @@ impl ForwardAuthConfig {
     }
 
     fn open_mode(&self) -> bool {
-        self.dev_open_admin || self.header_name.is_none() || self.admin_value.is_none()
+        self.dev_open_admin
     }
 }
 
@@ -257,11 +256,11 @@ fn is_admin_request(ctx: &RequestContext) -> bool {
 
     let header = match &cfg.header_name {
         Some(name) => name,
-        None => return true,
+        None => return false,
     };
     let expected = match &cfg.admin_value {
         Some(value) => value,
-        None => return true,
+        None => return false,
     };
 
     match ctx.headers.get(header) {
@@ -381,6 +380,23 @@ fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
         return Ok(true);
     }
 
+    if cfg.header_name.is_none() || cfg.admin_value.is_none() {
+        respond_text(
+            ctx,
+            500,
+            "InternalServerError",
+            "forward auth not configured",
+            action,
+            Some(json!({
+                "reason": "forward-auth-not-configured",
+                "required": [ENV_FWD_AUTH_HEADER, ENV_FWD_AUTH_ADMIN_VALUE],
+                "header": cfg.header_name,
+                "admin_value_configured": cfg.admin_value.is_some(),
+            })),
+        )?;
+        return Ok(false);
+    }
+
     if is_admin_request(ctx) {
         return Ok(true);
     }
@@ -397,6 +413,64 @@ fn ensure_admin(ctx: &RequestContext, action: &str) -> Result<bool, String> {
         })),
     )?;
     Ok(false)
+}
+
+fn ensure_csrf(ctx: &RequestContext, action: &str) -> Result<bool, String> {
+    let method = ctx.method.as_str();
+    let is_side_effect = matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
+    if !is_side_effect {
+        return Ok(true);
+    }
+
+    let csrf_value = ctx
+        .headers
+        .get("x-podup-csrf")
+        .map(|v| v.trim())
+        .unwrap_or("");
+    if csrf_value != "1" {
+        respond_text(
+            ctx,
+            403,
+            "Forbidden",
+            "forbidden",
+            action,
+            Some(json!({
+                "reason": "csrf",
+                "header": "x-podup-csrf",
+                "expected": "1",
+            })),
+        )?;
+        return Ok(false);
+    }
+
+    // For JSON endpoints that parse request bodies, enforce Content-Type.
+    if !ctx.body.is_empty() && matches!(method, "POST" | "PUT" | "PATCH") {
+        let content_type = ctx
+            .headers
+            .get("content-type")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        if !content_type
+            .to_ascii_lowercase()
+            .starts_with("application/json")
+        {
+            respond_text(
+                ctx,
+                403,
+                "Forbidden",
+                "forbidden",
+                action,
+                Some(json!({
+                    "reason": "content-type",
+                    "expected_prefix": "application/json",
+                    "content_type": content_type,
+                })),
+            )?;
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn ensure_infra_ready(ctx: &RequestContext, action: &str) -> Result<bool, String> {
@@ -1830,10 +1904,6 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
         .ok()
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
-    let manual_token_configured = env::var(ENV_MANUAL_TOKEN)
-        .ok()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
     let github_secret_configured = env::var(ENV_GH_WEBHOOK_SECRET)
         .ok()
         .map(|v| !v.trim().is_empty())
@@ -1882,7 +1952,13 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
     let db_health = db_status();
 
     let cfg = forward_auth_config();
-    let forward_mode = if cfg.open_mode() { "open" } else { "protected" };
+    let forward_mode = if cfg.open_mode() {
+        "open"
+    } else if cfg.header_name.is_some() && cfg.admin_value.is_some() {
+        "protected"
+    } else {
+        "misconfigured"
+    };
 
     let build_timestamp = option_env!("PODUP_BUILD_TIMESTAMP").map(|s| s.to_string());
     let current = current_version();
@@ -1912,7 +1988,6 @@ fn handle_settings_api(ctx: &RequestContext) -> Result<(), String> {
         "env": {
             "PODUP_STATE_DIR": state_dir,
             "PODUP_TOKEN_configured": webhook_token_configured,
-            "PODUP_MANUAL_TOKEN_configured": manual_token_configured,
             "PODUP_GH_WEBHOOK_SECRET_configured": github_secret_configured,
         },
         "scheduler": {
@@ -2541,6 +2616,10 @@ fn handle_tasks_create(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
+    if !ensure_csrf(ctx, "tasks-create-api")? {
+        return Ok(());
+    }
+
     let request: CreateTaskRequest = match parse_json_body(ctx) {
         Ok(body) => body,
         Err(err) => {
@@ -2826,6 +2905,10 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
             "tasks-stop-api",
             Some(json!({ "reason": "method" })),
         )?;
+        return Ok(());
+    }
+
+    if !ensure_csrf(ctx, "tasks-stop-api")? {
         return Ok(());
     }
 
@@ -3339,6 +3422,10 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
             "tasks-force-stop-api",
             Some(json!({ "reason": "method" })),
         )?;
+        return Ok(());
+    }
+
+    if !ensure_csrf(ctx, "tasks-force-stop-api")? {
         return Ok(());
     }
 
@@ -3858,6 +3945,10 @@ fn handle_task_retry(ctx: &RequestContext, task_id: &str) -> Result<(), String> 
         return Ok(());
     }
 
+    if !ensure_csrf(ctx, "tasks-retry-api")? {
+        return Ok(());
+    }
+
     let task_id_owned = task_id.to_string();
     let now = current_unix_secs() as i64;
 
@@ -4195,17 +4286,8 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
     Ok(body)
 }
 
-fn extract_query_token(query: &str) -> Option<String> {
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        if key == "token" {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
 fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
-    if ctx.method != "GET" && ctx.method != "POST" {
+    if ctx.method != "POST" {
         let redacted = redact_token(&ctx.raw_request);
         log_message(&format!("405 method-not-allowed {}", redacted));
         respond_text(
@@ -4219,27 +4301,15 @@ fn handle_manual_request(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
-    let redacted_line = redact_token(&ctx.raw_request);
-
-    let token = ctx
-        .query
-        .as_deref()
-        .and_then(extract_query_token)
-        .unwrap_or_default();
-
-    let expected = env::var(ENV_TOKEN).unwrap_or_default();
-    if expected.is_empty() || token.is_empty() || token != expected {
-        log_message(&format!("401 {}", redacted_line));
-        respond_text(
-            ctx,
-            401,
-            "Unauthorized",
-            "unauthorized",
-            "manual-auto-update",
-            Some(json!({ "reason": "token" })),
-        )?;
+    if !ensure_admin(ctx, "manual-auto-update")? {
         return Ok(());
     }
+
+    if !ensure_csrf(ctx, "manual-auto-update")? {
+        return Ok(());
+    }
+
+    let redacted_line = redact_token(&ctx.raw_request);
 
     if !enforce_rate_limit(ctx, &redacted_line)? {
         return Ok(());
@@ -4443,6 +4513,13 @@ fn parse_manual_update_image(default_image: &str) -> Result<ParsedManualUpdateIm
 }
 
 fn handle_manual_auto_update_run(ctx: &RequestContext) -> Result<(), String> {
+    if !ensure_admin(ctx, "manual-auto-update-run")? {
+        return Ok(());
+    }
+    if !ensure_csrf(ctx, "manual-auto-update-run")? {
+        return Ok(());
+    }
+
     let request: ManualAutoUpdateRunRequest = match parse_json_body(ctx) {
         Ok(body) => body,
         Err(err) => {
@@ -4457,24 +4534,6 @@ fn handle_manual_auto_update_run(ctx: &RequestContext) -> Result<(), String> {
             return Ok(());
         }
     };
-
-    let expected = manual_api_token();
-    let profile = env::var("PODUP_ENV")
-        .unwrap_or_else(|_| "dev".to_string())
-        .to_ascii_lowercase();
-    let is_dev_like = matches!(profile.as_str(), "dev" | "development" | "demo");
-    let require_token = !is_dev_like && !expected.is_empty();
-    if require_token && request.token.as_deref().unwrap_or_default() != expected {
-        respond_text(
-            ctx,
-            401,
-            "Unauthorized",
-            "unauthorized",
-            "manual-auto-update-run",
-            Some(json!({ "reason": "token" })),
-        )?;
-        return Ok(());
-    }
 
     let unit = manual_auto_update_unit();
 
@@ -4886,6 +4945,13 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
 }
 
 fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
+    if !ensure_admin(ctx, "manual-trigger")? {
+        return Ok(());
+    }
+    if !ensure_csrf(ctx, "manual-trigger")? {
+        return Ok(());
+    }
+
     let request: ManualTriggerRequest = match parse_json_body(ctx) {
         Ok(body) => body,
         Err(err) => {
@@ -4900,24 +4966,6 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
             return Ok(());
         }
     };
-
-    let expected = manual_api_token();
-    let profile = env::var("PODUP_ENV")
-        .unwrap_or_else(|_| "dev".to_string())
-        .to_ascii_lowercase();
-    let is_dev_like = matches!(profile.as_str(), "dev" | "development" | "demo");
-    let require_token = !is_dev_like && !expected.is_empty();
-    if require_token && request.token.as_deref().unwrap_or_default() != expected {
-        respond_text(
-            ctx,
-            401,
-            "Unauthorized",
-            "unauthorized",
-            "manual-trigger",
-            Some(json!({ "reason": "token" })),
-        )?;
-        return Ok(());
-    }
 
     let mut units: Vec<String> = if request.all || request.units.is_empty() {
         manual_unit_list()
@@ -5054,6 +5102,13 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
 }
 
 fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String> {
+    if !ensure_admin(ctx, "manual-service")? {
+        return Ok(());
+    }
+    if !ensure_csrf(ctx, "manual-service")? {
+        return Ok(());
+    }
+
     let trimmed = slug.trim_matches('/');
     if trimmed.is_empty() {
         respond_text(
@@ -5094,24 +5149,6 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
             return Ok(());
         }
     };
-
-    let expected = manual_api_token();
-    let profile = env::var("PODUP_ENV")
-        .unwrap_or_else(|_| "dev".to_string())
-        .to_ascii_lowercase();
-    let is_dev_like = matches!(profile.as_str(), "dev" | "development" | "demo");
-    let require_token = !is_dev_like && !expected.is_empty();
-    if require_token && request.token.as_deref().unwrap_or_default() != expected {
-        respond_text(
-            ctx,
-            401,
-            "Unauthorized",
-            "unauthorized",
-            "manual-service",
-            Some(json!({ "reason": "token", "unit": unit })),
-        )?;
-        return Ok(());
-    }
 
     let dry_run = request.dry_run;
     let mut result: UnitActionResult;
@@ -5238,7 +5275,6 @@ fn parse_json_body<T: DeserializeOwned>(ctx: &RequestContext) -> Result<T, Strin
 
 #[derive(Debug, Deserialize)]
 struct ManualTriggerRequest {
-    token: Option<String>,
     #[serde(default)]
     all: bool,
     #[serde(default)]
@@ -5251,7 +5287,6 @@ struct ManualTriggerRequest {
 
 #[derive(Debug, Deserialize)]
 struct ManualAutoUpdateRunRequest {
-    token: Option<String>,
     #[serde(default)]
     dry_run: bool,
     caller: Option<String>,
@@ -5272,7 +5307,6 @@ struct DiscoveryStats {
 
 #[derive(Debug, Deserialize)]
 struct ServiceTriggerRequest {
-    token: Option<String>,
     #[serde(default)]
     dry_run: bool,
     caller: Option<String>,
@@ -6950,13 +6984,6 @@ fn run_task_by_id(task_id: &str) -> Result<(), String> {
     }
 }
 
-fn manual_api_token() -> String {
-    env::var(ENV_MANUAL_TOKEN)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| env::var(ENV_TOKEN).unwrap_or_default())
-}
-
 fn container_systemd_dir() -> PathBuf {
     if let Ok(raw) = env::var(ENV_CONTAINER_DIR) {
         let trimmed = raw.trim();
@@ -8044,6 +8071,10 @@ fn handle_image_locks_api(ctx: &RequestContext) -> Result<(), String> {
     }
 
     if ctx.method == "DELETE" {
+        if !ensure_csrf(ctx, "image-locks-api")? {
+            return Ok(());
+        }
+
         let Some(rest) = ctx.path.strip_prefix("/api/image-locks/") else {
             respond_text(
                 ctx,
@@ -8130,6 +8161,10 @@ fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
     }
 
     if !ensure_admin(ctx, "prune-state-api")? {
+        return Ok(());
+    }
+
+    if !ensure_csrf(ctx, "prune-state-api")? {
         return Ok(());
     }
 
@@ -12422,7 +12457,7 @@ mod tests {
             method: "POST".to_string(),
             path: format!("/api/tasks/{task_id}/stop"),
             query: None,
-            headers: HashMap::new(),
+            headers: HashMap::from([("x-podup-csrf".to_string(), "1".to_string())]),
             body: Vec::new(),
             raw_request: String::new(),
             request_id: "req-test-stop".to_string(),
