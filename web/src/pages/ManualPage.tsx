@@ -16,17 +16,10 @@ import type {
 import { isCommandMeta } from '../domain/tasks'
 import { AutoUpdateWarningsBlock } from '../components/AutoUpdateWarningsBlock'
 import { TaskLogMetaDetails } from '../components/TaskLogMetaDetails'
-import { ManualUpdateBadge, type ManualServiceUpdate } from '../components/ManualUpdateBadge'
+import { ManualServicesCard } from '../components/manual/ManualServicesCard'
+import type { ManualServiceRowService } from '../components/manual/ManualServiceRow'
 
-type ManualService = {
-  slug: string
-  unit: string
-  display_name: string
-  default_image?: string | null
-  github_path?: string
-  is_auto_update?: boolean
-  update?: ManualServiceUpdate | null
-}
+type ManualService = ManualServiceRowService
 
 type ManualServicesResponse = {
   services: ManualService[]
@@ -344,41 +337,12 @@ export default function ManualPage() {
         </form>
       </section>
 
-      <section className="card bg-base-100 shadow">
-        <div className="card-body gap-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
-              按单元触发
-            </h2>
-            <div className="flex items-center gap-3">
-              <button
-                type="button"
-                className="btn btn-xs"
-                onClick={handleRefresh}
-                disabled={refreshing}
-              >
-                <Icon icon="mdi:refresh" className={refreshing ? 'animate-spin' : ''} />
-                刷新更新状态
-              </button>
-              <span className="hidden text-[11px] text-base-content/60 sm:inline">
-                来自 GET /api/manual/services
-              </span>
-            </div>
-          </div>
-          <div className="space-y-3">
-            {services.length === 0 && (
-              <p className="text-xs text-base-content/60">暂无可触发的 systemd 单元。</p>
-            )}
-            {services.map((service) => (
-              <ServiceRow
-                key={service.slug}
-                service={service}
-                onTrigger={handleTriggerService}
-              />
-            ))}
-          </div>
-        </div>
-      </section>
+      <ManualServicesCard
+        services={services}
+        refreshing={refreshing}
+        onRefresh={handleRefresh}
+        onTrigger={handleTriggerService}
+      />
 
       <section className="card bg-base-100 shadow">
         <div className="card-body gap-3">
@@ -424,97 +388,6 @@ export default function ManualPage() {
         />
       ) : null}
     </div>
-  )
-}
-
-type ServiceRowProps = {
-  service: ManualService
-  onTrigger: (
-    service: ManualService,
-    params: { dryRun: boolean; image?: string; caller?: string; reason?: string },
-  ) => void | Promise<void>
-}
-
-function ServiceRow({ service, onTrigger }: ServiceRowProps) {
-  const [image, setImage] = useState(service.default_image ?? '')
-  const [caller, setCaller] = useState('')
-  const [reason, setReason] = useState('')
-  const [dryRun, setDryRun] = useState(false)
-  const [pending, setPending] = useState(false)
-
-  const handleSubmit = async (event: FormEvent) => {
-    event.preventDefault()
-    setPending(true)
-    try {
-      await onTrigger(service, {
-        dryRun,
-        image: image.trim() || undefined,
-        caller,
-        reason,
-      })
-    } finally {
-      setPending(false)
-    }
-  }
-
-  return (
-    <form
-      className="flex flex-col gap-2 rounded-lg border border-base-200 bg-base-100 px-3 py-2 text-xs md:flex-row md:items-center"
-      onSubmit={handleSubmit}
-    >
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
-        <div className="flex items-center gap-2">
-          <span className="font-semibold">{service.display_name}</span>
-          <span className="badge badge-ghost badge-xs">{service.unit}</span>
-          <ManualUpdateBadge update={service.update} />
-        </div>
-        <div className="grid gap-2 md:grid-cols-3">
-          <input
-            className="input input-xs input-bordered"
-            placeholder={service.default_image ? 'override image' : 'image (optional)'}
-            value={image}
-            onChange={(event) => setImage(event.target.value)}
-          />
-          <input
-            className="input input-xs input-bordered"
-            placeholder="caller"
-            value={caller}
-            onChange={(event) => setCaller(event.target.value)}
-          />
-          <input
-            className="input input-xs input-bordered"
-            placeholder="reason"
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-          />
-        </div>
-        {service.github_path && (
-          <div className="mt-1 flex items-center gap-1 text-[10px] text-base-content/60">
-            <Icon icon="mdi:github" />
-            <span>{service.github_path}</span>
-          </div>
-        )}
-      </div>
-      <div className="flex items-center gap-2 md:flex-col md:items-end">
-        <label className="flex cursor-pointer items-center gap-1 text-[11px]">
-          <span>Dry</span>
-          <input
-            type="checkbox"
-            className="toggle toggle-xs"
-            checked={dryRun}
-            onChange={(event) => setDryRun(event.target.checked)}
-          />
-        </label>
-        <button
-          type="submit"
-          className="btn btn-primary btn-xs"
-          disabled={pending}
-        >
-          <Icon icon="mdi:play" className="text-lg" />
-          触发
-        </button>
-      </div>
-    </form>
   )
 }
 
