@@ -51,15 +51,13 @@ To try the built-in web UI locally:
 3. Start the HTTP server with a local state dir and dev-friendly auth:
    ```bash
    PODUP_STATE_DIR="$PWD" \
-   PODUP_TOKEN="dev-token" \
-   PODUP_MANUAL_TOKEN="dev-token" \
    PODUP_DEV_OPEN_ADMIN="1" \
    PODUP_HTTP_ADDR="127.0.0.1:25111" \
    target/debug/pod-upgrade-trigger http-server
    ```
 
-Then open `http://127.0.0.1:25111/` in your browser. In the top status bar,
-enter `dev-token` as the manual token to access admin-only APIs via the UI.
+Then open `http://127.0.0.1:25111/` in your browser. With `PODUP_DEV_OPEN_ADMIN=1`,
+all admin APIs are open for local development.
 The binary automatically serves UI assets in this order: `${PODUP_STATE_DIR}/web/dist` → `$CWD/web/dist` → the embedded bundle packaged in the release binary. No Web UI override environment variable is supported. Routes like `/`, `/events`, `/tasks`, and `/settings` will render from whichever source is found first; removing the on-disk bundle falls back to the embedded UI.
 
 ### Release build with embedded Web UI
@@ -80,22 +78,43 @@ Host systemd deployments only need the release binary plus env files; `/` will r
 
 ## ForwardAuth and dev mode
 
-The service can optionally protect admin-only APIs (Events, Manual, Webhooks)
-using a ForwardAuth-style header:
+The service can optionally protect admin-only APIs (primarily `/api/*`, plus legacy
+side-effect routes like `/auto-update`) using a ForwardAuth-style header.
+Incoming GitHub webhook endpoints under `/github-package-update/*` are **not**
+covered by ForwardAuth/CSRF; they only validate GitHub HMAC signatures via
+`PODUP_GH_WEBHOOK_SECRET`.
 
 - In production:
-  - Set `FORWARD_AUTH_HEADER`, e.g. `X-Forwarded-User`;
-  - Set `FORWARD_AUTH_ADMIN_VALUE` to the value that identifies an admin user;
-  - Optionally configure `FORWARD_AUTH_NICKNAME_HEADER` and `ADMIN_MODE_NAME`.
-  - Do **not** set `DEV_OPEN_ADMIN`.
+  - Set `PODUP_FWD_AUTH_HEADER`, e.g. `X-Forwarded-User`;
+  - Set `PODUP_FWD_AUTH_ADMIN_VALUE` to the value that identifies an admin user;
+  - Optionally configure `PODUP_FWD_AUTH_NICKNAME_HEADER` and `PODUP_ADMIN_MODE_NAME`.
+  - Do **not** set `PODUP_DEV_OPEN_ADMIN`.
 - In development:
-  - Either leave `FORWARD_AUTH_HEADER` / `FORWARD_AUTH_ADMIN_VALUE` unset, **or**
-  - Set `DEV_OPEN_ADMIN=1` to completely bypass ForwardAuth checks and treat all
-    requests as admin.
+  - Either leave `PODUP_FWD_AUTH_HEADER` / `PODUP_FWD_AUTH_ADMIN_VALUE` unset, **or**
+  - Set `PODUP_DEV_OPEN_ADMIN=1` to completely bypass ForwardAuth checks and treat
+    all requests as admin.
 
-If `FORWARD_AUTH_HEADER` and `FORWARD_AUTH_ADMIN_VALUE` are set but `DEV_OPEN_ADMIN`
-is not, missing/incorrect auth headers will cause `401 Unauthorized` on admin APIs
-and the UI will route to `/401`.
+If `PODUP_FWD_AUTH_HEADER` and `PODUP_FWD_AUTH_ADMIN_VALUE` are set but
+`PODUP_DEV_OPEN_ADMIN` is not, missing/incorrect auth headers will cause
+`401 Unauthorized` on admin APIs and the UI will route to `/401`.
+
+### CSRF header requirement for side-effect admin APIs
+
+For admin APIs that **produce side effects** (`POST`/`PUT`/`PATCH`/`DELETE`), callers
+must include `x-podup-csrf: 1`.
+
+If you send a JSON body, also ensure `Content-Type: application/json...` (prefix
+match). The Web UI automatically includes these headers; `curl`/CLI callers must
+add them explicitly.
+
+Example:
+
+```bash
+curl -X POST "http://127.0.0.1:25111/api/manual/trigger" \
+  -H 'Content-Type: application/json' \
+  -H 'x-podup-csrf: 1' \
+  -d '{"all":true,"dry_run":false,"caller":"ci","reason":"nightly"}'
+```
 
 ### 结构化事件记录
 
@@ -114,10 +133,10 @@ and the UI will route to `/401`.
   restarts the listed services immediately.
 - `pod-upgrade-trigger trigger-all --dry-run` shows which units would be touched
   without contacting systemd.
-- HTTP callers can use `POST /api/manual/trigger` with a JSON payload:
+- HTTP callers can use `POST /api/manual/trigger` with a JSON payload (remember the
+  `x-podup-csrf: 1` header for `POST`):
   ```json
   {
-    "token": "...",
     "all": true,
     "dry_run": false,
     "caller": "ci",

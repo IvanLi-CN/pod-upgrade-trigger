@@ -4,7 +4,7 @@
 
 ## 导航结构
 
-- 顶部状态条：常驻 Token 输入/刷新、健康状态(`/health`)、调度器 interval/迭代次数、系统时间；全局可见。
+- 顶部状态条：常驻健康状态(`/health`)、调度器 interval/迭代次数、系统时间；全局可见。
 - 左侧导航：
   - `/` Dashboard
   - `/manual` 手动触发控制台
@@ -27,14 +27,14 @@
 
 - “触发全部”表单：映射 `POST /api/manual/trigger`，字段 `all/dry_run/caller/reason`；提交后在下方历史卡片展示请求与响应。
 - “按单元触发”列表：通过新 `GET /api/manual/services` 拉取 slug；每行含输入 `image/caller/reason` 与触发按钮（`/api/manual/services/<slug>`）。
-- “传统 Token 触发”模块：包装 `/auto-update`，用于兼容旧流程。
+- “传统 /auto-update 触发”模块：用于兼容旧流程（不再依赖 token 鉴权）；该入口属于 admin side-effect API，受 ForwardAuth + CSRF 约束。
 - 历史记录：保留最近触发记录，点击项跳转到 `/events?request_id=...`。
 
 ### `/webhooks` GitHub Webhook 面板
 
 - 单元卡片：展示 `/github-package-update/<unit>` 与 `/github-package-update/<unit>/redeploy` URL、最近成功/失败时间、HMAC 校验状态（需 `GET /api/webhooks/status`）。
 - 镜像速率与锁：读取 `image_locks`，列出被锁镜像、预计解锁倒计时，提供“释放”操作（对应新 `DELETE /api/image-locks/<name>`）。
-- GitHub 配置提示：显示 `PODUP_GH_WEBHOOK_SECRET` 是否配置（true/false），链接到文档。
+- GitHub 配置提示：显示 `PODUP_GH_WEBHOOK_SECRET` 是否配置（true/false），链接到文档；并明确 `/github-package-update/*` 仅做 GitHub HMAC 校验，不受 ForwardAuth/CSRF 影响。
 
 ### `/events` 事件与审计
 
@@ -52,10 +52,10 @@
 
 ### `/settings` 配置总览
 
-- 环境变量展示（只读值/布尔）：`PODUP_STATE_DIR`、`PODUP_TOKEN/PODUP_MANUAL_TOKEN` 已配置与否、`PODUP_GH_WEBHOOK_SECRET` 配置状态、调度器 interval/max-iterations。
+- 环境变量展示（只读值/布尔）：`PODUP_STATE_DIR`、`PODUP_GH_WEBHOOK_SECRET` 配置状态、（可选）`PODUP_TOKEN` configured 状态（仅用于兼容/状态展示，不参与鉴权）、调度器 interval/max-iterations。
 - systemd 单元表：列出 `podman-auto-update.service` 与各业务 unit 名称，标记是否在 `trigger_unints`（sic）可见列表；跳转到 `/manual` 的对应单元操作。
 - API 基础信息：显示后端版本、构建时间、当前数据库连接串；链接到 `/events`。
-- ForwardAuth 信息：显示 `FORWARD_AUTH_HEADER`、`FORWARD_AUTH_ADMIN_VALUE`、`FORWARD_AUTH_NICKNAME_HEADER`、`ADMIN_MODE_NAME` 是否配置，便于排查登录问题；仅在生产模式展示。
+- ForwardAuth 信息：显示 `PODUP_FWD_AUTH_HEADER`、`PODUP_FWD_AUTH_ADMIN_VALUE`、`PODUP_FWD_AUTH_NICKNAME_HEADER`、`PODUP_ADMIN_MODE_NAME` 是否配置，便于排查登录问题；仅在生产模式展示。
 
 ### `/401` 未授权页
 
@@ -73,7 +73,7 @@
 - 维护页的下载/清理操作完成后，通过全局 toast 提示并保留在当前页；必要时自动刷新状态卡片。
 - 登录态跳转：
   - 开发/测试环境：不校验登录，直接进入目标路由。
-  - 生产环境：每次请求若缺少 ForwardAuth 头或值不满足管理员规则，则展示 `/401`，但 URL 立刻 `replaceState` 回原目标，用户刷新后仍留在原地址；当请求头满足 `FORWARD_AUTH_HEADER` 且其值等于 `FORWARD_AUTH_ADMIN_VALUE` 时视为管理员并恢复正常导航。
+  - 生产环境：每次请求若缺少 ForwardAuth 头或值不满足管理员规则，则展示 `/401`，但 URL 立刻 `replaceState` 回原目标，用户刷新后仍留在原地址；当请求头满足 `PODUP_FWD_AUTH_HEADER` 且其值等于 `PODUP_FWD_AUTH_ADMIN_VALUE` 时视为管理员并恢复正常导航。
 
 ## API 依赖与需要补齐的后端接口
 
@@ -82,6 +82,6 @@
 - `GET /api/webhooks/status`：返回各 unit 的最近触发时间、成功/失败状态、HMAC 校验结果。
 - `GET /api/image-locks` 与 `DELETE /api/image-locks/<name>`：查询/释放镜像锁。
 - `POST /api/prune-state`：触发清理任务（或提供 CLI 代理 HTTP 入口）。
-- 认证标识：沿用 tavily-hikari 的 ForwardAuth 方案——配置 `FORWARD_AUTH_HEADER` 指定载有用户 ID 的请求头，`FORWARD_AUTH_ADMIN_VALUE` 定义管理员匹配值，`FORWARD_AUTH_NICKNAME_HEADER`（可选）为 UI 昵称，`ADMIN_MODE_NAME` 提供兜底昵称，`DEV_OPEN_ADMIN` 仅用于本地开发放开权限。后端需对 Admin-only API 校验该组合并返回 401；前端收到 401 后跳转 `/401` 并恢复历史。
+- 认证标识：沿用 tavily-hikari 的 ForwardAuth 方案——配置 `PODUP_FWD_AUTH_HEADER` 指定载有用户 ID 的请求头，`PODUP_FWD_AUTH_ADMIN_VALUE` 定义管理员匹配值，`PODUP_FWD_AUTH_NICKNAME_HEADER`（可选）为 UI 昵称，`PODUP_ADMIN_MODE_NAME` 提供兜底昵称，`PODUP_DEV_OPEN_ADMIN` 仅用于本地开发放开权限。后端需对 Admin-only API 校验该组合并返回 401；同时对 `POST/PUT/PATCH/DELETE` 强制要求 `x-podup-csrf: 1`（JSON body 还需 `Content-Type: application/json...`）。前端发起副作用请求时需自动附带这些头；前端收到 401 后跳转 `/401` 并恢复历史。`/github-package-update/*` 属于 webhook 接收端点，不走 ForwardAuth/CSRF，仅做 GitHub HMAC 校验。
 
 以上路由若未实现，前端需用 mock 数据占位，后端实现后直接对接。

@@ -54,7 +54,6 @@ PODUP_ENV="$PODUP_ENV" \
 PODUP_STATE_DIR="$state_dir" \
 PODUP_DB_URL="sqlite://$db_path" \
 PODUP_TOKEN="${PODUP_TOKEN:-demo-token}" \
-PODUP_MANUAL_TOKEN="${PODUP_MANUAL_TOKEN:-demo-token}" \
 PODUP_GH_WEBHOOK_SECRET="${PODUP_GH_WEBHOOK_SECRET:-demo-secret}" \
 PODUP_DEBUG_PAYLOAD_PATH="$state_dir/last_payload.bin" \
 PODUP_DEV_OPEN_ADMIN="${PODUP_DEV_OPEN_ADMIN:-1}" \
