@@ -1,0 +1,15 @@
+pre-commit:
+  parallel: true
+  commands:
+    fmt:
+      glob:
+        - "*.rs"
+        - "**/*.rs"
+        - "web/*.{ts,tsx,js,jsx,json,html}"
+        - "web/**/*.{ts,tsx,js,jsx,json,html}"
+      run: bash scripts/format_staged.sh
+      stage_fixed: true
+    # Additional checks (clippy/tests/etc) are intentionally not run in git hooks.
+
+commit-msg:
+  skip: true
