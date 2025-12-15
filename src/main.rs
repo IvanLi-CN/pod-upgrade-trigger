@@ -7145,49 +7145,12 @@ fn discover_units_from_podman_ps() -> Result<Vec<DiscoveredUnit>, String> {
             }
 
             // Prefer explicit unit label if present (commonly set by generate systemd/quadlet).
-            if let Some(unit) = labels
-                .get("io.podman.systemd.unit")
-                .or_else(|| labels.get("io.containers.autoupdate.unit"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(unit) = podman_systemd_unit_label(labels) {
                 units.push(DiscoveredUnit {
                     unit: unit.to_string(),
                     source: "ps",
                 });
                 continue;
-            }
-
-            // Fall back to container name -> <name>.service mapping.
-            if let Some(name) = item
-                .get("Name")
-                .or_else(|| item.get("name"))
-                .and_then(|v| v.as_str())
-            {
-                units.push(DiscoveredUnit {
-                    unit: format!("{name}.service"),
-                    source: "ps",
-                });
-                continue;
-            }
-            if let Some(names) = item.get("Names").or_else(|| item.get("names")) {
-                if let Some(first) = names
-                    .as_array()
-                    .and_then(|arr| arr.get(0))
-                    .and_then(|v| v.as_str())
-                {
-                    units.push(DiscoveredUnit {
-                        unit: format!("{first}.service"),
-                        source: "ps",
-                    });
-                    continue;
-                }
-                if let Some(name) = names.as_str() {
-                    units.push(DiscoveredUnit {
-                        unit: format!("{name}.service"),
-                        source: "ps",
-                    });
-                    continue;
-                }
             }
         }
     }
@@ -7320,14 +7283,20 @@ fn container_image_id(item: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn container_unit_label(item: &Value) -> Option<String> {
-    let labels = item.get("Labels").or_else(|| item.get("labels"))?;
-    let obj = labels.as_object()?;
-    obj.get("io.podman.systemd.unit")
-        .or_else(|| obj.get("io.containers.autoupdate.unit"))
+fn podman_systemd_unit_label(labels: &serde_json::Map<String, Value>) -> Option<String> {
+    labels
+        .get("io.podman.systemd.unit")
+        .or_else(|| labels.get("PODMAN_SYSTEMD_UNIT"))
+        .or_else(|| labels.get("io.containers.autoupdate.unit"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn container_unit_label(item: &Value) -> Option<String> {
+    let labels = item.get("Labels").or_else(|| item.get("labels"))?;
+    let obj = labels.as_object()?;
+    podman_systemd_unit_label(obj)
 }
 
 fn resolve_running_digests_by_unit(units: &[String]) -> HashMap<String, RunningDigestInfo> {

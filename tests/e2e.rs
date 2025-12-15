@@ -18,6 +18,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_full_suite() -> AnyResult<()> {
     scenario_auto_discovery().await?;
+    scenario_auto_discovery_podman_ps_skips_missing_unit_label().await?;
     scenario_webhook_auto_discovery_toggle().await?;
     scenario_health_db_error().await?;
     scenario_github_webhook().await?;
@@ -33,6 +34,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_manual_services_update_tag_update_available().await?;
     scenario_manual_services_update_latest_ahead().await?;
     scenario_manual_services_update_up_to_date_tag_latest().await?;
+    scenario_manual_services_update_up_to_date_tag_latest_podman_systemd_unit_label().await?;
     scenario_manual_services_update_unknown_container_not_found().await?;
     scenario_manual_auto_update_failure().await?;
     scenario_manual_task_command_meta_and_unit_errors().await?;
@@ -170,6 +172,58 @@ async fn scenario_auto_discovery() -> AnyResult<()> {
         .filter(|svc| svc["source"] == Value::from("discovered"))
         .collect();
     assert_eq!(sources.len(), 2);
+
+    Ok(())
+}
+
+async fn scenario_auto_discovery_podman_ps_skips_missing_unit_label() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let missing_dir = env.state_dir.join("containers/systemd-missing");
+    let ps_json = json!([
+        {
+            "Id": "cid-labeled-1",
+            "Created": 1000,
+            "Labels": {
+                "io.podman.systemd.unit": "svc-labeled.service",
+                "io.containers.autoupdate": "registry"
+            },
+            "Name": "svc-labeled"
+        },
+        {
+            "Id": "cid-unlabeled-1",
+            "Created": 999,
+            "Labels": {
+                "io.containers.autoupdate": "registry"
+            },
+            "Name": "svc-unlabeled"
+        }
+    ]);
+
+    let services =
+        env.send_request_with_env(HttpRequest::get("/api/manual/services?refresh=1"), |cmd| {
+            cmd.env("PODUP_CONTAINER_DIR", &missing_dir);
+            cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+        })?;
+    assert_eq!(services.status, 200);
+    let body = services.json_body()?;
+    let discovered = body["discovered"]["units"].as_array().unwrap();
+    let discovered_units: Vec<String> = discovered
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        discovered_units.iter().any(|u| u == "svc-labeled.service"),
+        "labeled container should be discovered via podman ps"
+    );
+    assert!(
+        !discovered_units
+            .iter()
+            .any(|u| u == "svc-unlabeled.service"),
+        "containers missing systemd unit label should not be surfaced as <name>.service"
+    );
 
     Ok(())
 }
@@ -1069,6 +1123,56 @@ async fn scenario_manual_services_update_up_to_date_tag_latest() -> AnyResult<()
             "State": "running",
             "Labels": {
                 "io.podman.systemd.unit": "svc-alpha.service",
+                "io.containers.autoupdate": "registry"
+            }
+        }
+    ]);
+    let inspect_json = json!([
+        { "Id": "img-alpha-1", "RepoDigests": [ "ghcr.io/koha/svc-alpha@sha256:eeeeeeee" ] }
+    ]);
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:latest": "sha256:eeeeeeee"
+    });
+
+    let resp = env.send_request_with_env(HttpRequest::get("/api/manual/services"), |cmd| {
+        cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+        cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+        cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+        cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+    })?;
+    assert_eq!(resp.status, 200);
+    let body = resp.json_body()?;
+    let services = body["services"].as_array().unwrap();
+    let svc = services
+        .iter()
+        .find(|s| s["unit"] == Value::from("svc-alpha.service"))
+        .expect("svc-alpha exists");
+    assert_eq!(svc["update"]["status"], Value::from("up_to_date"));
+    assert_eq!(svc["update"]["tag"], Value::from("latest"));
+    Ok(())
+}
+
+async fn scenario_manual_services_update_up_to_date_tag_latest_podman_systemd_unit_label()
+-> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-alpha.container"),
+        b"[Container]\nImage=ghcr.io/koha/svc-alpha:latest\nAutoupdate=registry\n",
+    )?;
+
+    let ps_json = json!([
+        {
+            "Id": "cid-alpha-1",
+            "ImageID": "img-alpha-1",
+            "Created": 1000,
+            "State": "running",
+            "Labels": {
+                "PODMAN_SYSTEMD_UNIT": "svc-alpha.service",
                 "io.containers.autoupdate": "registry"
             }
         }
