@@ -360,11 +360,20 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
 
 ### A. 测试镜像与 SSH 连通性
 
+建议以脚本化方式“一键复现与验收”（端口固定 `2222:22`，容器名固定 `podup-test`）：
+
+- 基线（任务 1 不得被破坏）：
+  - `./scripts/e2e/test-host/verify.sh root@<host>` 仍 PASS
+- 部署 SSH target（从开发机执行，在测试机上 `docker build`）：
+  - `./scripts/e2e/ssh-target/deploy.sh root@<host>`
+- 自动化验收（从开发机执行）：
+  - `./scripts/e2e/ssh-target/verify.sh root@<host>`
+
 1. 能在测试服务器上构建并运行测试容器（端口映射模式）：
-   - `docker build -t podup-ssh-target -f scripts/e2e/ssh-target/Dockerfile scripts/e2e/ssh-target`
-   - `docker run ... -p <port>:22 ... podup-ssh-target`
+   - 通过 `scripts/e2e/ssh-target/deploy.sh` 在远端构建镜像并启动容器（端口固定 `2222:22`）
 2. 开发机通过 Host alias（`~/.ssh/config`）可直接 SSH 到容器，并默认 `StrictHostKeyChecking=accept-new` 可工作：
-   - `ssh podup-test -- true` 返回 0
+   - `ssh podup-test -- true` 返回 0（alias 指向 `Port 2222`）
+   - 或直接：`ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2222 ivan@<host> -- true` 返回 0
 3. 在容器内（通过非交互 SSH 执行）以下命令返回 0：
    - `systemctl --user list-units --no-pager`
    - `journalctl --user -n 1 --no-pager`
