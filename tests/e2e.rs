@@ -219,7 +219,9 @@ async fn scenario_auto_discovery_podman_ps_skips_missing_unit_label() -> AnyResu
         "labeled container should be discovered via podman ps"
     );
     assert!(
-        !discovered_units.iter().any(|u| u == "svc-unlabeled.service"),
+        !discovered_units
+            .iter()
+            .any(|u| u == "svc-unlabeled.service"),
         "containers missing systemd unit label should not be surfaced as <name>.service"
     );
 
@@ -1150,7 +1152,8 @@ async fn scenario_manual_services_update_up_to_date_tag_latest() -> AnyResult<()
     Ok(())
 }
 
-async fn scenario_manual_services_update_up_to_date_tag_latest_podman_systemd_unit_label() -> AnyResult<()> {
+async fn scenario_manual_services_update_up_to_date_tag_latest_podman_systemd_unit_label()
+-> AnyResult<()> {
     let env = TestEnv::new()?;
     env.ensure_db_initialized().await?;
     env.clear_mock_log()?;
