@@ -60,6 +60,21 @@ Then open `http://127.0.0.1:25111/` in your browser. With `PODUP_DEV_OPEN_ADMIN=
 all admin APIs are open for local development.
 The binary automatically serves UI assets in this order: `${PODUP_STATE_DIR}/web/dist` → `$CWD/web/dist` → the embedded bundle packaged in the release binary. No Web UI override environment variable is supported. Routes like `/`, `/events`, `/tasks`, and `/settings` will render from whichever source is found first; removing the on-disk bundle falls back to the embedded UI.
 
+## Git hooks (Lefthook)
+
+This repo uses [Lefthook](https://lefthook.dev/) to manage Git hooks.
+
+1. Install lefthook (macOS/Homebrew):
+   ```bash
+   brew install lefthook
+   ```
+2. Register hooks for this clone:
+   ```bash
+   lefthook install
+   ```
+
+Configured hooks live in `lefthook.yml` and `scripts/format_staged.sh`.
+
 ### Release build with embedded Web UI
 
 Release artifacts embed the frontend bundle so host systemd deployments only need the binary. Build steps (example):
