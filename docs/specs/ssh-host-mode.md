@@ -156,15 +156,17 @@ docker run -d --name podup-test \
   -p 2222:22 \
   -v /home/<ops-user>/.ssh/authorized_keys:/etc/ssh/authorized_keys/<ops-user>:ro \
   -v /home/<ops-user>/.config/containers/systemd:/mnt/quadlet-real:ro \
-  -v /home/<ops-user>/.local/share/podman-auto-update/logs:/mnt/podman-auto-update-logs:ro \
   <image>
 ```
 
 挂载路径约定：
 
 - 业务 Quadlet 目录挂载到 `/mnt/quadlet-real`（只读）
-- auto-update 日志目录挂载到 `/mnt/podman-auto-update-logs`（只读）
-- `PODUP_CONTAINER_DIR` 与 `PODUP_AUTO_UPDATE_LOG_DIR` 在 SSH 模式下应指向容器内路径（例如上述 `/mnt/...`）
+- auto-update 日志目录（可选）挂载到 `/mnt/podman-auto-update-logs`（只读）
+  - 若宿主目录不存在，**不要**在 `docker run` 中添加该 bind mount（避免 Docker 以 root 身份创建宿主目录，导致权限与语义混乱）。
+  - 在 SSH Host Mode 中，`PODUP_AUTO_UPDATE_LOG_DIR` 缺失/不可读会被视为“无日志可读”，不会触发目录创建。
+- `PODUP_CONTAINER_DIR` 在 SSH 模式下应指向容器内路径（例如上述 `/mnt/quadlet-real`）
+- `PODUP_AUTO_UPDATE_LOG_DIR`（如需读取）在 SSH 模式下应指向容器内路径（例如 `/mnt/podman-auto-update-logs`）
 
 ### 远端前置条件（主人保证）
 
@@ -197,7 +199,8 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
 
 - `read_file(path)`：读取 Quadlet/Service 文件内容（用于 service auto-discovery 与解析）。
 - `list_dir(path)`：列出 `.container`/`.service`/`.network`/`.volume` 等文件（用于发现）。
-- `exists(path)` / `create_dir_all(path)`：启动时预检与必要的目录创建（仅限允许的目录）。
+- `exists(path)`：启动时预检与可读性检查。
+- `create_dir_all(path)`：仅允许对“本项目拥有的目录”执行创建（例如测试专用目录）。**不得**为 `PODUP_AUTO_UPDATE_LOG_DIR` 自动创建目录；该目录应由 `podman auto-update` 自身产生，缺失时视为“无日志可读”并跳过解析。
 - `tail_file(path, n)`（可选）：读取远端 auto-update 日志尾部（用于 UI 展示/诊断）。
 
 实现上可先采用 `ssh target -- <posix cmd>` 的方式（如 `ls -1`、`cat`、`tail`），并配合“路径字符集约束”保证安全；后续如需更强健可切换到 `sftp -b` 的 batch 模式实现读写（仍是 OpenSSH 生态，避免额外依赖）。
@@ -210,7 +213,9 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
 - 关键命令可用性：`podman --version`、`systemctl --user --version`、（可选）`busctl --user --version`、`journalctl --version`
 - `systemctl --user` 可用性检查：
   - 若无法连接 user bus / 用户实例，返回明确错误并提示修复建议（主机场景优先提示 `loginctl enable-linger <user>`；容器场景提示检查 systemd/user bus 是否按预期启动）。
-- 远端目录存在性：确保 `PODUP_CONTAINER_DIR`、`PODUP_AUTO_UPDATE_LOG_DIR` 可读（必要时创建）。
+- 远端目录存在性：
+  - `PODUP_CONTAINER_DIR`：必须可读（必要时可创建测试专用目录）。
+  - `PODUP_AUTO_UPDATE_LOG_DIR`：仅做可读性检查，**不得**自动创建；缺失/不可读时跳过 auto-update 日志解析与告警提取。
 
 ## Task executor 设计（保证 SSH 模式覆盖全部功能）
 
@@ -374,6 +379,9 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
    - `GET /api/manual/services` 正常返回，并包含：
      - `podup-e2e-noop.service`（manual source）
      - `discovered.units` 非空（来自 `PODUP_CONTAINER_DIR` 的远端扫描）
+   - 若 `PODUP_AUTO_UPDATE_LOG_DIR` 在 SSH target 内不存在/不可读：
+     - 后端不得创建该目录
+     - 后端不得因该目录缺失而导致请求失败或 hang（最多记录 debug/warn 并跳过日志解析）
 2. 触发一次“重启单元”后端任务（以 `podup-e2e-noop.service` 为准）：
    - 任务执行成功（HTTP 200/202，或与现有语义一致）
    - 任务日志中能看到 `host_backend=ssh` 且包含远端执行的 `systemctl --user restart ...` 的结果摘要（stdout/stderr 截断）
