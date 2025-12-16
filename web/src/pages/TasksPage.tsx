@@ -248,6 +248,7 @@ export default function TasksPage() {
   }, [getJson, selectedTaskId])
 
   useEffect(() => {
+    if (!selectedTaskId) return
     setExpandedCommandLogs({})
   }, [selectedTaskId])
 

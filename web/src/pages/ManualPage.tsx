@@ -505,6 +505,7 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
   }, [getJson, selectedTaskId])
 
   useEffect(() => {
+    if (!selectedTaskId) return
     setExpandedCommandLogs({})
   }, [selectedTaskId])
 
