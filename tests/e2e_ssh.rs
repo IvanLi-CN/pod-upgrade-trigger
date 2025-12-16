@@ -11,7 +11,10 @@ use tempfile::TempDir;
 type AnyResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn is_truthy(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn sh_single_quote(raw: &str) -> String {
@@ -44,7 +47,8 @@ async fn scenario_ssh_manual_services_and_restart() -> AnyResult<()> {
 
     let list = env.send_request(HttpRequest::get("/api/manual/services"))?;
     assert_eq!(
-        list.status, 200,
+        list.status,
+        200,
         "GET /api/manual/services must succeed in SSH mode: {}",
         list.body_text()
     );
@@ -52,7 +56,9 @@ async fn scenario_ssh_manual_services_and_restart() -> AnyResult<()> {
 
     let services = body["services"].as_array().cloned().unwrap_or_default();
     assert!(
-        services.iter().any(|svc| svc.get("unit") == Some(&Value::from("podup-e2e-noop.service"))),
+        services
+            .iter()
+            .any(|svc| svc.get("unit") == Some(&Value::from("podup-e2e-noop.service"))),
         "expected podup-e2e-noop.service in manual services list"
     );
 
@@ -62,7 +68,9 @@ async fn scenario_ssh_manual_services_and_restart() -> AnyResult<()> {
         .cloned()
         .unwrap_or_default();
     assert!(
-        discovered_units.iter().any(|u| u == "podup-e2e-noop.service"),
+        discovered_units
+            .iter()
+            .any(|u| u == "podup-e2e-noop.service"),
         "expected podup-e2e-noop.service in discovered.units (from remote PODUP_CONTAINER_DIR)"
     );
 
@@ -77,10 +85,19 @@ async fn scenario_ssh_manual_services_and_restart() -> AnyResult<()> {
             .header("x-podup-csrf", "1")
             .body(trigger_body.to_string().into_bytes()),
     )?;
-    assert_eq!(trigger.status, 202, "manual service trigger should be accepted");
+    assert_eq!(
+        trigger.status, 202,
+        "manual service trigger should be accepted"
+    );
     let trigger_json = trigger.json_body()?;
-    let task_id = trigger_json["task_id"].as_str().unwrap_or_default().to_string();
-    assert!(!task_id.is_empty(), "manual service trigger must return task_id");
+    let task_id = trigger_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "manual service trigger must return task_id"
+    );
 
     let task = env.wait_for_task_terminal(&task_id, Duration::from_secs(30))?;
     assert_eq!(
@@ -193,7 +210,10 @@ impl TestEnvSsh {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "PODUP_AUTO_UPDATE_LOG_DIR is required")
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "PODUP_AUTO_UPDATE_LOG_DIR is required",
+                )
             })?;
 
         let temp = TempDir::new()?;
