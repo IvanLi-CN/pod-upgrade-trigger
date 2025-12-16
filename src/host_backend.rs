@@ -93,8 +93,12 @@ pub trait HostBackend: Send + Sync {
     }
 
     fn podman(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError>;
-    fn systemctl_user(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError>;
-    fn journalctl_user(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError>;
+    fn systemctl_user(&self, args: &[String])
+    -> Result<crate::CommandExecResult, HostBackendError>;
+    fn journalctl_user(
+        &self,
+        args: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError>;
     fn busctl_user(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError>;
 
     fn exists(&self, path: &HostAbsPath) -> Result<bool, HostBackendError>;
@@ -124,14 +128,20 @@ impl HostBackend for LocalHostBackend {
         exec_local("podman", args).map_err(HostBackendError::ExecFailed)
     }
 
-    fn systemctl_user(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError> {
+    fn systemctl_user(
+        &self,
+        args: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError> {
         let mut full = Vec::with_capacity(args.len() + 1);
         full.push("--user".to_string());
         full.extend(args.iter().cloned());
         exec_local("systemctl", &full).map_err(HostBackendError::ExecFailed)
     }
 
-    fn journalctl_user(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError> {
+    fn journalctl_user(
+        &self,
+        args: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError> {
         let mut full = Vec::with_capacity(args.len() + 1);
         full.push("--user".to_string());
         full.extend(args.iter().cloned());
@@ -170,7 +180,8 @@ impl HostBackend for LocalHostBackend {
     }
 
     fn list_dir(&self, path: &HostAbsPath) -> Result<Vec<String>, HostBackendError> {
-        let read_dir = std::fs::read_dir(path.as_path()).map_err(|e| HostBackendError::Io(e.to_string()))?;
+        let read_dir =
+            std::fs::read_dir(path.as_path()).map_err(|e| HostBackendError::Io(e.to_string()))?;
         let mut out = Vec::new();
         for entry in read_dir.flatten() {
             let name = entry.file_name();
@@ -187,7 +198,8 @@ impl HostBackend for LocalHostBackend {
     }
 
     fn metadata(&self, path: &HostAbsPath) -> Result<HostFileMeta, HostBackendError> {
-        let meta = std::fs::metadata(path.as_path()).map_err(|e| HostBackendError::Io(e.to_string()))?;
+        let meta =
+            std::fs::metadata(path.as_path()).map_err(|e| HostBackendError::Io(e.to_string()))?;
         let modified = meta.modified().ok();
         Ok(HostFileMeta {
             is_file: meta.is_file(),
@@ -234,11 +246,17 @@ impl HostBackend for FailingHostBackend {
         Err(HostBackendError::ExecFailed(self.err.clone()))
     }
 
-    fn systemctl_user(&self, _args: &[String]) -> Result<crate::CommandExecResult, HostBackendError> {
+    fn systemctl_user(
+        &self,
+        _args: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError> {
         Err(HostBackendError::ExecFailed(self.err.clone()))
     }
 
-    fn journalctl_user(&self, _args: &[String]) -> Result<crate::CommandExecResult, HostBackendError> {
+    fn journalctl_user(
+        &self,
+        _args: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError> {
         Err(HostBackendError::ExecFailed(self.err.clone()))
     }
 
@@ -285,7 +303,10 @@ impl SshHostBackend {
         })
     }
 
-    pub fn ssh_argv_for_test(&self, remote_argv: &[String]) -> Result<Vec<String>, HostBackendError> {
+    pub fn ssh_argv_for_test(
+        &self,
+        remote_argv: &[String],
+    ) -> Result<Vec<String>, HostBackendError> {
         validate_remote_argv(remote_argv)?;
         let mut argv = Vec::new();
         argv.extend(self.default_opts.iter().cloned());
@@ -294,7 +315,10 @@ impl SshHostBackend {
         Ok(argv)
     }
 
-    fn exec_remote(&self, remote_argv: &[String]) -> Result<crate::CommandExecResult, HostBackendError> {
+    fn exec_remote(
+        &self,
+        remote_argv: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError> {
         validate_remote_argv(remote_argv)?;
 
         let mut cmd = Command::new("ssh");
@@ -355,7 +379,10 @@ impl HostBackend for SshHostBackend {
         self.exec_remote(&remote)
     }
 
-    fn systemctl_user(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError> {
+    fn systemctl_user(
+        &self,
+        args: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError> {
         let mut remote = Vec::with_capacity(args.len() + 2);
         remote.push("systemctl".to_string());
         remote.push("--user".to_string());
@@ -363,7 +390,10 @@ impl HostBackend for SshHostBackend {
         self.exec_remote(&remote)
     }
 
-    fn journalctl_user(&self, args: &[String]) -> Result<crate::CommandExecResult, HostBackendError> {
+    fn journalctl_user(
+        &self,
+        args: &[String],
+    ) -> Result<crate::CommandExecResult, HostBackendError> {
         let mut remote = Vec::with_capacity(args.len() + 2);
         remote.push("journalctl".to_string());
         remote.push("--user".to_string());
@@ -549,7 +579,7 @@ pub fn validate_host_abs_path(path: &Path) -> Result<(), String> {
                     return Err("path-dot-seg".to_string());
                 }
                 for ch in seg.chars() {
-                    let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' );
+                    let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
                     if !ok {
                         return Err("path-invalid-char".to_string());
                     }
@@ -604,19 +634,27 @@ fn validate_shell_token(token: &str) -> Result<(), HostBackendError> {
         return Err(HostBackendError::InvalidInput("token-empty".to_string()));
     }
     if token.chars().any(is_disallowed_shell_char) {
-        return Err(HostBackendError::InvalidInput("token-unsafe-char".to_string()));
+        return Err(HostBackendError::InvalidInput(
+            "token-unsafe-char".to_string(),
+        ));
     }
     Ok(())
 }
 
 fn validate_remote_argv(remote_argv: &[String]) -> Result<(), HostBackendError> {
     if remote_argv.is_empty() {
-        return Err(HostBackendError::InvalidInput("remote-argv-empty".to_string()));
+        return Err(HostBackendError::InvalidInput(
+            "remote-argv-empty".to_string(),
+        ));
     }
     // Whitelist the leading command token.
     match remote_argv[0].as_str() {
         "podman" | "systemctl" | "journalctl" | "busctl" | "ls" | "cat" | "test" | "stat" => {}
-        _ => return Err(HostBackendError::InvalidInput("remote-command-not-allowed".to_string())),
+        _ => {
+            return Err(HostBackendError::InvalidInput(
+                "remote-command-not-allowed".to_string(),
+            ));
+        }
     }
     for token in remote_argv {
         validate_shell_token(token)?;
@@ -694,7 +732,10 @@ mod tests {
         let argv = backend.ssh_argv_for_test(&remote).unwrap();
 
         assert!(argv.iter().any(|a| a == "-oBatchMode=yes"));
-        assert!(argv.iter().any(|a| a == "-oStrictHostKeyChecking=accept-new"));
+        assert!(
+            argv.iter()
+                .any(|a| a == "-oStrictHostKeyChecking=accept-new")
+        );
         assert!(argv.iter().any(|a| a == "-oConnectTimeout=5"));
         assert!(argv.iter().any(|a| a == "-oConnectionAttempts=1"));
         assert!(argv.iter().any(|a| a == "podup-test"));

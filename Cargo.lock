@@ -978,6 +978,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "hmac",
+ "libc",
  "regex",
  "reqwest",
  "rust-embed",

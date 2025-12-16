@@ -33,8 +33,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use url::Url;
 
-mod registry_digest;
 mod host_backend;
+mod registry_digest;
+mod task_executor;
 
 const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
@@ -78,6 +79,7 @@ const ENV_DB_URL: &str = "PODUP_DB_URL";
 const ENV_TOKEN: &str = "PODUP_TOKEN";
 const ENV_GH_WEBHOOK_SECRET: &str = "PODUP_GH_WEBHOOK_SECRET";
 const ENV_HTTP_ADDR: &str = "PODUP_HTTP_ADDR";
+const ENV_TASK_EXECUTOR: &str = "PODUP_TASK_EXECUTOR";
 const ENV_PUBLIC_BASE_URL: &str = "PODUP_PUBLIC_BASE_URL";
 const ENV_DEBUG_PAYLOAD_PATH: &str = "PODUP_DEBUG_PAYLOAD_PATH";
 const ENV_SCHEDULER_INTERVAL_SECS: &str = "PODUP_SCHEDULER_INTERVAL_SECS";
@@ -135,6 +137,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static PODMAN_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
 static PODMAN_PS_ALL_JSON: OnceLock<Result<Value, String>> = OnceLock::new();
 static HOST_BACKEND: OnceLock<Arc<dyn host_backend::HostBackend>> = OnceLock::new();
+static TASK_EXECUTOR: OnceLock<Arc<dyn task_executor::TaskExecutor>> = OnceLock::new();
 static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static SELF_UPDATE_IMPORTER_STARTED: OnceLock<()> = OnceLock::new();
 static SELF_UPDATE_SCHEDULER_STARTED: OnceLock<()> = OnceLock::new();
@@ -173,9 +176,61 @@ fn host_backend() -> &'static dyn host_backend::HostBackend {
         .as_ref()
 }
 
+fn task_executor() -> &'static dyn task_executor::TaskExecutor {
+    TASK_EXECUTOR
+        .get_or_init(|| {
+            let requested = env::var(ENV_TASK_EXECUTOR)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+
+            let kind = match requested.as_deref() {
+                Some("local-child") => "local-child",
+                Some("systemd-run") => "systemd-run",
+                Some(other) => {
+                    log_message(&format!(
+                        "warn task-executor-invalid {ENV_TASK_EXECUTOR}={other} (expected systemd-run|local-child)"
+                    ));
+                    if ssh_target_from_env().is_some() {
+                        "local-child"
+                    } else {
+                        "systemd-run"
+                    }
+                }
+                None => {
+                    if ssh_target_from_env().is_some() {
+                        "local-child"
+                    } else {
+                        "systemd-run"
+                    }
+                }
+            };
+
+            if kind == "local-child" {
+                match task_executor::LocalChildExecutor::from_current_exe() {
+                    Ok(executor) => Arc::new(executor),
+                    Err(err) => {
+                        log_message(&format!(
+                            "error task-executor-init-failed executor=local-child err={err}"
+                        ));
+                        Arc::new(task_executor::SystemdRunExecutor::new())
+                    }
+                }
+            } else {
+                Arc::new(task_executor::SystemdRunExecutor::new())
+            }
+        })
+        .as_ref()
+}
+
+fn task_executor_meta() -> Value {
+    json!({ "task_executor": task_executor().kind() })
+}
+
 fn host_backend_meta() -> Value {
     let kind = host_backend().kind().as_str();
     let mut meta = json!({ "host_backend": kind });
+    meta = merge_task_meta(meta, task_executor_meta());
     if kind == "ssh" {
         if let Some(hint) = host_backend().ssh_target_hint() {
             meta["ssh_target"] = Value::String(hint);
@@ -190,7 +245,9 @@ fn host_backend_error_to_string(err: host_backend::HostBackendError) -> String {
         host_backend::HostBackendError::ExecFailed(msg) => format!("exec-failed: {msg}"),
         host_backend::HostBackendError::Io(msg) => format!("io: {msg}"),
         host_backend::HostBackendError::NonZeroExit { exit, stderr } => {
-            let exit = exit.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string());
+            let exit = exit
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
             if stderr.trim().is_empty() {
                 format!("non-zero-exit: {exit}")
             } else {
@@ -590,7 +647,8 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn manual_auto_update_unit() -> String {
-    let raw = env::var(ENV_MANUAL_AUTO_UPDATE_UNIT).unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string());
+    let raw =
+        env::var(ENV_MANUAL_AUTO_UPDATE_UNIT).unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string());
     let trimmed = raw.trim();
     if host_backend::validate_systemd_unit_name(trimmed).is_ok() {
         trimmed.to_string()
@@ -598,8 +656,7 @@ fn manual_auto_update_unit() -> String {
         if trimmed != DEFAULT_MANUAL_UNIT {
             log_message(&format!(
                 "warn manual-auto-update-unit-invalid unit={} fallback={}",
-                trimmed,
-                DEFAULT_MANUAL_UNIT
+                trimmed, DEFAULT_MANUAL_UNIT
             ));
         }
         DEFAULT_MANUAL_UNIT.to_string()
@@ -800,7 +857,13 @@ fn run_background_cli(args: &[String]) -> ! {
         std::process::exit(1);
     }
 
-    if let Err(err) = run_task_by_id(&task_id) {
+    let result = run_task_by_id(&task_id);
+    // LocalChildExecutor persists pid mappings across the per-request `server`
+    // processes spawned by `http-server`; ensure we always clean up our own pid
+    // file when the run-task worker exits.
+    task_executor::LocalChildExecutor::cleanup_pid_file(&task_id);
+
+    if let Err(err) = result {
         log_message(&format!(
             "500 background-task-failed task_id={task_id} err={err}"
         ));
@@ -3045,7 +3108,7 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
     if status != "running" {
         let status_copy = status.clone();
         let task_id_db = task_id.to_string();
-        let meta = json!({ "status": status_copy });
+        let meta = merge_task_meta(json!({ "status": status_copy }), host_backend_meta());
         let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
         let log_result = with_db(|pool| async move {
@@ -3124,10 +3187,13 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
         if !can_stop_flag {
             let task_id_db = task_id.to_string();
             let kind_copy = kind.clone();
-            let meta = json!({
-                "kind": kind_copy,
-                "reason": "can_stop_false",
-            });
+            let meta = merge_task_meta(
+                json!({
+                    "kind": kind_copy,
+                    "reason": "can_stop_false",
+                }),
+                host_backend_meta(),
+            );
             let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
             let log_result = with_db(|pool| async move {
@@ -3174,106 +3240,116 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
         }
 
         let runner_unit = match task_runner_unit_for_task(&kind, meta_raw.as_deref()) {
-            Ok(Some(unit)) => unit,
-            Ok(None) => {
-                // No stable transient unit associated with this task; treat as
-                // not safely stoppable.
-                let task_id_db = task_id.to_string();
-                let kind_copy = kind.clone();
-                let meta = json!({
-                    "kind": kind_copy,
-                    "reason": "no-runner-unit",
-                });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+            Ok(Some(unit)) => Some(unit),
+            Ok(None) => None,
+            Err(err) => {
+                if task_executor().kind() != "systemd-run" {
+                    None
+                } else {
+                    // Malformed meta for a supposedly stoppable task.
+                    let task_id_db = task_id.to_string();
+                    let meta = merge_task_meta(
+                        json!({
+                            "kind": kind,
+                            "error": err,
+                        }),
+                        host_backend_meta(),
+                    );
+                    let meta_str =
+                        serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
-                let log_result = with_db(|pool| async move {
-                    sqlx::query(
-                        "INSERT INTO task_logs \
-                         (task_id, ts, level, action, status, summary, unit, meta) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&task_id_db)
-                    .bind(now)
-                    .bind("info")
-                    .bind("task-stop-unsupported")
-                    .bind("running")
-                    .bind("Stop requested but task has no controllable runner unit")
-                    .bind(Option::<String>::None)
-                    .bind(meta_str)
-                    .execute(&pool)
-                    .await?;
+                    let _ = with_db(|pool| async move {
+                        sqlx::query(
+                            "INSERT INTO task_logs \
+                             (task_id, ts, level, action, status, summary, unit, meta) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        )
+                        .bind(&task_id_db)
+                        .bind(now)
+                        .bind("error")
+                        .bind("task-stop-meta-error")
+                        .bind("running")
+                        .bind("Stop requested but task metadata was invalid")
+                        .bind(Option::<String>::None)
+                        .bind(meta_str)
+                        .execute(&pool)
+                        .await?;
 
-                    Ok::<(), sqlx::Error>(())
-                });
+                        Ok::<(), sqlx::Error>(())
+                    });
 
-                if let Err(err) = log_result {
                     respond_text(
                         ctx,
                         500,
                         "InternalServerError",
                         "failed to stop task",
                         "tasks-stop-api",
-                        Some(json!({ "task_id": task_id, "error": err })),
+                        Some(json!({ "task_id": task_id, "error": "invalid-task-meta" })),
                     )?;
                     return Ok(());
                 }
-
-                respond_text(
-                    ctx,
-                    400,
-                    "BadRequest",
-                    "task cannot be safely stopped",
-                    "tasks-stop-api",
-                    Some(json!({ "task_id": task_id, "reason": "no-runner-unit" })),
-                )?;
-                return Ok(());
             }
-            Err(err) => {
-                // Malformed meta for a supposedly stoppable task.
-                let task_id_db = task_id.to_string();
-                let meta = json!({
-                    "kind": kind,
-                    "error": err,
-                });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+        };
 
-                let _ = with_db(|pool| async move {
-                    sqlx::query(
-                        "INSERT INTO task_logs \
-                         (task_id, ts, level, action, status, summary, unit, meta) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&task_id_db)
-                    .bind(now)
-                    .bind("error")
-                    .bind("task-stop-meta-error")
-                    .bind("running")
-                    .bind("Stop requested but task metadata was invalid")
-                    .bind(Option::<String>::None)
-                    .bind(meta_str)
-                    .execute(&pool)
-                    .await?;
+        if task_executor().kind() == "systemd-run" && runner_unit.is_none() {
+            // No stable transient unit associated with this task; treat as
+            // not safely stoppable.
+            let task_id_db = task_id.to_string();
+            let kind_copy = kind.clone();
+            let meta = merge_task_meta(
+                json!({
+                    "kind": kind_copy,
+                    "reason": "no-runner-unit",
+                }),
+                host_backend_meta(),
+            );
+            let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
-                    Ok::<(), sqlx::Error>(())
-                });
+            let log_result = with_db(|pool| async move {
+                sqlx::query(
+                    "INSERT INTO task_logs \
+                     (task_id, ts, level, action, status, summary, unit, meta) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&task_id_db)
+                .bind(now)
+                .bind("info")
+                .bind("task-stop-unsupported")
+                .bind("running")
+                .bind("Stop requested but task has no controllable runner unit")
+                .bind(Option::<String>::None)
+                .bind(meta_str)
+                .execute(&pool)
+                .await?;
 
+                Ok::<(), sqlx::Error>(())
+            });
+
+            if let Err(err) = log_result {
                 respond_text(
                     ctx,
                     500,
                     "InternalServerError",
                     "failed to stop task",
                     "tasks-stop-api",
-                    Some(json!({ "task_id": task_id, "error": "invalid-task-meta" })),
+                    Some(json!({ "task_id": task_id, "error": err })),
                 )?;
                 return Ok(());
             }
-        };
 
-        // Attempt graceful stop of the transient unit. A successful systemctl
-        // call is treated as "stop requested" and we immediately transition the
-        // task into cancelled.
-        match stop_task_runner_unit(&runner_unit) {
-            Ok(result) if result.success() => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "task cannot be safely stopped",
+                "tasks-stop-api",
+                Some(json!({ "task_id": task_id, "reason": "no-runner-unit" })),
+            )?;
+            return Ok(());
+        }
+
+        match task_executor().stop(task_id, runner_unit.as_deref()) {
+            Ok(meta_value) => {
                 let finish_ts = finished_at.unwrap_or(now);
                 let new_summary = match existing_summary {
                     Some(ref s) if s.contains("cancelled") => s.clone(),
@@ -3281,10 +3357,6 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     None => "Task · cancelled by user".to_string(),
                 };
 
-                let command = format!("systemctl --user stop {runner_unit}");
-                let argv = ["systemctl", "--user", "stop", runner_unit.as_str()];
-                let extra_meta = json!({ "via": "stop", "runner_unit": runner_unit });
-                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
                 let meta_str =
                     serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
@@ -3398,60 +3470,10 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     }
                 }
             }
-            Ok(result) => {
-                let exit = exit_code_string(&result.status);
-
-                let task_id_db = task_id.to_string();
-                let command = format!("systemctl --user stop {runner_unit}");
-                let argv = ["systemctl", "--user", "stop", runner_unit.as_str()];
-                let extra_meta = json!({
-                    "runner_unit": runner_unit,
-                    "exit": exit,
-                });
-                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
-                let meta_str =
-                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
-
-                let _ = with_db(|pool| async move {
-                    sqlx::query(
-                        "INSERT INTO task_logs \
-                         (task_id, ts, level, action, status, summary, unit, meta) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&task_id_db)
-                    .bind(now)
-                    .bind("error")
-                    .bind("task-stop-failed")
-                    .bind("running")
-                    .bind("Failed to stop underlying runner unit")
-                    .bind(Option::<String>::None)
-                    .bind(meta_str)
-                    .execute(&pool)
-                    .await?;
-
-                    Ok::<(), sqlx::Error>(())
-                });
-
-                respond_text(
-                    ctx,
-                    500,
-                    "InternalServerError",
-                    "failed to stop task",
-                    "tasks-stop-api",
-                    Some(json!({
-                        "task_id": task_id,
-                        "error": exit,
-                    })),
-                )?;
-                Ok(())
-            }
             Err(err) => {
                 let task_id_db = task_id.to_string();
-                let meta = json!({
-                    "runner_unit": runner_unit,
-                    "error": err,
-                });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+                let meta_str =
+                    serde_json::to_string(&err.meta).unwrap_or_else(|_| "{}".to_string());
 
                 let _ = with_db(|pool| async move {
                     sqlx::query(
@@ -3479,7 +3501,7 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
                     "InternalServerError",
                     "failed to stop task",
                     "tasks-stop-api",
-                    Some(json!({ "task_id": task_id, "error": "runner-stop-error" })),
+                    Some(json!({ "task_id": task_id, "error": err.code })),
                 )?;
                 Ok(())
             }
@@ -3560,7 +3582,7 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
     if status != "running" {
         let status_copy = status.clone();
         let task_id_db = task_id.to_string();
-        let meta = json!({ "status": status_copy });
+        let meta = merge_task_meta(json!({ "status": status_copy }), host_backend_meta());
         let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
         let log_result = with_db(|pool| async move {
@@ -3638,10 +3660,13 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
         if !can_force_stop_flag {
             let task_id_db = task_id.to_string();
             let kind_copy = kind.clone();
-            let meta = json!({
-                "kind": kind_copy,
-                "reason": "can_force_stop_false",
-            });
+            let meta = merge_task_meta(
+                json!({
+                    "kind": kind_copy,
+                    "reason": "can_force_stop_false",
+                }),
+                host_backend_meta(),
+            );
             let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
             let log_result = with_db(|pool| async move {
@@ -3688,100 +3713,113 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
         }
 
         let runner_unit = match task_runner_unit_for_task(&kind, meta_raw.as_deref()) {
-            Ok(Some(unit)) => unit,
-            Ok(None) => {
-                let task_id_db = task_id.to_string();
-                let kind_copy = kind.clone();
-                let meta = json!({
-                    "kind": kind_copy,
-                    "reason": "no-runner-unit",
-                });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+            Ok(Some(unit)) => Some(unit),
+            Ok(None) => None,
+            Err(err) => {
+                if task_executor().kind() != "systemd-run" {
+                    None
+                } else {
+                    let task_id_db = task_id.to_string();
+                    let meta = merge_task_meta(
+                        json!({
+                            "kind": kind,
+                            "error": err,
+                        }),
+                        host_backend_meta(),
+                    );
+                    let meta_str =
+                        serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
-                let log_result = with_db(|pool| async move {
-                    sqlx::query(
-                        "INSERT INTO task_logs \
-                         (task_id, ts, level, action, status, summary, unit, meta) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&task_id_db)
-                    .bind(now)
-                    .bind("info")
-                    .bind("task-force-stop-unsupported")
-                    .bind("running")
-                    .bind("Force-stop requested but task has no controllable runner unit")
-                    .bind(Option::<String>::None)
-                    .bind(meta_str)
-                    .execute(&pool)
-                    .await?;
+                    let _ = with_db(|pool| async move {
+                        sqlx::query(
+                            "INSERT INTO task_logs \
+                             (task_id, ts, level, action, status, summary, unit, meta) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        )
+                        .bind(&task_id_db)
+                        .bind(now)
+                        .bind("error")
+                        .bind("task-force-stop-meta-error")
+                        .bind("running")
+                        .bind("Force-stop requested but task metadata was invalid")
+                        .bind(Option::<String>::None)
+                        .bind(meta_str)
+                        .execute(&pool)
+                        .await?;
 
-                    Ok::<(), sqlx::Error>(())
-                });
+                        Ok::<(), sqlx::Error>(())
+                    });
 
-                if let Err(err) = log_result {
                     respond_text(
                         ctx,
                         500,
                         "InternalServerError",
                         "failed to force-stop task",
                         "tasks-force-stop-api",
-                        Some(json!({ "task_id": task_id, "error": err })),
+                        Some(json!({ "task_id": task_id, "error": "invalid-task-meta" })),
                     )?;
                     return Ok(());
                 }
-
-                respond_text(
-                    ctx,
-                    400,
-                    "BadRequest",
-                    "task cannot be safely force-stopped",
-                    "tasks-force-stop-api",
-                    Some(json!({ "task_id": task_id, "reason": "no-runner-unit" })),
-                )?;
-                return Ok(());
             }
-            Err(err) => {
-                let task_id_db = task_id.to_string();
-                let meta = json!({
-                    "kind": kind,
-                    "error": err,
-                });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+        };
 
-                let _ = with_db(|pool| async move {
-                    sqlx::query(
-                        "INSERT INTO task_logs \
-                         (task_id, ts, level, action, status, summary, unit, meta) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&task_id_db)
-                    .bind(now)
-                    .bind("error")
-                    .bind("task-force-stop-meta-error")
-                    .bind("running")
-                    .bind("Force-stop requested but task metadata was invalid")
-                    .bind(Option::<String>::None)
-                    .bind(meta_str)
-                    .execute(&pool)
-                    .await?;
+        if task_executor().kind() == "systemd-run" && runner_unit.is_none() {
+            let task_id_db = task_id.to_string();
+            let kind_copy = kind.clone();
+            let meta = merge_task_meta(
+                json!({
+                    "kind": kind_copy,
+                    "reason": "no-runner-unit",
+                }),
+                host_backend_meta(),
+            );
+            let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
 
-                    Ok::<(), sqlx::Error>(())
-                });
+            let log_result = with_db(|pool| async move {
+                sqlx::query(
+                    "INSERT INTO task_logs \
+                     (task_id, ts, level, action, status, summary, unit, meta) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&task_id_db)
+                .bind(now)
+                .bind("info")
+                .bind("task-force-stop-unsupported")
+                .bind("running")
+                .bind("Force-stop requested but task has no controllable runner unit")
+                .bind(Option::<String>::None)
+                .bind(meta_str)
+                .execute(&pool)
+                .await?;
 
+                Ok::<(), sqlx::Error>(())
+            });
+
+            if let Err(err) = log_result {
                 respond_text(
                     ctx,
                     500,
                     "InternalServerError",
                     "failed to force-stop task",
                     "tasks-force-stop-api",
-                    Some(json!({ "task_id": task_id, "error": "invalid-task-meta" })),
+                    Some(json!({ "task_id": task_id, "error": err })),
                 )?;
                 return Ok(());
             }
-        };
 
-        match kill_task_runner_unit(&runner_unit) {
-            Ok(result) if result.success() => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "task cannot be safely force-stopped",
+                "tasks-force-stop-api",
+                Some(json!({ "task_id": task_id, "reason": "no-runner-unit" })),
+            )?;
+            return Ok(());
+        }
+
+        match task_executor().force_stop(task_id, runner_unit.as_deref()) {
+            Ok(meta_value) => {
                 let finish_ts = finished_at.unwrap_or(now);
                 let new_summary = match existing_summary {
                     Some(ref s) if s.contains("force-stopped") => s.clone(),
@@ -3789,16 +3827,6 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                     None => "Task · force-stopped".to_string(),
                 };
 
-                let command = format!("systemctl --user kill --signal=SIGKILL {runner_unit}");
-                let argv = [
-                    "systemctl",
-                    "--user",
-                    "kill",
-                    "--signal=SIGKILL",
-                    runner_unit.as_str(),
-                ];
-                let extra_meta = json!({ "via": "force-stop", "runner_unit": runner_unit });
-                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
                 let meta_str =
                     serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
 
@@ -3912,66 +3940,10 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                     }
                 }
             }
-            Ok(result) => {
-                let exit = exit_code_string(&result.status);
-
-                let task_id_db = task_id.to_string();
-                let command = format!("systemctl --user kill --signal=SIGKILL {runner_unit}");
-                let argv = [
-                    "systemctl",
-                    "--user",
-                    "kill",
-                    "--signal=SIGKILL",
-                    runner_unit.as_str(),
-                ];
-                let extra_meta = json!({
-                    "runner_unit": runner_unit,
-                    "exit": exit,
-                });
-                let meta_value = build_command_meta(&command, &argv, &result, Some(extra_meta));
-                let meta_str =
-                    serde_json::to_string(&meta_value).unwrap_or_else(|_| "{}".to_string());
-
-                let _ = with_db(|pool| async move {
-                    sqlx::query(
-                        "INSERT INTO task_logs \
-                         (task_id, ts, level, action, status, summary, unit, meta) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&task_id_db)
-                    .bind(now)
-                    .bind("error")
-                    .bind("task-force-stop-failed")
-                    .bind("running")
-                    .bind("Failed to force-stop underlying runner unit")
-                    .bind(Option::<String>::None)
-                    .bind(meta_str)
-                    .execute(&pool)
-                    .await?;
-
-                    Ok::<(), sqlx::Error>(())
-                });
-
-                respond_text(
-                    ctx,
-                    500,
-                    "InternalServerError",
-                    "failed to force-stop task",
-                    "tasks-force-stop-api",
-                    Some(json!({
-                        "task_id": task_id,
-                        "error": exit,
-                    })),
-                )?;
-                Ok(())
-            }
             Err(err) => {
                 let task_id_db = task_id.to_string();
-                let meta = json!({
-                    "runner_unit": runner_unit,
-                    "error": err,
-                });
-                let meta_str = serde_json::to_string(&meta).unwrap_or_else(|_| "{}".to_string());
+                let meta_str =
+                    serde_json::to_string(&err.meta).unwrap_or_else(|_| "{}".to_string());
 
                 let _ = with_db(|pool| async move {
                     sqlx::query(
@@ -3999,7 +3971,7 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
                     "InternalServerError",
                     "failed to force-stop task",
                     "tasks-force-stop-api",
-                    Some(json!({ "task_id": task_id, "error": "runner-force-stop-error" })),
+                    Some(json!({ "task_id": task_id, "error": err.code })),
                 )?;
                 Ok(())
             }
@@ -5844,13 +5816,16 @@ fn create_github_task(
         .bind("Github webhook accepted for background processing")
         .bind(Some(unit_owned.clone()))
         .bind(
-            serde_json::to_string(&json!({
-                "unit": unit_owned,
-                "image": image_owned,
-                "event": event_owned,
-                "delivery": delivery_owned,
-                "path": path_owned,
-            }))
+            serde_json::to_string(&merge_task_meta(
+                json!({
+                    "unit": unit_owned,
+                    "image": image_owned,
+                    "event": event_owned,
+                    "delivery": delivery_owned,
+                    "path": path_owned,
+                }),
+                host_backend_meta(),
+            ))
             .unwrap_or_else(|_| "{}".to_string()),
         )
         .execute(&mut *tx)
@@ -5958,11 +5933,14 @@ fn create_manual_trigger_task(
         .bind("Manual trigger task created from API")
         .bind(Option::<String>::None)
         .bind(
-            serde_json::to_string(&json!({
-                "units": units_owned,
-                "caller": caller_owned,
-                "reason": reason_owned,
-            }))
+            serde_json::to_string(&merge_task_meta(
+                json!({
+                    "units": units_owned,
+                    "caller": caller_owned,
+                    "reason": reason_owned,
+                }),
+                host_backend_meta(),
+            ))
             .unwrap_or_else(|_| "{}".to_string()),
         )
         .execute(&mut *tx)
@@ -6074,13 +6052,16 @@ fn create_cli_manual_trigger_task(
         .bind("Manual trigger task created from CLI")
         .bind(Option::<String>::None)
         .bind(
-            serde_json::to_string(&json!({
-                "units": units_owned,
-                "caller": caller_owned,
-                "reason": reason_owned,
-                "source": trigger_source,
-                "path": path_owned,
-            }))
+            serde_json::to_string(&merge_task_meta(
+                json!({
+                    "units": units_owned,
+                    "caller": caller_owned,
+                    "reason": reason_owned,
+                    "source": trigger_source,
+                    "path": path_owned,
+                }),
+                host_backend_meta(),
+            ))
             .unwrap_or_else(|_| "{}".to_string()),
         )
         .execute(&mut *tx)
@@ -6192,12 +6173,15 @@ fn create_manual_service_task(
         .bind("Manual service task created from API")
         .bind(Some(unit_owned.clone()))
         .bind(
-            serde_json::to_string(&json!({
-                "unit": unit_owned,
-                "image": image_owned,
-                "caller": caller_owned,
-                "reason": reason_owned,
-            }))
+            serde_json::to_string(&merge_task_meta(
+                json!({
+                    "unit": unit_owned,
+                    "image": image_owned,
+                    "caller": caller_owned,
+                    "reason": reason_owned,
+                }),
+                host_backend_meta(),
+            ))
             .unwrap_or_else(|_| "{}".to_string()),
         )
         .execute(&mut *tx)
@@ -6814,7 +6798,9 @@ fn collect_run_task_env() -> Vec<String> {
     const KEYS: &[&str] = &[
         ENV_DB_URL,
         ENV_STATE_DIR,
+        ENV_SSH_TARGET,
         ENV_CONTAINER_DIR,
+        ENV_AUTO_UPDATE_LOG_DIR,
         ENV_MANUAL_UNITS,
         ENV_MANUAL_AUTO_UPDATE_UNIT,
     ];
@@ -6844,67 +6830,14 @@ fn spawn_manual_task(task_id: &str, action: &str) -> Result<(), String> {
             }
         }
     }
-
-    let exe = env::current_exe().map_err(|e| e.to_string())?;
-    let exe_str = exe.to_str().ok_or_else(|| "invalid exe path".to_string())?;
-
     log_message(&format!(
-        "debug manual-dispatch-launch task_id={task_id} action={action} exe={exe_str}"
+        "debug manual-dispatch-launch task_id={task_id} action={action} executor={}",
+        task_executor().kind()
     ));
 
-    // For manual tasks我们不单独创建 transient unit 名称，复用 run-task 调用。
-    let mut args = Vec::new();
-    args.push("--user".to_string());
-    args.push("--quiet".to_string());
-
-    for env_kv in collect_run_task_env() {
-        args.push(format!("--setenv={env_kv}"));
-    }
-
-    args.push(exe_str.to_string());
-    args.push("run-task".to_string());
-    args.push(task_id.to_string());
-
-    let status = Command::new("systemd-run")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status();
-
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => {
-            let code = exit_code_string(&status);
-            log_message(&format!(
-                "warn manual-dispatch-fallback systemd-run-exit code={code} task_id={task_id} action={action}"
-            ));
-            // Fallback to inline process.
-            Command::new(exe_str)
-                .arg("run-task")
-                .arg(task_id)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        }
-        Err(err) => {
-            log_message(&format!(
-                "warn manual-dispatch-fallback no-systemd-run err={err} task_id={task_id} action={action}"
-            ));
-            Command::new(exe_str)
-                .arg("run-task")
-                .arg(task_id)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        }
-    }
+    task_executor()
+        .dispatch(task_id, task_executor::DispatchRequest::Manual { action })
+        .map_err(|e| format!("dispatch-failed code={} meta={}", e.code, e.meta))
 }
 fn load_task_detail_record(task_id: &str) -> Result<Option<TaskDetailResponse>, String> {
     let task_id_owned = task_id.to_string();
@@ -7190,17 +7123,24 @@ fn quadlet_unit_name(path: &Path) -> Option<String> {
 
 fn discover_units_from_dir() -> Result<Vec<DiscoveredUnit>, String> {
     let dir = container_systemd_dir()?;
-    let dir_exists = host_backend()
-        .is_dir(&dir)
-        .map_err(|e| format!("container-dir-check-failed: {}", host_backend_error_to_string(e)))?;
+    let dir_exists = host_backend().is_dir(&dir).map_err(|e| {
+        format!(
+            "container-dir-check-failed: {}",
+            host_backend_error_to_string(e)
+        )
+    })?;
     if !dir_exists {
         return Ok(Vec::new());
     }
 
     let mut units = Vec::new();
-    let names = host_backend()
-        .list_dir(&dir)
-        .map_err(|e| format!("failed to read {}: {}", dir.as_str(), host_backend_error_to_string(e)))?;
+    let names = host_backend().list_dir(&dir).map_err(|e| {
+        format!(
+            "failed to read {}: {}",
+            dir.as_str(),
+            host_backend_error_to_string(e)
+        )
+    })?;
     for name in names {
         let path = dir.as_path().join(&name);
         let Some(unit) = quadlet_unit_name(&path) else {
@@ -7821,8 +7761,11 @@ fn resolve_unit_identifier(raw: &str) -> Option<String> {
     };
 
     let synthetic = format!("/{slug}");
-    lookup_unit_from_path(&synthetic)
-        .and_then(|unit| host_backend::validate_systemd_unit_name(&unit).ok().map(|_| unit))
+    lookup_unit_from_path(&synthetic).and_then(|unit| {
+        host_backend::validate_systemd_unit_name(&unit)
+            .ok()
+            .map(|_| unit)
+    })
 }
 
 fn trigger_units(units: &[String], dry_run: bool) -> Vec<UnitActionResult> {
@@ -9717,7 +9660,10 @@ fn podman_health() -> Result<(), String> {
                     "podman unavailable: {}",
                     exit_code_string(&res.status)
                 )),
-                Err(err) => Err(format!("podman unavailable: {}", host_backend_error_to_string(err))),
+                Err(err) => Err(format!(
+                    "podman unavailable: {}",
+                    host_backend_error_to_string(err)
+                )),
             }
         })
         .clone()
@@ -10011,7 +9957,10 @@ fn prune_images_for_task(task_id: &str, unit: &str) {
     let argv = ["podman", "image", "prune", "-f"];
 
     let args = vec!["image".to_string(), "prune".to_string(), "-f".to_string()];
-    match host_backend().podman(&args).map_err(host_backend_error_to_string) {
+    match host_backend()
+        .podman(&args)
+        .map_err(host_backend_error_to_string)
+    {
         Ok(result) => {
             let extra_meta = json!({ "unit": unit });
             let meta = build_command_meta(command, &argv, &result, Some(extra_meta));
@@ -10080,39 +10029,22 @@ fn spawn_background_task(
     path: &str,
     task_id: &str,
 ) -> Result<(), String> {
-    let exe = env::current_exe().map_err(|e| e.to_string())?;
-    let exe_str = exe.to_str().ok_or_else(|| "invalid exe path".to_string())?;
     let suffix = sanitize_image_key(delivery);
     let unit_name = format!("webhook-task-{}", suffix);
 
     log_message(&format!(
-        "debug github-dispatch-launch unit={unit} image={image} event={event} delivery={delivery} path={path} exe={exe_str} task-unit={unit_name} task_id={task_id}"
+        "debug github-dispatch-launch unit={unit} image={image} event={event} delivery={delivery} path={path} executor={} task-unit={unit_name} task_id={task_id}",
+        task_executor().kind()
     ));
 
-    let args = build_systemd_run_args(&unit_name, exe_str, task_id);
-
-    if let Ok(snapshot) = env::var(ENV_SYSTEMD_RUN_SNAPSHOT) {
-        fs::write(snapshot, args.join("\n")).map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-
-    let status = Command::new("systemd-run")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status();
-
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(exit_code_string(&status)),
-        Err(err) => {
-            log_message(&format!(
-                "warn github-dispatch-fallback no-systemd-run err={err} running-inline"
-            ));
-            spawn_inline_task(exe_str, task_id)
-        }
-    }
+    task_executor()
+        .dispatch(
+            task_id,
+            task_executor::DispatchRequest::GithubWebhook {
+                runner_unit: &unit_name,
+            },
+        )
+        .map_err(|e| format!("dispatch-failed code={} meta={}", e.code, e.meta))
 }
 
 fn spawn_inline_task(exe: &str, task_id: &str) -> Result<(), String> {
@@ -10573,6 +10505,7 @@ fn mark_task_dispatch_failed(
         // without an explanation.
         let task_id_owned = task_id.to_string();
         let summary_owned = summary.clone();
+        let merged_meta = merge_task_meta(merged_meta, host_backend_meta());
         let meta_str = serde_json::to_string(&merged_meta).unwrap_or_else(|_| "{}".to_string());
         let _ = with_db(|pool| async move {
             let mut tx = pool.begin().await?;
@@ -11205,10 +11138,13 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         .bind(&summary)
         .bind(Option::<String>::None)
         .bind(
-            serde_json::to_string(&json!({
-                "units": units_upd,
-                "results": results,
-            }))
+            serde_json::to_string(&merge_task_meta(
+                json!({
+                    "units": units_upd,
+                    "results": results,
+                }),
+                host_backend_meta(),
+            ))
             .unwrap_or_else(|_| "{}".to_string()),
         )
         .execute(&mut *tx)
@@ -11480,7 +11416,9 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
                 match host_backend().list_dir(&log_dir) {
                     Ok(names) => {
                         for name in names {
-                            if Path::new(&name).extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                            if Path::new(&name).extension().and_then(|e| e.to_str())
+                                != Some("jsonl")
+                            {
                                 continue;
                             }
                             if baseline_files.contains(&name) {
@@ -11488,7 +11426,9 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
                             }
 
                             let path = log_dir.as_path().join(&name);
-                            let Ok(host_path) = host_backend::HostAbsPath::parse(&path.to_string_lossy()) else {
+                            let Ok(host_path) =
+                                host_backend::HostAbsPath::parse(&path.to_string_lossy())
+                            else {
                                 continue;
                             };
 
@@ -11662,9 +11602,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
         }
     }
 
-    let summary_meta_log_dir = log_dir_opt
-        .as_ref()
-        .map(|p| p.as_str().to_string());
+    let summary_meta_log_dir = log_dir_opt.as_ref().map(|p| p.as_str().to_string());
 
     if let Some(summary) = summary_event {
         let counts = summary
@@ -11746,7 +11684,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
             "podman auto-update run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)"
                 .to_string()
         };
-        ("unknown", "unknown", "warning", summary)
+        ("succeeded", "succeeded", "warning", summary)
     };
 
     let meta = json!({
