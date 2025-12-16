@@ -3392,10 +3392,14 @@ fn handle_task_stop(ctx: &RequestContext, task_id: &str) -> Result<(), String> {
 
                     sqlx::query(
                         "UPDATE task_units SET status = 'cancelled', \
+                         phase = 'done', \
                          finished_at = COALESCE(finished_at, ?), \
+                         duration_ms = COALESCE(duration_ms, (? - COALESCE(started_at, ?)) * 1000), \
                          message = COALESCE(message, 'cancelled by user') \
                          WHERE task_id = ? AND status IN ('running', 'pending')",
                     )
+                    .bind(finish_ts)
+                    .bind(finish_ts)
                     .bind(finish_ts)
                     .bind(&task_id_db)
                     .execute(&mut *tx)
@@ -3862,10 +3866,14 @@ fn handle_task_force_stop(ctx: &RequestContext, task_id: &str) -> Result<(), Str
 
                     sqlx::query(
                         "UPDATE task_units SET status = 'failed', \
+                         phase = 'done', \
                          finished_at = COALESCE(finished_at, ?), \
+                         duration_ms = COALESCE(duration_ms, (? - COALESCE(started_at, ?)) * 1000), \
                          message = COALESCE(message, 'force-stopped by user') \
                          WHERE task_id = ? AND status IN ('running', 'pending')",
                     )
+                    .bind(finish_ts)
+                    .bind(finish_ts)
                     .bind(finish_ts)
                     .bind(&task_id_db)
                     .execute(&mut *tx)
@@ -9804,6 +9812,213 @@ fn run_unit_operation(unit: &str, purpose: UnitOperationPurpose) -> UnitOperatio
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnitHealthVerdict {
+    Healthy,
+    Degraded,
+    Failed,
+    Unknown,
+}
+
+impl UnitHealthVerdict {
+    fn task_status(self) -> &'static str {
+        match self {
+            UnitHealthVerdict::Healthy => "succeeded",
+            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => "unknown",
+            UnitHealthVerdict::Failed => "failed",
+        }
+    }
+
+    fn log_level(self) -> &'static str {
+        match self {
+            UnitHealthVerdict::Healthy => "info",
+            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => "warning",
+            UnitHealthVerdict::Failed => "error",
+        }
+    }
+}
+
+fn parse_systemctl_show_properties(stdout: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in stdout.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            continue;
+        }
+        out.insert(key.to_string(), v.trim().to_string());
+    }
+    out
+}
+
+fn unit_state_summary(props: &HashMap<String, String>) -> String {
+    let keys = [
+        "ActiveState",
+        "SubState",
+        "Result",
+        "Type",
+        "ExecMainStatus",
+    ];
+
+    let mut parts = Vec::new();
+    for key in keys {
+        let Some(value) = props.get(key) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed == "n/a" || trimmed == "-" {
+            continue;
+        }
+        parts.push(format!("{key}={trimmed}"));
+    }
+    parts.join(" ")
+}
+
+fn evaluate_unit_health(props: &HashMap<String, String>) -> UnitHealthVerdict {
+    let active_state = props
+        .get("ActiveState")
+        .map(|v| v.trim().to_ascii_lowercase());
+    if active_state.as_deref() == Some("failed") {
+        return UnitHealthVerdict::Failed;
+    }
+
+    let result = props.get("Result").map(|v| v.trim().to_ascii_lowercase());
+    if let Some(result) = result.as_deref() {
+        if !result.is_empty() && result != "success" {
+            return UnitHealthVerdict::Failed;
+        }
+    }
+
+    let service_type = props.get("Type").map(|v| v.trim().to_ascii_lowercase());
+    if service_type.as_deref().is_some_and(|t| t != "oneshot") {
+        if let Some(active) = active_state.as_deref() {
+            if !active.is_empty() && active != "active" {
+                return UnitHealthVerdict::Degraded;
+            }
+        }
+    }
+
+    UnitHealthVerdict::Healthy
+}
+
+fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict, String) {
+    let command = format!(
+        "systemctl --user show {unit} --property=ActiveState --property=SubState --property=Result --property=Type --property=ExecMainStatus"
+    );
+    let argv = [
+        "systemctl",
+        "--user",
+        "show",
+        unit,
+        "--property=ActiveState",
+        "--property=SubState",
+        "--property=Result",
+        "--property=Type",
+        "--property=ExecMainStatus",
+    ];
+
+    let args = vec![
+        "show".to_string(),
+        unit.to_string(),
+        "--property=ActiveState".to_string(),
+        "--property=SubState".to_string(),
+        "--property=Result".to_string(),
+        "--property=Type".to_string(),
+        "--property=ExecMainStatus".to_string(),
+    ];
+
+    let outcome = host_backend()
+        .systemctl_user(&args)
+        .map_err(host_backend_error_to_string);
+
+    let (verdict, summary, meta) = match outcome {
+        Ok(result) => {
+            let props = if result.success() {
+                parse_systemctl_show_properties(&result.stdout)
+            } else {
+                HashMap::new()
+            };
+            let state_summary = unit_state_summary(&props);
+            let verdict = if result.success() && !props.is_empty() {
+                evaluate_unit_health(&props)
+            } else {
+                UnitHealthVerdict::Unknown
+            };
+
+            let summary = if state_summary.is_empty() {
+                match verdict {
+                    UnitHealthVerdict::Healthy => "Unit health check: OK".to_string(),
+                    UnitHealthVerdict::Degraded => "Unit health check: degraded".to_string(),
+                    UnitHealthVerdict::Failed => "Unit health check: FAILED".to_string(),
+                    UnitHealthVerdict::Unknown => "Unit health check: unavailable".to_string(),
+                }
+            } else {
+                match verdict {
+                    UnitHealthVerdict::Healthy => {
+                        format!("Unit health check: OK · {state_summary}")
+                    }
+                    UnitHealthVerdict::Degraded => {
+                        format!("Unit health check: degraded · {state_summary}")
+                    }
+                    UnitHealthVerdict::Failed => {
+                        format!("Unit health check: FAILED · {state_summary}")
+                    }
+                    UnitHealthVerdict::Unknown => {
+                        format!("Unit health check: unavailable · {state_summary}")
+                    }
+                }
+            };
+
+            let extra_meta = json!({
+                "unit": unit,
+                "result_status": match verdict {
+                    UnitHealthVerdict::Healthy => "healthy",
+                    UnitHealthVerdict::Degraded => "degraded",
+                    UnitHealthVerdict::Failed => "failed",
+                    UnitHealthVerdict::Unknown => "unknown",
+                },
+                "result_message": summary,
+                "active_state": props.get("ActiveState"),
+                "sub_state": props.get("SubState"),
+                "result": props.get("Result"),
+                "service_type": props.get("Type"),
+                "exec_main_status": props.get("ExecMainStatus"),
+            });
+
+            let meta = build_command_meta(&command, &argv, &result, Some(extra_meta));
+            (verdict, summary.clone(), meta)
+        }
+        Err(err) => {
+            let verdict = UnitHealthVerdict::Unknown;
+            let summary = format!("Unit health check: unavailable ({err})");
+            let meta = json!({
+                "type": "command",
+                "command": command,
+                "argv": argv,
+                "error": err,
+                "unit": unit,
+                "result_status": "unknown",
+                "result_message": summary,
+            });
+            (verdict, summary.clone(), meta)
+        }
+    };
+
+    append_task_log(
+        task_id,
+        verdict.log_level(),
+        "unit-health-check",
+        verdict.task_status(),
+        &summary,
+        Some(unit),
+        meta,
+    );
+
+    (verdict, summary)
+}
+
 const UNIT_ERROR_SUMMARY_MAX_CHARS: usize = 1024;
 
 fn truncate_unit_error_summary(text: &str) -> String {
@@ -10123,6 +10338,7 @@ fn run_background_task(
 
     let _guard = guard;
 
+    update_task_unit_phase(task_id, unit, "pulling-image");
     let pull_result = match pull_container_image(image) {
         Ok(res) => res,
         Err(err) => {
@@ -10178,6 +10394,31 @@ fn run_background_task(
         return Ok(());
     }
 
+    let pull_command = format!("podman pull {image}");
+    let pull_argv = ["podman", "pull", image];
+    let pull_meta = build_command_meta(
+        &pull_command,
+        &pull_argv,
+        &pull_result,
+        Some(json!({
+            "unit": unit,
+            "image": image,
+            "event": event,
+            "delivery": delivery,
+            "path": path,
+        })),
+    );
+    append_task_log(
+        task_id,
+        "info",
+        "image-pull",
+        "succeeded",
+        "Image pull succeeded",
+        Some(unit),
+        pull_meta,
+    );
+
+    update_task_unit_phase(task_id, unit, "restarting");
     let restart_command = format!("systemctl --user restart {unit}");
     let restart_argv = ["systemctl", "--user", "restart", unit];
 
@@ -10195,16 +10436,45 @@ fn run_background_task(
             });
             let meta =
                 build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
-            update_task_state_with_unit(
-                task_id,
-                "succeeded",
-                unit,
-                "succeeded",
-                "Github webhook task completed successfully",
-                "restart-unit",
-                "info",
-                meta,
-            );
+
+            update_task_unit_phase(task_id, unit, "verifying");
+            let (verdict, health_summary) = append_unit_health_check_log(task_id, unit);
+            match verdict {
+                UnitHealthVerdict::Healthy => update_task_state_with_unit(
+                    task_id,
+                    "succeeded",
+                    unit,
+                    "succeeded",
+                    "Github webhook task completed successfully",
+                    "restart-unit",
+                    "info",
+                    meta,
+                ),
+                UnitHealthVerdict::Failed => update_task_state_with_unit_error(
+                    task_id,
+                    "failed",
+                    unit,
+                    "failed",
+                    "Github webhook task failed (unit unhealthy after restart)",
+                    Some(&health_summary),
+                    "restart-unit",
+                    "error",
+                    meta,
+                ),
+                UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
+                    update_task_state_with_unit_error(
+                        task_id,
+                        "unknown",
+                        unit,
+                        "unknown",
+                        "Github webhook task completed with warnings (unit state uncertain)",
+                        Some(&health_summary),
+                        "restart-unit",
+                        "warning",
+                        meta,
+                    )
+                }
+            };
             prune_images_for_task(task_id, unit);
         }
         Ok(result) => {
@@ -10309,10 +10579,16 @@ fn update_task_state_with_unit(
 
         sqlx::query(
             "UPDATE task_units \
-             SET status = ?, finished_at = COALESCE(finished_at, ?), message = ? \
+             SET status = ?, \
+                 phase = 'done', \
+                 finished_at = COALESCE(finished_at, ?), \
+                 duration_ms = COALESCE(duration_ms, (? - COALESCE(started_at, ?)) * 1000), \
+                 message = ? \
              WHERE task_id = ? AND unit = ?",
         )
         .bind(&unit_status_owned)
+        .bind(now)
+        .bind(now)
         .bind(now)
         .bind(&summary_owned)
         .bind(&task_id_owned)
@@ -10392,10 +10668,17 @@ fn update_task_state_with_unit_error(
 
         sqlx::query(
             "UPDATE task_units \
-             SET status = ?, finished_at = COALESCE(finished_at, ?), message = ?, error = ? \
+             SET status = ?, \
+                 phase = 'done', \
+                 finished_at = COALESCE(finished_at, ?), \
+                 duration_ms = COALESCE(duration_ms, (? - COALESCE(started_at, ?)) * 1000), \
+                 message = ?, \
+                 error = ? \
              WHERE task_id = ? AND unit = ?",
         )
         .bind(&unit_status_owned)
+        .bind(now)
+        .bind(now)
         .bind(now)
         .bind(&summary_owned)
         .bind(unit_error_owned)
@@ -10612,6 +10895,38 @@ fn append_task_log(
         .bind(meta_str)
         .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+}
+
+fn update_task_unit_phase(task_id: &str, unit: &str, phase: &str) {
+    let phase_trimmed = phase.trim();
+    if phase_trimmed.is_empty() {
+        return;
+    }
+
+    let task_id_owned = task_id.to_string();
+    let unit_owned = unit.to_string();
+    let phase_owned = phase_trimmed.to_string();
+    let now = current_unix_secs() as i64;
+
+    let _ = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query("UPDATE tasks SET updated_at = ? WHERE task_id = ?")
+            .bind(now)
+            .bind(&task_id_owned)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("UPDATE task_units SET phase = ? WHERE task_id = ? AND unit = ?")
+            .bind(&phase_owned)
+            .bind(&task_id_owned)
+            .bind(&unit_owned)
+            .execute(&mut *tx)
+            .await?;
 
         tx.commit().await?;
         Ok::<(), sqlx::Error>(())
@@ -11060,10 +11375,17 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
 
             sqlx::query(
                 "UPDATE task_units \
-                 SET status = ?, finished_at = COALESCE(finished_at, ?), message = ?, error = ? \
+                 SET status = ?, \
+                     phase = 'done', \
+                     finished_at = COALESCE(finished_at, ?), \
+                     duration_ms = COALESCE(duration_ms, (? - COALESCE(started_at, ?)) * 1000), \
+                     message = ?, \
+                     error = ? \
                  WHERE task_id = ? AND unit = ?",
             )
             .bind(unit_status)
+            .bind(now)
+            .bind(now)
             .bind(now)
             .bind(if unit_status == "failed" {
                 Some(format!("{} failed", purpose.as_str()))
@@ -11160,6 +11482,7 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
 fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Result<(), String> {
     let unit_owned = unit.to_string();
     if let Some(image) = image {
+        update_task_unit_phase(task_id, &unit_owned, "pulling-image");
         let pull_result = match pull_container_image(image) {
             Ok(res) => res,
             Err(err) => {
@@ -11213,8 +11536,26 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
             );
             return Ok(());
         }
+
+        let command = format!("podman pull {image}");
+        let argv = ["podman", "pull", image];
+        let extra_meta = json!({
+            "unit": unit_owned.clone(),
+            "image": image,
+        });
+        let meta = build_command_meta(&command, &argv, &pull_result, Some(extra_meta));
+        append_task_log(
+            task_id,
+            "info",
+            "image-pull",
+            "succeeded",
+            "Image pull succeeded",
+            Some(&unit_owned),
+            meta,
+        );
     }
 
+    update_task_unit_phase(task_id, &unit_owned, "restarting");
     let purpose = if unit_owned == manual_auto_update_unit() {
         UnitOperationPurpose::Start
     } else {
@@ -11222,18 +11563,18 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
     };
     let run = run_unit_operation(&unit_owned, purpose);
     let result = unit_action_result_from_operation(&unit_owned, &run.result);
-    let unit_status = match result.status.as_str() {
+    let mut unit_status = match result.status.as_str() {
         "triggered" => "succeeded",
         "dry-run" => "skipped",
         "failed" | "error" => "failed",
         other => other,
     };
-    let task_status = if unit_status == "failed" {
+    let mut task_status = if unit_status == "failed" {
         "failed"
     } else {
         "succeeded"
     };
-    let summary = if unit_status == "failed" {
+    let mut summary = if unit_status == "failed" {
         "Manual service task failed".to_string()
     } else {
         "Manual service task succeeded".to_string()
@@ -11252,7 +11593,7 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         &result.message,
     );
 
-    let unit_error = if unit_status == "failed" {
+    let mut unit_error = if unit_status == "failed" {
         match &run.result {
             Ok(res) => unit_error_summary_from_command_result(res),
             Err(err) => unit_error_summary_from_exec_error(err),
@@ -11260,6 +11601,27 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
     } else {
         None
     };
+
+    if unit_status != "failed" {
+        update_task_unit_phase(task_id, &unit_owned, "verifying");
+        let (verdict, health_summary) = append_unit_health_check_log(task_id, &unit_owned);
+        match verdict {
+            UnitHealthVerdict::Healthy => {}
+            UnitHealthVerdict::Failed => {
+                unit_status = "failed";
+                task_status = "failed";
+                summary = "Manual service task failed (unit unhealthy after restart)".to_string();
+                unit_error = Some(health_summary);
+            }
+            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
+                unit_status = "unknown";
+                task_status = "unknown";
+                summary = "Manual service task completed with warnings (unit state uncertain)"
+                    .to_string();
+                unit_error = Some(health_summary);
+            }
+        }
+    }
 
     update_task_state_with_unit_error(
         task_id,
@@ -11269,10 +11631,10 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         &summary,
         unit_error.as_deref(),
         "manual-service-run",
-        if unit_status == "failed" {
-            "error"
-        } else {
-            "info"
+        match unit_status {
+            "failed" => "error",
+            "unknown" => "warning",
+            _ => "info",
         },
         meta,
     );

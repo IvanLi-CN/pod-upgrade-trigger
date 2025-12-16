@@ -116,8 +116,6 @@ test.describe('Tasks page (mock)', () => {
       'command output toggle not visible in image-pull log card',
     ).toBeVisible()
 
-    await commandToggle.click()
-
     await expect(
       logsTimelineSection.getByText(
         'podman pull ghcr.io/example/svc-alpha:main',
@@ -131,6 +129,14 @@ test.describe('Tasks page (mock)', () => {
         'warning: using cached image layer metadata',
       ),
     ).toBeVisible()
+
+    // 仍然允许手动折叠/展开命令输出。
+    await commandToggle.click()
+    await expect(
+      logsTimelineSection.getByText(
+        'podman pull ghcr.io/example/svc-alpha:main',
+      ),
+    ).toHaveCount(0)
   })
 
   test('shows meta.result_message details in the timeline (collapsible)', async ({ page }) => {
@@ -434,7 +440,6 @@ test.describe('Tasks page (mock)', () => {
       })
       .first()
     await expect(commandToggle).toBeVisible()
-    await commandToggle.click()
 
     await expect(
       pruneFailureCard.getByText('podman image prune -f'),
@@ -443,6 +448,9 @@ test.describe('Tasks page (mock)', () => {
     await expect(
       pruneFailureCard.getByText('mock image prune failure'),
     ).toBeVisible()
+
+    await commandToggle.click()
+    await expect(pruneFailureCard.getByText('podman image prune -f')).toHaveCount(0)
   })
 
   test('groups auto-update warnings and shows warning badge count', async ({ page }) => {
