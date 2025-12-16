@@ -9956,11 +9956,15 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
                 }
             } else {
                 match verdict {
-                    UnitHealthVerdict::Healthy => format!("Unit health check: OK · {state_summary}"),
+                    UnitHealthVerdict::Healthy => {
+                        format!("Unit health check: OK · {state_summary}")
+                    }
                     UnitHealthVerdict::Degraded => {
                         format!("Unit health check: degraded · {state_summary}")
                     }
-                    UnitHealthVerdict::Failed => format!("Unit health check: FAILED · {state_summary}"),
+                    UnitHealthVerdict::Failed => {
+                        format!("Unit health check: FAILED · {state_summary}")
+                    }
                     UnitHealthVerdict::Unknown => {
                         format!("Unit health check: unavailable · {state_summary}")
                     }
@@ -10457,17 +10461,19 @@ fn run_background_task(
                     "error",
                     meta,
                 ),
-                UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => update_task_state_with_unit_error(
-                    task_id,
-                    "unknown",
-                    unit,
-                    "unknown",
-                    "Github webhook task completed with warnings (unit state uncertain)",
-                    Some(&health_summary),
-                    "restart-unit",
-                    "warning",
-                    meta,
-                ),
+                UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
+                    update_task_state_with_unit_error(
+                        task_id,
+                        "unknown",
+                        unit,
+                        "unknown",
+                        "Github webhook task completed with warnings (unit state uncertain)",
+                        Some(&health_summary),
+                        "restart-unit",
+                        "warning",
+                        meta,
+                    )
+                }
             };
             prune_images_for_task(task_id, unit);
         }
@@ -11610,7 +11616,8 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
             UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
                 unit_status = "unknown";
                 task_status = "unknown";
-                summary = "Manual service task completed with warnings (unit state uncertain)".to_string();
+                summary = "Manual service task completed with warnings (unit state uncertain)"
+                    .to_string();
                 unit_error = Some(health_summary);
             }
         }
