@@ -34,6 +34,7 @@ use tokio::task::JoinSet;
 use url::Url;
 
 mod registry_digest;
+mod host_backend;
 
 const LOG_TAG: &str = "pod-upgrade-trigger";
 const DEFAULT_STATE_DIR: &str = "/srv/pod-upgrade-trigger";
@@ -85,6 +86,7 @@ const ENV_SCHEDULER_MAX_TICKS: &str = "PODUP_SCHEDULER_MAX_TICKS";
 const ENV_MANUAL_UNITS: &str = "PODUP_MANUAL_UNITS";
 const ENV_MANUAL_AUTO_UPDATE_UNIT: &str = "PODUP_MANUAL_AUTO_UPDATE_UNIT";
 const ENV_CONTAINER_DIR: &str = "PODUP_CONTAINER_DIR";
+const ENV_SSH_TARGET: &str = "PODUP_SSH_TARGET";
 const ENV_FWD_AUTH_HEADER: &str = "PODUP_FWD_AUTH_HEADER";
 const ENV_FWD_AUTH_ADMIN_VALUE: &str = "PODUP_FWD_AUTH_ADMIN_VALUE";
 const ENV_FWD_AUTH_NICKNAME_HEADER: &str = "PODUP_FWD_AUTH_NICKNAME_HEADER";
@@ -132,11 +134,71 @@ static DB_INIT_STATUS: OnceLock<RwLock<DbInitStatus>> = OnceLock::new();
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 static PODMAN_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
 static PODMAN_PS_ALL_JSON: OnceLock<Result<Value, String>> = OnceLock::new();
+static HOST_BACKEND: OnceLock<Arc<dyn host_backend::HostBackend>> = OnceLock::new();
 static DISCOVERY_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static SELF_UPDATE_IMPORTER_STARTED: OnceLock<()> = OnceLock::new();
 static SELF_UPDATE_SCHEDULER_STARTED: OnceLock<()> = OnceLock::new();
 static SELF_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 static HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+
+fn ssh_target_from_env() -> Option<String> {
+    env::var(ENV_SSH_TARGET)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn host_backend() -> &'static dyn host_backend::HostBackend {
+    HOST_BACKEND
+        .get_or_init(|| {
+            if let Some(target) = ssh_target_from_env() {
+                match host_backend::SshHostBackend::new(target) {
+                    Ok(backend) => Arc::new(backend),
+                    Err(err) => {
+                        // Never silently fall back to local when SSH is requested: that
+                        // could cause unintended host mutations.
+                        log_message(&format!(
+                            "error host-backend-init-failed backend=ssh err={err}"
+                        ));
+                        Arc::new(host_backend::FailingHostBackend::ssh(
+                            format!("ssh-backend-init-failed: {err}"),
+                            ssh_target_from_env(),
+                        ))
+                    }
+                }
+            } else {
+                Arc::new(host_backend::LocalHostBackend::new())
+            }
+        })
+        .as_ref()
+}
+
+fn host_backend_meta() -> Value {
+    let kind = host_backend().kind().as_str();
+    let mut meta = json!({ "host_backend": kind });
+    if kind == "ssh" {
+        if let Some(hint) = host_backend().ssh_target_hint() {
+            meta["ssh_target"] = Value::String(hint);
+        }
+    }
+    meta
+}
+
+fn host_backend_error_to_string(err: host_backend::HostBackendError) -> String {
+    match err {
+        host_backend::HostBackendError::InvalidInput(msg) => format!("invalid-input: {msg}"),
+        host_backend::HostBackendError::ExecFailed(msg) => format!("exec-failed: {msg}"),
+        host_backend::HostBackendError::Io(msg) => format!("io: {msg}"),
+        host_backend::HostBackendError::NonZeroExit { exit, stderr } => {
+            let exit = exit.map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string());
+            if stderr.trim().is_empty() {
+                format!("non-zero-exit: {exit}")
+            } else {
+                format!("non-zero-exit: {exit} stderr={}", stderr.trim())
+            }
+        }
+    }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -528,7 +590,20 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn manual_auto_update_unit() -> String {
-    env::var(ENV_MANUAL_AUTO_UPDATE_UNIT).unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string())
+    let raw = env::var(ENV_MANUAL_AUTO_UPDATE_UNIT).unwrap_or_else(|_| DEFAULT_MANUAL_UNIT.to_string());
+    let trimmed = raw.trim();
+    if host_backend::validate_systemd_unit_name(trimmed).is_ok() {
+        trimmed.to_string()
+    } else {
+        if trimmed != DEFAULT_MANUAL_UNIT {
+            log_message(&format!(
+                "warn manual-auto-update-unit-invalid unit={} fallback={}",
+                trimmed,
+                DEFAULT_MANUAL_UNIT
+            ));
+        }
+        DEFAULT_MANUAL_UNIT.to_string()
+    }
 }
 
 fn lookup_unit_from_path(path: &str) -> Option<String> {
@@ -4678,6 +4753,25 @@ fn handle_manual_services_list(ctx: &RequestContext) -> Result<(), String> {
         return Ok(());
     }
 
+    if ssh_target_from_env().is_some() {
+        if let Err(err) = container_systemd_dir() {
+            respond_json(
+                ctx,
+                500,
+                "InternalServerError",
+                &json!({
+                    "error": "ssh-container-dir-missing",
+                    "message": err,
+                    "required_env": ENV_CONTAINER_DIR,
+                    "ssh_env": ENV_SSH_TARGET,
+                }),
+                "manual-services",
+                None,
+            )?;
+            return Ok(());
+        }
+    }
+
     let force_refresh = query_flag(ctx, &["discover", "refresh"]);
 
     if force_refresh {
@@ -6984,43 +7078,55 @@ fn run_task_by_id(task_id: &str) -> Result<(), String> {
     }
 }
 
-fn container_systemd_dir() -> PathBuf {
+fn container_systemd_dir() -> Result<host_backend::HostAbsPath, String> {
     if let Ok(raw) = env::var(ENV_CONTAINER_DIR) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+            return host_backend::HostAbsPath::parse(trimmed);
         }
+    }
+
+    // In SSH mode we MUST NOT infer remote paths from the local HOME.
+    if ssh_target_from_env().is_some() {
+        return Err(format!(
+            "{ENV_CONTAINER_DIR}-missing (required when {ENV_SSH_TARGET} is set)"
+        ));
     }
 
     if let Ok(home) = env::var("HOME") {
         let trimmed = home.trim();
         if !trimmed.is_empty() {
-            return Path::new(trimmed)
+            let inferred = Path::new(trimmed)
                 .join(".config")
                 .join("containers")
                 .join("systemd");
+            return host_backend::HostAbsPath::parse(&inferred.to_string_lossy());
         }
     }
 
-    PathBuf::from(DEFAULT_CONTAINER_DIR)
+    host_backend::HostAbsPath::parse(DEFAULT_CONTAINER_DIR)
 }
 
-fn auto_update_log_dir() -> Option<PathBuf> {
+fn auto_update_log_dir() -> Option<host_backend::HostAbsPath> {
     if let Ok(raw) = env::var(ENV_AUTO_UPDATE_LOG_DIR) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
+            return host_backend::HostAbsPath::parse(trimmed).ok();
         }
     }
 
+    // In SSH mode we MUST NOT infer remote paths from the local HOME.
+    if ssh_target_from_env().is_some() {
+        return None;
+    }
+
     let home = env::var("HOME").ok().filter(|v| !v.trim().is_empty())?;
-    Some(
-        Path::new(&home)
-            .join(".local")
-            .join("share")
-            .join("podman-auto-update")
-            .join("logs"),
-    )
+    let inferred = Path::new(&home)
+        .join(".local")
+        .join("share")
+        .join("podman-auto-update")
+        .join("logs");
+    host_backend::HostAbsPath::parse(&inferred.to_string_lossy()).ok()
 }
 
 fn self_update_report_dir() -> PathBuf {
@@ -7083,22 +7189,33 @@ fn quadlet_unit_name(path: &Path) -> Option<String> {
 }
 
 fn discover_units_from_dir() -> Result<Vec<DiscoveredUnit>, String> {
-    let dir = container_systemd_dir();
-    if !dir.exists() {
+    let dir = container_systemd_dir()?;
+    let dir_exists = host_backend()
+        .is_dir(&dir)
+        .map_err(|e| format!("container-dir-check-failed: {}", host_backend_error_to_string(e)))?;
+    if !dir_exists {
         return Ok(Vec::new());
     }
 
     let mut units = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| format!("failed to read {}: {e}", dir.display()))? {
-        let entry = entry.map_err(|e| format!("failed to read {}: {e}", dir.display()))?;
-        let path = entry.path();
+    let names = host_backend()
+        .list_dir(&dir)
+        .map_err(|e| format!("failed to read {}: {}", dir.as_str(), host_backend_error_to_string(e)))?;
+    for name in names {
+        let path = dir.as_path().join(&name);
         let Some(unit) = quadlet_unit_name(&path) else {
             continue;
         };
+        if host_backend::validate_systemd_unit_name(&unit).is_err() {
+            continue;
+        }
 
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if matches!(ext, "container" | "kube" | "image") {
-            let Ok(content) = fs::read_to_string(&path) else {
+            let Ok(host_path) = host_backend::HostAbsPath::parse(&path.to_string_lossy()) else {
+                continue;
+            };
+            let Ok(content) = host_backend().read_file_to_string(&host_path) else {
                 continue;
             };
             if !autoupdate_enabled(&content) {
@@ -7146,6 +7263,9 @@ fn discover_units_from_podman_ps() -> Result<Vec<DiscoveredUnit>, String> {
 
             // Prefer explicit unit label if present (commonly set by generate systemd/quadlet).
             if let Some(unit) = podman_systemd_unit_label(labels) {
+                if host_backend::validate_systemd_unit_name(&unit).is_err() {
+                    continue;
+                }
                 units.push(DiscoveredUnit {
                     unit: unit.to_string(),
                     source: "ps",
@@ -7163,20 +7283,21 @@ fn discover_units_from_podman_ps() -> Result<Vec<DiscoveredUnit>, String> {
 fn podman_ps_all_json() -> Result<Value, String> {
     PODMAN_PS_ALL_JSON
         .get_or_init(|| {
-            let output = Command::new("podman")
-                .arg("ps")
-                .arg("-a")
-                .arg("--format")
-                .arg("json")
-                .output()
+            let args = vec![
+                "ps".to_string(),
+                "-a".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ];
+            let result = host_backend()
+                .podman(&args)
                 .map_err(|_| "exec-failed".to_string())?;
 
-            if !output.status.success() {
+            if !result.status.success() {
                 return Err("non-zero-exit".to_string());
             }
 
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let trimmed = stdout.trim();
+            let trimmed = result.stdout.trim();
             if trimmed.is_empty() {
                 return Ok(Value::Array(Vec::new()));
             }
@@ -7191,22 +7312,22 @@ fn podman_image_inspect_json(image_ids: &[String]) -> Result<Value, String> {
         return Ok(Value::Array(Vec::new()));
     }
 
-    let mut cmd = Command::new("podman");
-    cmd.arg("image").arg("inspect");
+    let mut args: Vec<String> = vec!["image".to_string(), "inspect".to_string()];
     for id in image_ids {
         let trimmed = id.trim();
         if !trimmed.is_empty() {
-            cmd.arg(trimmed);
+            args.push(trimmed.to_string());
         }
     }
 
-    let output = cmd.output().map_err(|_| "exec-failed".to_string())?;
-    if !output.status.success() {
+    let result = host_backend()
+        .podman(&args)
+        .map_err(|_| "exec-failed".to_string())?;
+    if !result.status.success() {
         return Err("non-zero-exit".to_string());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let trimmed = stdout.trim();
+    let trimmed = result.stdout.trim();
     if trimmed.is_empty() {
         return Ok(Value::Array(Vec::new()));
     }
@@ -7565,7 +7686,9 @@ fn discovered_unit_list() -> Vec<String> {
         let mut units = Vec::with_capacity(rows.len());
         for row in rows {
             let unit: String = row.get("unit");
-            units.push(unit);
+            if host_backend::validate_systemd_unit_name(&unit).is_ok() {
+                units.push(unit);
+            }
         }
         Ok::<Vec<String>, sqlx::Error>(units)
     }) {
@@ -7685,7 +7808,10 @@ fn resolve_unit_identifier(raw: &str) -> Option<String> {
     }
 
     if trimmed.ends_with(".service") {
-        return Some(trimmed.to_string());
+        if host_backend::validate_systemd_unit_name(trimmed).is_ok() {
+            return Some(trimmed.to_string());
+        }
+        return None;
     }
 
     let slug = if trimmed.starts_with(GITHUB_ROUTE_PREFIX) {
@@ -7696,6 +7822,7 @@ fn resolve_unit_identifier(raw: &str) -> Option<String> {
 
     let synthetic = format!("/{slug}");
     lookup_unit_from_path(&synthetic)
+        .and_then(|unit| host_backend::validate_systemd_unit_name(&unit).ok().map(|_| unit))
 }
 
 fn trigger_units(units: &[String], dry_run: bool) -> Vec<UnitActionResult> {
@@ -9386,6 +9513,14 @@ fn build_command_meta(
         "exit": exit,
     });
 
+    // Always include which host backend executed the command.
+    let backend_meta = host_backend_meta();
+    if let (Some(dst), Value::Object(src)) = (meta.as_object_mut(), backend_meta) {
+        for (k, v) in src {
+            dst.insert(k, v);
+        }
+    }
+
     if !stdout.is_empty() {
         meta["stdout"] = Value::String(stdout);
         if truncated_stdout {
@@ -9490,15 +9625,15 @@ fn capture_unit_failure_diagnostics(unit: &str, journal_lines: i64) -> Vec<Prepa
         "--no-pager",
         "--full",
     ];
-    let status_result = run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user")
-            .arg("status")
-            .arg(unit)
-            .arg("--no-pager")
-            .arg("--full");
-        cmd
-    });
+    let status_args = vec![
+        "status".to_string(),
+        unit.to_string(),
+        "--no-pager".to_string(),
+        "--full".to_string(),
+    ];
+    let status_result = host_backend()
+        .systemctl_user(&status_args)
+        .map_err(host_backend_error_to_string);
     let status_ok = matches!(status_result.as_ref(), Ok(res) if res.success());
     let status_meta = build_unit_diagnostics_command_meta(
         unit,
@@ -9531,17 +9666,17 @@ fn capture_unit_failure_diagnostics(unit: &str, journal_lines: i64) -> Vec<Prepa
         "--no-pager",
         "--output=short-precise",
     ];
-    let journal_result = run_quiet_command({
-        let mut cmd = Command::new("journalctl");
-        cmd.arg("--user")
-            .arg("-u")
-            .arg(unit)
-            .arg("-n")
-            .arg(&n_str)
-            .arg("--no-pager")
-            .arg("--output=short-precise");
-        cmd
-    });
+    let journal_args = vec![
+        "-u".to_string(),
+        unit.to_string(),
+        "-n".to_string(),
+        n_str.clone(),
+        "--no-pager".to_string(),
+        "--output=short-precise".to_string(),
+    ];
+    let journal_result = host_backend()
+        .journalctl_user(&journal_args)
+        .map_err(host_backend_error_to_string);
     let journal_ok = matches!(journal_result.as_ref(), Ok(res) if res.success());
     let journal_meta = build_unit_diagnostics_command_meta(
         unit,
@@ -9575,18 +9710,14 @@ fn podman_health() -> Result<(), String> {
                 return Ok(());
             }
 
-            let result = run_quiet_command({
-                let mut cmd = Command::new("podman");
-                cmd.arg("--version");
-                cmd
-            });
-            match result {
+            let args = vec!["--version".to_string()];
+            match host_backend().podman(&args) {
                 Ok(res) if res.success() => Ok(()),
                 Ok(res) => Err(format!(
                     "podman unavailable: {}",
                     exit_code_string(&res.status)
                 )),
-                Err(err) => Err(format!("podman unavailable: {err}")),
+                Err(err) => Err(format!("podman unavailable: {}", host_backend_error_to_string(err))),
             }
         })
         .clone()
@@ -9600,56 +9731,50 @@ fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
     //
     // If busctl is not available at all (e.g. on non-systemd dev hosts), fall
     // back to the previous `systemctl --user start` behaviour.
-    if let Ok(result) = run_quiet_command({
-        let mut cmd = Command::new("busctl");
-        cmd.arg("--user")
-            .arg("call")
-            .arg("org.freedesktop.systemd1")
-            .arg("/org/freedesktop/systemd1")
-            .arg("org.freedesktop.systemd1.Manager")
-            .arg("StartUnit")
-            .arg("ss")
-            .arg(unit)
-            .arg("replace");
-        cmd
-    }) {
+    let busctl_args = vec![
+        "call".to_string(),
+        "org.freedesktop.systemd1".to_string(),
+        "/org/freedesktop/systemd1".to_string(),
+        "org.freedesktop.systemd1.Manager".to_string(),
+        "StartUnit".to_string(),
+        "ss".to_string(),
+        unit.to_string(),
+        "replace".to_string(),
+    ];
+    if let Ok(result) = host_backend().busctl_user(&busctl_args) {
         // Always return the busctl result to the caller; non-zero exit codes
         // are treated as failures by the higher-level logic which will keep
         // returning 500s and surfacing stderr in task logs.
         return Ok(result);
     }
 
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg("start").arg(unit);
-        cmd
-    })
+    let systemctl_args = vec!["start".to_string(), unit.to_string()];
+    host_backend()
+        .systemctl_user(&systemctl_args)
+        .map_err(host_backend_error_to_string)
 }
 
 fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
     // See start_auto_update_unit for rationale; use the same D-Bus path for
     // restart operations, with a systemctl fallback when busctl is missing.
-    if let Ok(result) = run_quiet_command({
-        let mut cmd = Command::new("busctl");
-        cmd.arg("--user")
-            .arg("call")
-            .arg("org.freedesktop.systemd1")
-            .arg("/org/freedesktop/systemd1")
-            .arg("org.freedesktop.systemd1.Manager")
-            .arg("RestartUnit")
-            .arg("ss")
-            .arg(unit)
-            .arg("replace");
-        cmd
-    }) {
+    let busctl_args = vec![
+        "call".to_string(),
+        "org.freedesktop.systemd1".to_string(),
+        "/org/freedesktop/systemd1".to_string(),
+        "org.freedesktop.systemd1.Manager".to_string(),
+        "RestartUnit".to_string(),
+        "ss".to_string(),
+        unit.to_string(),
+        "replace".to_string(),
+    ];
+    if let Ok(result) = host_backend().busctl_user(&busctl_args) {
         return Ok(result);
     }
 
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg("restart").arg(unit);
-        cmd
-    })
+    let systemctl_args = vec!["restart".to_string(), unit.to_string()];
+    host_backend()
+        .systemctl_user(&systemctl_args)
+        .map_err(host_backend_error_to_string)
 }
 
 #[derive(Clone, Copy)]
@@ -9697,19 +9822,17 @@ fn run_unit_operation(unit: &str, purpose: UnitOperationPurpose) -> UnitOperatio
         purpose.busctl_method()
     );
 
-    if let Ok(result) = run_quiet_command({
-        let mut cmd = Command::new("busctl");
-        cmd.arg("--user")
-            .arg("call")
-            .arg("org.freedesktop.systemd1")
-            .arg("/org/freedesktop/systemd1")
-            .arg("org.freedesktop.systemd1.Manager")
-            .arg(purpose.busctl_method())
-            .arg("ss")
-            .arg(unit)
-            .arg("replace");
-        cmd
-    }) {
+    let busctl_args = vec![
+        "call".to_string(),
+        "org.freedesktop.systemd1".to_string(),
+        "/org/freedesktop/systemd1".to_string(),
+        "org.freedesktop.systemd1.Manager".to_string(),
+        purpose.busctl_method().to_string(),
+        "ss".to_string(),
+        unit.to_string(),
+        "replace".to_string(),
+    ];
+    if let Ok(result) = host_backend().busctl_user(&busctl_args) {
         return UnitOperationRun {
             runner: "busctl",
             purpose,
@@ -9720,11 +9843,10 @@ fn run_unit_operation(unit: &str, purpose: UnitOperationPurpose) -> UnitOperatio
         };
     }
 
-    let result = run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg(purpose.as_str()).arg(unit);
-        cmd
-    });
+    let systemctl_args = vec![purpose.as_str().to_string(), unit.to_string()];
+    let result = host_backend()
+        .systemctl_user(&systemctl_args)
+        .map_err(host_backend_error_to_string);
 
     UnitOperationRun {
         runner: "systemctl",
@@ -9844,34 +9966,32 @@ fn build_unit_operation_command_meta(
 
 /// Best-effort graceful stop of a systemd unit backing a running task.
 fn stop_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user").arg("stop").arg(unit);
-        cmd
-    })
+    let args = vec!["stop".to_string(), unit.to_string()];
+    host_backend()
+        .systemctl_user(&args)
+        .map_err(host_backend_error_to_string)
 }
 
 /// Forcefully terminate a systemd unit backing a running task.
 fn kill_task_runner_unit(unit: &str) -> Result<CommandExecResult, String> {
-    run_quiet_command({
-        let mut cmd = Command::new("systemctl");
-        cmd.arg("--user")
-            .arg("kill")
-            .arg("--signal=SIGKILL")
-            .arg(unit);
-        cmd
-    })
+    let args = vec![
+        "kill".to_string(),
+        "--signal=SIGKILL".to_string(),
+        unit.to_string(),
+    ];
+    host_backend()
+        .systemctl_user(&args)
+        .map_err(host_backend_error_to_string)
 }
 
 fn pull_container_image(image: &str) -> Result<CommandExecResult, String> {
     let mut last_result: Option<CommandExecResult> = None;
 
     for attempt in 1..=PULL_RETRY_ATTEMPTS {
-        let result = run_quiet_command({
-            let mut cmd = Command::new("podman");
-            cmd.arg("pull").arg(image);
-            cmd
-        })?;
+        let args = vec!["pull".to_string(), image.to_string()];
+        let result = host_backend()
+            .podman(&args)
+            .map_err(host_backend_error_to_string)?;
         if result.success() {
             return Ok(result);
         }
@@ -9890,11 +10010,8 @@ fn prune_images_for_task(task_id: &str, unit: &str) {
     let command = "podman image prune -f";
     let argv = ["podman", "image", "prune", "-f"];
 
-    match run_quiet_command({
-        let mut cmd = Command::new("podman");
-        cmd.arg("image").arg("prune").arg("-f");
-        cmd
-    }) {
+    let args = vec!["image".to_string(), "prune".to_string(), "-f".to_string()];
+    match host_backend().podman(&args).map_err(host_backend_error_to_string) {
         Ok(result) => {
             let extra_meta = json!({ "unit": unit });
             let meta = build_command_meta(command, &argv, &result, Some(extra_meta));
@@ -10218,6 +10335,7 @@ fn update_task_state_with_unit(
     log_level: &str,
     meta: Value,
 ) {
+    let meta = merge_task_meta(meta, host_backend_meta());
     let task_id_owned = task_id.to_string();
     let unit_owned = unit.to_string();
     let status_owned = new_status.to_string();
@@ -10302,6 +10420,7 @@ fn update_task_state_with_unit_error(
     log_level: &str,
     meta: Value,
 ) {
+    let meta = merge_task_meta(meta, host_backend_meta());
     let task_id_owned = task_id.to_string();
     let unit_owned = unit.to_string();
     let status_owned = new_status.to_string();
@@ -10532,6 +10651,7 @@ fn append_task_log(
     unit: Option<&str>,
     meta: Value,
 ) {
+    let meta = merge_task_meta(meta, host_backend_meta());
     let task_id_owned = task_id.to_string();
     let level_owned = level.to_string();
     let action_owned = action.to_string();
@@ -11319,31 +11439,32 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
     );
 
     let log_dir_opt = auto_update_log_dir();
+    #[cfg(not(test))]
     let mut baseline_files: HashSet<String> = HashSet::new();
+    #[cfg(test)]
+    let baseline_files: HashSet<String> = HashSet::new();
+
+    // In production we snapshot existing JSONL files to avoid mixing logs from
+    // previous runs. In tests we skip this so that pre-seeded JSONL files can
+    // be picked up deterministically without background threads.
+    #[cfg(not(test))]
     if let Some(ref dir) = log_dir_opt {
-        // In production we snapshot existing JSONL files to avoid mixing logs
-        // from previous runs. In tests we skip this so that pre-seeded JSONL
-        // files can be picked up deterministically without background threads.
-        #[cfg(not(test))]
-        if let Ok(read_dir) = fs::read_dir(dir) {
-            for entry in read_dir.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        if let Ok(names) = host_backend().list_dir(dir) {
+            for name in names {
+                if Path::new(&name).extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    baseline_files.insert(name.to_string());
-                }
+                baseline_files.insert(name);
             }
         }
     }
 
     let start_instant = Instant::now();
     let mut summary_event: Option<Value> = None;
-    let mut summary_log_file: Option<PathBuf> = None;
+    let mut summary_log_file: Option<String> = None;
 
     if let Some(log_dir) = log_dir_opt.clone() {
-        let mut known_file: Option<PathBuf> = None;
+        let mut known_file: Option<host_backend::HostAbsPath> = None;
         let mut processed_lines: usize = 0;
 
         loop {
@@ -11355,35 +11476,43 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
             }
 
             if known_file.is_none() {
-                let mut latest: Option<(SystemTime, PathBuf)> = None;
-                match fs::read_dir(&log_dir) {
-                    Ok(read_dir) => {
-                        for entry in read_dir.flatten() {
-                            let path = entry.path();
-                            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                let mut latest: Option<(SystemTime, host_backend::HostAbsPath)> = None;
+                match host_backend().list_dir(&log_dir) {
+                    Ok(names) => {
+                        for name in names {
+                            if Path::new(&name).extension().and_then(|e| e.to_str()) != Some("jsonl") {
                                 continue;
                             }
-                            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                if baseline_files.contains(name) {
-                                    continue;
-                                }
+                            if baseline_files.contains(&name) {
+                                continue;
                             }
-                            let Ok(meta) = fs::metadata(&path) else {
+
+                            let path = log_dir.as_path().join(&name);
+                            let Ok(host_path) = host_backend::HostAbsPath::parse(&path.to_string_lossy()) else {
                                 continue;
                             };
-                            let Ok(modified) = meta.modified() else {
+
+                            let Ok(meta) = host_backend().metadata(&host_path) else {
                                 continue;
                             };
+                            if !meta.is_file {
+                                continue;
+                            }
+                            let Some(modified) = meta.modified else {
+                                continue;
+                            };
+
                             match latest {
                                 Some((ts, _)) if modified <= ts => {}
-                                _ => latest = Some((modified, path)),
+                                _ => latest = Some((modified, host_path)),
                             }
                         }
                     }
                     Err(err) => {
                         log_message(&format!(
-                            "warn auto-update-run-log-dir-read-failed dir={} err={err}",
-                            log_dir.to_string_lossy()
+                            "warn auto-update-run-log-dir-read-failed dir={} err={}",
+                            log_dir.as_str(),
+                            host_backend_error_to_string(err)
                         ));
                         break;
                     }
@@ -11400,23 +11529,20 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
             }
 
             let path = known_file.as_ref().cloned().unwrap();
-            let file = match File::open(&path) {
-                Ok(f) => f,
+            let contents = match host_backend().read_file_to_string(&path) {
+                Ok(c) => c,
                 Err(err) => {
                     log_message(&format!(
-                        "warn auto-update-run-open-log-failed file={} err={err}",
-                        path.to_string_lossy()
+                        "warn auto-update-run-open-log-failed file={} err={}",
+                        path.as_str(),
+                        host_backend_error_to_string(err)
                     ));
                     break;
                 }
             };
 
-            let reader = io::BufReader::new(file);
             let mut line_index: usize = 0;
-            for line_result in reader.lines() {
-                let Ok(line) = line_result else {
-                    continue;
-                };
+            for line in contents.lines() {
                 if line_index < processed_lines {
                     line_index = line_index.saturating_add(1);
                     continue;
@@ -11442,7 +11568,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
                             json!({
                                 "unit": unit_owned,
                                 "raw": trimmed,
-                                "log_file": path.to_string_lossy(),
+                                "log_file": path.as_str(),
                             }),
                         );
                         continue;
@@ -11516,13 +11642,13 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
                     Some(unit),
                     json!({
                         "unit": unit_owned,
-                        "log_file": path.to_string_lossy(),
+                        "log_file": path.as_str(),
                         "event": event,
                     }),
                 );
 
                 if event_type == "summary" {
-                    summary_log_file = Some(path.clone());
+                    summary_log_file = Some(path.as_str().to_string());
                     summary_event = Some(event);
                     break;
                 }
@@ -11538,7 +11664,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
 
     let summary_meta_log_dir = log_dir_opt
         .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
+        .map(|p| p.as_str().to_string());
 
     if let Some(summary) = summary_event {
         let counts = summary
@@ -11579,7 +11705,7 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
             "unchanged": unchanged,
             "log_file": summary_log_file
                 .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
+                .cloned(),
             "log_dir": summary_meta_log_dir,
         });
 
@@ -11728,12 +11854,13 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
         return;
     };
 
-    let read_dir = match fs::read_dir(&log_dir) {
-        Ok(rd) => rd,
+    let names = match host_backend().list_dir(&log_dir) {
+        Ok(names) => names,
         Err(err) => {
             log_message(&format!(
-                "debug auto-update-logs-skip dir-unreadable dir={} err={err}",
-                log_dir.to_string_lossy()
+                "debug auto-update-logs-skip dir-unreadable dir={} err={}",
+                log_dir.as_str(),
+                host_backend_error_to_string(err)
             ));
             return;
         }
@@ -11748,19 +11875,22 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
         .checked_sub(Duration::from_secs(max_age_secs))
         .unwrap_or(UNIX_EPOCH);
 
-    let mut latest: Option<(SystemTime, PathBuf)> = None;
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
+    let mut latest: Option<(SystemTime, host_backend::HostAbsPath)> = None;
+    for name in names {
+        if Path::new(&name).extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(meta) = fs::metadata(&path) else {
+        let path = log_dir.as_path().join(&name);
+        let Ok(path) = host_backend::HostAbsPath::parse(&path.to_string_lossy()) else {
             continue;
         };
-        let Ok(modified) = meta.modified() else {
+        let Ok(meta) = host_backend().metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file {
+            continue;
+        }
+        let Some(modified) = meta.modified else {
             continue;
         };
         if modified < threshold {
@@ -11775,29 +11905,25 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
     let Some((_, path)) = latest else {
         log_message(&format!(
             "debug auto-update-logs-skip no-recent-jsonl dir={}",
-            log_dir.to_string_lossy()
+            log_dir.as_str()
         ));
         return;
     };
 
-    let file = match File::open(&path) {
-        Ok(f) => f,
+    let contents = match host_backend().read_file_to_string(&path) {
+        Ok(c) => c,
         Err(err) => {
             log_message(&format!(
-                "debug auto-update-logs-skip open-failed file={} err={err}",
-                path.to_string_lossy()
+                "debug auto-update-logs-skip open-failed file={} err={}",
+                path.as_str(),
+                host_backend_error_to_string(err)
             ));
             return;
         }
     };
-
-    let reader = io::BufReader::new(file);
     let mut warnings: Vec<Value> = Vec::new();
 
-    for line_result in reader.lines() {
-        let Ok(line) = line_result else {
-            continue;
-        };
+    for line in contents.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -11819,7 +11945,7 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
     if warnings.is_empty() {
         log_message(&format!(
             "debug auto-update-logs-none task_id={task_id} unit={unit} file={}",
-            path.to_string_lossy()
+            path.as_str()
         ));
         return;
     }
@@ -11827,7 +11953,7 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
     let now_secs = current_unix_secs() as i64;
     let task_id_db = task_id.to_string();
     let unit_db = unit.to_string();
-    let log_file = path.to_string_lossy().into_owned();
+    let log_file = path.as_str().to_string();
 
     let summary_meta = json!({
         "unit": unit_db,
@@ -11955,7 +12081,7 @@ fn ingest_auto_update_warnings(task_id: &str, unit: &str) {
     if let Err(err) = db_result {
         log_message(&format!(
             "warn auto-update-log-ingest-failed task_id={task_id} unit={unit} file={} err={err}",
-            path.to_string_lossy()
+            path.as_str()
         ));
         return;
     }
@@ -12061,8 +12187,10 @@ fn run_maintenance_prune_task(
 
 fn unit_configured_image(unit: &str) -> Option<String> {
     if let Some(path) = unit_definition_path(unit) {
-        if let Some(image) = parse_container_image(&path) {
-            return Some(image);
+        if let Ok(contents) = host_backend().read_file_to_string(&path) {
+            if let Some(image) = parse_container_image_contents(&contents) {
+                return Some(image);
+            }
         }
     }
 
@@ -12071,47 +12199,50 @@ fn unit_configured_image(unit: &str) -> Option<String> {
         return None;
     }
 
-    let fallback = container_systemd_dir().join(format!("{trimmed}.container"));
-    parse_container_image(&fallback)
+    let dir = container_systemd_dir().ok()?;
+    let fallback = dir.as_path().join(format!("{trimmed}.container"));
+    let fallback = host_backend::HostAbsPath::parse(&fallback.to_string_lossy()).ok()?;
+    let contents = host_backend().read_file_to_string(&fallback).ok()?;
+    parse_container_image_contents(&contents)
 }
 
-fn unit_definition_path(unit: &str) -> Option<PathBuf> {
-    let output = Command::new("systemctl")
-        .arg("--user")
-        .arg("show")
-        .arg(unit)
-        .arg("--property=SourcePath")
-        .arg("--property=FragmentPath")
-        .output()
-        .ok()?;
+fn unit_definition_path(unit: &str) -> Option<host_backend::HostAbsPath> {
+    let args = vec![
+        "show".to_string(),
+        unit.to_string(),
+        "--property=SourcePath".to_string(),
+        "--property=FragmentPath".to_string(),
+    ];
+    let output = host_backend().systemctl_user(&args).ok()?;
 
     if !output.status.success() {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut source: Option<PathBuf> = None;
-    let mut fragment: Option<PathBuf> = None;
+    let stdout = output.stdout;
+    let mut source: Option<String> = None;
+    let mut fragment: Option<String> = None;
 
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("SourcePath=") {
             let trimmed = rest.trim();
-            if !trimmed.is_empty() {
-                source = Some(PathBuf::from(trimmed));
+            if !trimmed.is_empty() && trimmed != "n/a" && trimmed != "-" {
+                source = Some(trimmed.to_string());
             }
         } else if let Some(rest) = line.strip_prefix("FragmentPath=") {
             let trimmed = rest.trim();
-            if !trimmed.is_empty() {
-                fragment = Some(PathBuf::from(trimmed));
+            if !trimmed.is_empty() && trimmed != "n/a" && trimmed != "-" {
+                fragment = Some(trimmed.to_string());
             }
         }
     }
 
-    source.or(fragment)
+    source
+        .or(fragment)
+        .and_then(|p| host_backend::HostAbsPath::parse(&p).ok())
 }
 
-fn parse_container_image(path: &Path) -> Option<String> {
-    let contents = fs::read_to_string(path).ok()?;
+fn parse_container_image_contents(contents: &str) -> Option<String> {
     let mut in_container_section = false;
 
     for raw_line in contents.lines() {
@@ -12318,7 +12449,8 @@ mod tests {
         )
         .unwrap();
 
-        let image = parse_container_image(file.path()).expect("image expected");
+        let contents = fs::read_to_string(file.path()).unwrap();
+        let image = parse_container_image_contents(&contents).expect("image expected");
         assert_eq!(image, "ghcr.io/example/service:latest");
     }
 
