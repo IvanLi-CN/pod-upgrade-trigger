@@ -90,26 +90,20 @@ RUN set -euo pipefail; \
   ln -sf /usr/lib/systemd/system/sshd.service /etc/systemd/system/multi-user.target.wants/sshd.service
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY podup-e2e-noop.container /usr/local/share/podup-e2e-noop.container
+COPY podup-e2e-noop.service /usr/local/share/podup-e2e-noop.service
 
 RUN set -euo pipefail; \
   chmod 0755 /usr/local/bin/entrypoint.sh; \
   ops_uid="${OPS_UID}"; \
   ops_gid="${OPS_GID}"; \
-  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/podup-e2e-noop.container "/home/${OPS_USER}/.local/share/podup-e2e/quadlets/podup-e2e-noop.container"
+  install -d -m 0755 -o "${ops_uid}" -g "${ops_gid}" "/home/${OPS_USER}/.config/systemd/user"; \
+  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/podup-e2e-noop.service "/home/${OPS_USER}/.config/systemd/user/podup-e2e-noop.service"; \
+  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/podup-e2e-noop.service "/home/${OPS_USER}/.local/share/podup-e2e/quadlets/podup-e2e-noop.service"
 
 RUN set -euo pipefail; \
   printf '%s\n' '[storage]' 'driver = "vfs"' >"/home/${OPS_USER}/.config/containers/storage.conf"; \
   chown "${OPS_UID}:${OPS_GID}" "/home/${OPS_USER}/.config/containers/storage.conf"; \
   chmod 0644 "/home/${OPS_USER}/.config/containers/storage.conf"
-
-RUN set -euo pipefail; \
-  su - "${OPS_USER}" -s /bin/bash -c ' \
-    mkdir -p "$HOME/.config/systemd/user" && \
-    QUADLET_UNIT_DIRS="$HOME/.local/share/podup-e2e/quadlets" /usr/libexec/podman/quadlet -user -dryrun \
-      | awk '"'"'BEGIN{p=0} $0=="---podup-e2e-noop.service---"{p=1;next} p{print}'"'"' \
-      >"$HOME/.config/systemd/user/podup-e2e-noop.service" \
-  '
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/sbin/init"]

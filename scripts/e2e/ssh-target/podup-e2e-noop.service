@@ -1,0 +1,9 @@
+[Unit]
+Description=pod-upgrade-trigger E2E noop (no side effects)
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sleep infinity
+
+[Install]
+WantedBy=default.target

@@ -88,9 +88,23 @@ echo "[deploy] ops_uid=$ops_uid ops_gid=$ops_gid"
 echo "[deploy] ensuring persistent ssh host key dir exists"
 ssh_root "install -d -m 0700 /var/lib/podup-ssh-target/ssh-host-keys"
 
-echo "[deploy] docker build (on remote)"
-runtime="docker"
-if ssh_root "
+runtime=""
+force_rebuild="${PODUP_SSH_TARGET_REBUILD:-0}"
+if [[ "$force_rebuild" != "1" ]]; then
+  if ssh_root "docker image inspect '$image_tag' >/dev/null 2>&1"; then
+    runtime="docker"
+    echo "[deploy] using existing docker image: $image_tag"
+  elif ssh_root "command -v podman >/dev/null 2>&1 && podman image exists '$image_tag'"; then
+    runtime="podman"
+    echo "[deploy] using existing podman image: $image_tag"
+  fi
+fi
+
+if [[ -z "$runtime" ]]; then
+  echo "[deploy] building image (set PODUP_SSH_TARGET_REBUILD=1 to force rebuild)"
+  echo "[deploy] docker build (on remote)"
+  runtime="docker"
+  if ssh_root "
 docker version >/dev/null
 docker build --pull -t '$image_tag' \
   --build-arg OPS_USER='$ops_user' \
@@ -115,12 +129,46 @@ podman build --pull=always -t '$image_tag' \
     ssh_root "
 command -v podman >/dev/null
 
-build_ctr=\"podup-ssh-target-build-\$(date +%s)\"
-podman rm -f \"\$build_ctr\" >/dev/null 2>&1 || true
+build_ctr=\"podup-ssh-target-build\"
 
-podman run -d --name \"\$build_ctr\" registry.fedoraproject.org/fedora:42 bash -lc 'sleep infinity'
+# If a previous run was interrupted (e.g. SSH timeout), reuse the most recent
+# in-progress build container instead of starting from scratch.
+if ! podman inspect \"\$build_ctr\" >/dev/null 2>&1; then
+  prev_ctr=\$(podman ps -a --format '{{.Names}}' | grep '^podup-ssh-target-build-' | sort -t- -k5,5n | tail -n 1 || true)
+  if [[ -n \"\$prev_ctr\" ]]; then
+    podman rename \"\$prev_ctr\" \"\$build_ctr\" >/dev/null 2>&1 || true
+  fi
+fi
 
-podman exec \"\$build_ctr\" bash -lc 'dnf -y update && dnf -y install systemd dbus dbus-tools openssh-server openssh-clients podman podman-docker slirp4netns fuse-overlayfs crun shadow-utils procps-ng iproute which sudo && dnf clean all'
+# Best-effort cleanup of older interrupted build containers.
+for ctr in \$(podman ps -a --format '{{.Names}}' | grep '^podup-ssh-target-build-' || true); do
+  podman rm -f \"\$ctr\" >/dev/null 2>&1 || true
+done
+
+if ! podman inspect \"\$build_ctr\" >/dev/null 2>&1; then
+  podman run -d --name \"\$build_ctr\" registry.fedoraproject.org/fedora:42 bash -lc 'sleep infinity'
+else
+  running=\$(podman inspect \"\$build_ctr\" --format '{{.State.Running}}' 2>/dev/null || echo false)
+  if [[ \"\$running\" != \"true\" ]]; then
+    podman start \"\$build_ctr\" >/dev/null
+  fi
+fi
+
+if ! podman exec \"\$build_ctr\" bash -lc 'rpm -q systemd dbus openssh-server podman >/dev/null 2>&1'; then
+  podman exec \"\$build_ctr\" bash -lc '
+set -euo pipefail
+for attempt in 1 2 3 4 5; do
+  if dnf -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs --setopt=keepcache=True install \
+    systemd dbus dbus-tools openssh-server openssh-clients podman podman-docker slirp4netns fuse-overlayfs crun shadow-utils procps-ng iproute which sudo; then
+    dnf clean all
+    exit 0
+  fi
+  echo \"[podup-ssh-target] WARNING: dnf install failed (attempt=\${attempt})\" >&2
+  sleep 3
+done
+exit 1
+'
+fi
 
 podman exec --env OPS_USER='$ops_user' --env OPS_UID='$ops_uid' --env OPS_GID='$ops_gid' \"\$build_ctr\" bash -lc '
 set -euo pipefail
@@ -140,6 +188,8 @@ fi
 
 install -d -m 0700 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.ssh\"
 install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.config\"
+install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.config/systemd\"
+install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.config/systemd/user\"
 install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.config/containers\"
 install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.config/containers/systemd\"
 install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.local\"
@@ -196,24 +246,22 @@ ln -sf /usr/lib/systemd/system/sshd.service /etc/systemd/system/multi-user.targe
 '
 
 podman cp '$remote_dir/entrypoint.sh' \"\$build_ctr:/usr/local/bin/entrypoint.sh\"
-podman cp '$remote_dir/podup-e2e-noop.container' \"\$build_ctr:/home/$ops_user/.local/share/podup-e2e/quadlets/podup-e2e-noop.container\"
+podman cp '$remote_dir/podup-e2e-noop.service' \"\$build_ctr:/home/$ops_user/.config/systemd/user/podup-e2e-noop.service\"
+podman cp '$remote_dir/podup-e2e-noop.service' \"\$build_ctr:/home/$ops_user/.local/share/podup-e2e/quadlets/podup-e2e-noop.service\"
 
 podman exec --env OPS_USER='$ops_user' --env OPS_UID='$ops_uid' --env OPS_GID='$ops_gid' \"\$build_ctr\" bash -lc '
 set -euo pipefail
 chmod 0755 /usr/local/bin/entrypoint.sh
-chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.local/share/podup-e2e/quadlets/podup-e2e-noop.container\"
-chmod 0644 \"/home/\$OPS_USER/.local/share/podup-e2e/quadlets/podup-e2e-noop.container\"
 
 home=\"/home/\$OPS_USER\"
 mkdir -p \"\$home/.config/systemd/user\"
 chown \"\$OPS_UID:\$OPS_GID\" \"\$home/.config/systemd\" \"\$home/.config/systemd/user\"
-generated=\"\$(QUADLET_UNIT_DIRS=\"\$home/.local/share/podup-e2e/quadlets\" HOME=\"\$home\" /usr/libexec/podman/quadlet -user -dryrun)\"
-start_line=\"\$(printf '%s\\n' \"\$generated\" | grep -n '^---podup-e2e-noop.service---\$' | head -n 1 | cut -d: -f1)\"
-start_line=\$((start_line + 1))
-printf '%s\\n' \"\$generated\" | tail -n \"+\$start_line\" >\"\$home/.config/systemd/user/podup-e2e-noop.service\"
 
 chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.config/systemd/user/podup-e2e-noop.service\"
 chmod 0644 \"/home/\$OPS_USER/.config/systemd/user/podup-e2e-noop.service\"
+
+chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.local/share/podup-e2e/quadlets/podup-e2e-noop.service\"
+chmod 0644 \"/home/\$OPS_USER/.local/share/podup-e2e/quadlets/podup-e2e-noop.service\"
 '
 
 podman commit \
@@ -227,6 +275,7 @@ podman rm -f \"\$build_ctr\" >/dev/null
 "
     runtime="podman"
   fi
+fi
 fi
 
 echo "[deploy] starting container ($container_name)"

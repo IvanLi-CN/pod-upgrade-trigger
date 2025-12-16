@@ -73,9 +73,9 @@ check "systemctl --user works (no bus error)" "ssh_target 'systemctl --user list
 check "podman --version returns 0" "ssh_target 'podman --version'"
 
 check "daemon-reload ok" "ssh_target 'systemctl --user daemon-reload'"
-check "enable --now podup-e2e-noop.service" "ssh_target 'systemctl --user enable --now podup-e2e-noop.service'"
-check "restart podup-e2e-noop.service" "ssh_target 'systemctl --user restart podup-e2e-noop.service'"
-check "stop podup-e2e-noop.service" "ssh_target 'systemctl --user stop podup-e2e-noop.service'"
+check "enable --now podup-e2e-noop.service" "ssh_target 'systemctl --user enable --now --no-block podup-e2e-noop.service; for i in {1..30}; do systemctl --user is-active --quiet podup-e2e-noop.service && exit 0; sleep 1; done; systemctl --user status podup-e2e-noop.service --no-pager || true; exit 1'"
+check "restart podup-e2e-noop.service" "ssh_target 'systemctl --user restart --no-block podup-e2e-noop.service; for i in {1..30}; do systemctl --user is-active --quiet podup-e2e-noop.service && exit 0; sleep 1; done; systemctl --user status podup-e2e-noop.service --no-pager || true; exit 1'"
+check "stop podup-e2e-noop.service" "ssh_target 'systemctl --user stop --no-block podup-e2e-noop.service; for i in {1..30}; do systemctl --user is-active --quiet podup-e2e-noop.service || exit 0; sleep 1; done; systemctl --user status podup-e2e-noop.service --no-pager || true; exit 1'"
 
 echo "[verify] pass=$pass fail=$fail"
 if [[ "$fail" -ne 0 ]]; then

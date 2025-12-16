@@ -233,16 +233,21 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
 新增一个本机任务执行器：
 
 - Dispatch：
-  - `spawn(current_exe, ["run-task", task_id], inherit_env=collect_run_task_env())`
-  - 将 `task_id -> child_pid` 持久化到进程内表（必要时也可落盘，但本次可先内存）。
+  - `spawn(current_exe, ["--run-task", task_id], env=collect_run_task_env())`
+  - 将 `task_id -> child_pid` 维护在进程内表（内存映射），并将 pid **持久化到本机 pidfile**，以支持 `http-server` “每个请求派生一个 `server` 进程”的模型下跨进程 stop/force-stop：
+    - pidfile 路径：`$PODUP_STATE_DIR/task-pids/<task_id>.pid`（若未设置 `PODUP_STATE_DIR`，回退到系统临时目录 `$(tmp)/pod-upgrade-trigger/task-pids/<task_id>.pid`）。
+    - `run-task` 子进程退出时会主动清理自身 pidfile，避免遗留脏映射；同时 stop/force-stop 遇到 `ESRCH` 也会清理 pidfile 作为兜底。
 - Stop/Force-stop：
-  - `stop`: 发送温和信号（类 Unix 上 `SIGTERM`；跨平台可退化为 `kill`）。
-  - `force-stop`: 强制终止子进程。
-  - 并写入 `task_logs` 说明“via=local-child”。
+  - `stop`: 对映射中的 `pid` 发送 `SIGTERM`（不依赖外部 `kill` 命令）。
+  - `force-stop`: 对映射中的 `pid` 发送 `SIGKILL`。
+  - 若找不到 `pid`（子进程已退出 / 进程重启导致映射丢失），API 返回明确错误并写入 `task_logs`（不 hang）。
 
 语义差异（需要在 UI/文档说明）：
 
-- 本机进程重启后，内存映射丢失：对“历史 running task”的 stop/force-stop 可能退化为不可用；此时应在 API 上返回明确错误并提示“任务由旧进程启动，无法控制”。
+- `http-server` 模式下，每个请求都会派生新的 `server` 进程：因此 stop/force-stop **不能**依赖单进程内存映射，必须通过 pidfile 跨进程定位 run-task 子进程。
+- 本机进程重启/崩溃后：
+  - 若 run-task 子进程仍在运行，pidfile 仍可用于 stop/force-stop；
+  - 若 pidfile 遗留但 pid 已不存在，API 会返回明确错误并清理 pidfile（避免下一次误判）。
 - 生产环境仍可使用 systemd-run，保持可控性与持久性。
 
 ## 本地自我更新（UI 入口）设计
@@ -283,17 +288,15 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
 ### 建议新增脚本（命名仅建议）
 
 - `scripts/test-e2e-ssh.sh`：
-  - 读取/校验必要 env；
-  - 调用 `scripts/e2e/ssh-preflight.sh`；
-  - 启动后端（本机）并运行 `cargo test --test e2e_ssh -- --nocapture`（或在现有 `tests/e2e.rs` 中用 feature/ignored tests 分组）。
-- `scripts/e2e/ssh-preflight.sh`：
-  - 检查远端 `podman/systemctl` 可用；
-  - 检查 `systemctl --user` 可用（提示 enable-linger）；
-  - 检查/创建远端目录。
-- `scripts/e2e/ssh-prepare-env.sh`（最小集）：
-  - 验证 `PODUP_CONTAINER_DIR` / `PODUP_AUTO_UPDATE_LOG_DIR` 在 SSH target 内可读；
-  - 验证 `podup-e2e-noop.service` 存在且可 `restart`；
-  - （可选）打印远端 `podman/systemd` 版本信息，便于排障。
+  - 从开发机执行，输入参数为 `root@<host>`；
+  - 先跑基线验收 `scripts/e2e/test-host/verify.sh root@<host>`（确保任务 1 环境未被破坏）；
+  - 通过 `scripts/e2e/ssh-target/deploy.sh root@<host>` + `scripts/e2e/ssh-target/verify.sh root@<host>` 确保 SSH target 可用；
+  - 导出并固定本次 E2E 所需 env：
+    - `PODUP_E2E_SSH=1`（用于让 `tests/e2e_ssh.rs` 默认跳过，避免 CI 误跑）
+    - `PODUP_SSH_TARGET=ssh://ivan@<host>:2222`
+    - `PODUP_CONTAINER_DIR=/home/ivan/.local/share/podup-e2e/quadlets`
+    - `PODUP_AUTO_UPDATE_LOG_DIR=/home/ivan/.local/share/podup-e2e/logs-missing`
+  - 运行 `cargo test --locked --test e2e_ssh -- --nocapture`（不得注入 `tests/mock-bin` 到 `PATH`）。
 
 ### 并发与隔离
 
@@ -364,13 +367,14 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
 
 - 基线（任务 1 不得被破坏）：
   - `./scripts/e2e/test-host/verify.sh root@<host>` 仍 PASS
-- 部署 SSH target（从开发机执行，在测试机上 `docker build`）：
+- 部署 SSH target（从开发机执行，在测试机上构建/组装镜像并启动容器）：
   - `./scripts/e2e/ssh-target/deploy.sh root@<host>`
+  - 如需强制重建镜像：`PODUP_SSH_TARGET_REBUILD=1 ./scripts/e2e/ssh-target/deploy.sh root@<host>`
 - 自动化验收（从开发机执行）：
   - `./scripts/e2e/ssh-target/verify.sh root@<host>`
 
 1. 能在测试服务器上构建并运行测试容器（端口映射模式）：
-   - 通过 `scripts/e2e/ssh-target/deploy.sh` 在远端构建镜像并启动容器（端口固定 `2222:22`）
+   - 通过 `scripts/e2e/ssh-target/deploy.sh` 在远端构建/组装镜像并启动容器（端口固定 `2222:22`）
 2. 开发机通过 Host alias（`~/.ssh/config`）可直接 SSH 到容器，并默认 `StrictHostKeyChecking=accept-new` 可工作：
    - `ssh podup-test -- true` 返回 0（alias 指向 `Port 2222`）
    - 或直接：`ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -p 2222 ivan@<host> -- true` 返回 0
