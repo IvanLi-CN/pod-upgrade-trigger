@@ -11679,12 +11679,12 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
     } else {
         let summary = if dry_run {
             "podman auto-update dry-run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)"
-                .to_string()
+	                .to_string()
         } else {
             "podman auto-update run completed (no JSONL summary found; check podman auto-update JSONL logs or podman logs on the host)"
-                .to_string()
+	                .to_string()
         };
-        ("succeeded", "succeeded", "warning", summary)
+        ("unknown", "unknown", "warning", summary)
     };
 
     let meta = json!({
