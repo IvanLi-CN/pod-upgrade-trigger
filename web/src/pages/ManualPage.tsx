@@ -504,7 +504,11 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
     }
   }, [getJson, selectedTaskId])
 
-  // 当新的命令型日志进入 running 状态时，默认展开一次命令输出。
+  useEffect(() => {
+    setExpandedCommandLogs({})
+  }, [selectedTaskId])
+
+  // 当首次看到命令型日志时，默认展开命令输出（避免任务执行太快导致永远折叠）。
   useEffect(() => {
     if (!detailLogs || detailLogs.length === 0) return
     setExpandedCommandLogs((prev) => {
@@ -512,7 +516,6 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
       const next = { ...prev }
       for (const log of detailLogs) {
         if (next[log.id] !== undefined) continue
-        if (log.status !== 'running') continue
         if (!isCommandMeta(log.meta)) continue
         next[log.id] = true
         changed = true

@@ -34,4 +34,26 @@ if [[ "$*" =~ --user\ status\ (.+)\ --no-pager\ --full ]]; then
   exit 0
 fi
 
+if [[ "$*" =~ --user\ show\ ([^[:space:]]+) ]]; then
+  unit="${BASH_REMATCH[1]}"
+  active_state="active"
+  sub_state="running"
+  result="success"
+  unit_type="simple"
+  exec_main_status="0"
+
+  if [[ -n "${MOCK_SYSTEMCTL_SHOW_FAILED_UNIT:-}" && "${MOCK_SYSTEMCTL_SHOW_FAILED_UNIT}" == "$unit" ]]; then
+    active_state="failed"
+    result="failed"
+    exec_main_status="1"
+  fi
+
+  echo "ActiveState=${active_state}"
+  echo "SubState=${sub_state}"
+  echo "Result=${result}"
+  echo "Type=${unit_type}"
+  echo "ExecMainStatus=${exec_main_status}"
+  exit 0
+fi
+
 exit 0

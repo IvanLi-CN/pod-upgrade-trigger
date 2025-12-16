@@ -5,6 +5,7 @@ tests/mock-bin/log.txt
 /data/
 /http-server.log
 /http-server.pid
+/.env.local
 
 # Local HTTP dev/demo/test logs & pids
 /*-http*.log

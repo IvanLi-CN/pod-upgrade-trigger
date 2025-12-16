@@ -7,6 +7,16 @@ pid_file="$repo_root/dev-http.pid"
 
 cd "$repo_root"
 
+env_file="$repo_root/.env.local"
+if [ -f "$env_file" ]; then
+  echo "[dev] loading local env: $env_file"
+  set +u
+  set -a
+  . "$env_file"
+  set +a
+  set -u
+fi
+
 export PODUP_ENV="${PODUP_ENV:-dev}"
 export PATH="$repo_root/tests/mock-bin:${PATH:-}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
