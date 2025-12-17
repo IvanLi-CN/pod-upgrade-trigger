@@ -10289,6 +10289,13 @@ fn evaluate_unit_health(props: &HashMap<String, String>) -> UnitHealthVerdict {
 }
 
 fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict, String) {
+    // Quadlet/podman container units can legitimately take >5s to settle after a
+    // restart because the stop+start cycle is async (especially when the unit
+    // is still in ActiveState=deactivating/activating). Give it a larger
+    // window to avoid misclassifying healthy deploys as "unknown".
+    const HEALTH_STABILIZE_TIMEOUT_MS: u64 = 20_000;
+    const HEALTH_STABILIZE_POLL_MS: u64 = 200;
+
     let command = format!(
         "systemctl --user show {unit} --property=ActiveState --property=SubState --property=Result --property=Type --property=ExecMainStatus"
     );
@@ -10314,17 +10321,49 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
         "--property=ExecMainStatus".to_string(),
     ];
 
-    let outcome = host_backend()
-        .systemctl_user(&args)
-        .map_err(host_backend_error_to_string);
+    let started_at = std::time::Instant::now();
+    let mut attempts: u32 = 0;
+    let mut last_props: HashMap<String, String> = HashMap::new();
+    let outcome = loop {
+        attempts = attempts.saturating_add(1);
+        let outcome = host_backend()
+            .systemctl_user(&args)
+            .map_err(host_backend_error_to_string);
+
+        let Ok(result) = &outcome else {
+            break outcome;
+        };
+        if !result.success() {
+            break outcome;
+        }
+
+        last_props = parse_systemctl_show_properties(&result.stdout);
+        let active_state = last_props
+            .get("ActiveState")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let service_type = last_props
+            .get("Type")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        // For non-oneshot services, a restart/start job may temporarily report
+        // inactive/activating/deactivating. Give it a short window to settle
+        // before classifying health, otherwise we risk marking successful
+        // deploys as "unknown" due to a race.
+        if service_type != "oneshot" && active_state != "active" && active_state != "failed" {
+            if started_at.elapsed().as_millis() < HEALTH_STABILIZE_TIMEOUT_MS as u128 {
+                thread::sleep(Duration::from_millis(HEALTH_STABILIZE_POLL_MS));
+                continue;
+            }
+        }
+
+        break outcome;
+    };
 
     let (verdict, summary, meta) = match outcome {
         Ok(result) => {
-            let props = if result.success() {
-                parse_systemctl_show_properties(&result.stdout)
-            } else {
-                HashMap::new()
-            };
+            let props = if result.success() { last_props } else { HashMap::new() };
             let state_summary = unit_state_summary(&props);
             let verdict = if result.success() && !props.is_empty() {
                 evaluate_unit_health(&props)
@@ -10370,6 +10409,8 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
                 "result": props.get("Result"),
                 "service_type": props.get("Type"),
                 "exec_main_status": props.get("ExecMainStatus"),
+                "attempts": attempts,
+                "waited_ms": started_at.elapsed().as_millis() as u64,
             });
 
             let meta = build_command_meta(&command, &argv, &result, Some(extra_meta));
@@ -12337,6 +12378,19 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
             "Image pull succeeded",
             Some(&unit_owned),
             meta,
+        );
+    } else {
+        append_task_log(
+            task_id,
+            "info",
+            "image-pull",
+            "skipped",
+            "Image pull skipped (no image provided)",
+            Some(&unit_owned),
+            json!({
+                "unit": unit_owned.clone(),
+                "image": Option::<String>::None,
+            }),
         );
     }
 
