@@ -114,9 +114,10 @@ describe('ManualServiceRow stories', () => {
     })
   })
 
-  it('uses image (optional) placeholder without default_image', async () => {
+  it('uses image (required) placeholder without default_image', async () => {
     render(<WithoutDefaultImage />)
-    expect(await screen.findByPlaceholderText('image (optional)')).toBeInTheDocument()
+    expect(await screen.findByPlaceholderText('image (required)')).toBeInTheDocument()
+    expect(await screen.findByText('缺少镜像')).toBeInTheDocument()
     expect(await screen.findByText('v9.9.9')).toBeInTheDocument()
     expectCurrentVersionBetween({
       unit: 'demo.service',

@@ -191,7 +191,8 @@ export const WithoutDefaultImage: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     expect(await canvas.findByText('Demo service')).toBeInTheDocument()
-    expect(await canvas.findByPlaceholderText('image (optional)')).toBeInTheDocument()
+    expect(await canvas.findByText('缺少镜像')).toBeInTheDocument()
+    expect(await canvas.findByPlaceholderText('image (required)')).toBeInTheDocument()
     expectCurrentVersionBetween({
       canvasElement,
       unit: 'demo.service',

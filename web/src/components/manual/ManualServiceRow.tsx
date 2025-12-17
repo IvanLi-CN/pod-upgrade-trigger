@@ -50,15 +50,23 @@ export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) 
   const [dryRun, setDryRun] = useState(false)
   const [pending, setPending] = useState(false)
 
+  const defaultImage = service.default_image?.trim() || ''
+  const resolvedImage = image.trim() || defaultImage
+  const canDeploy = resolvedImage.length > 0
+
   const currentTag = service.update?.tag?.trim() || extractTagFromImage(service.default_image)
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault()
     setPending(true)
     try {
+      if (!resolvedImage) return
+      if (!image.trim() && defaultImage) {
+        setImage(defaultImage)
+      }
       await onTrigger(service, {
         dryRun,
-        image: image.trim() || undefined,
+        image: resolvedImage,
         caller,
         reason,
       })
@@ -76,6 +84,7 @@ export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) 
         <div className="flex items-center gap-2">
           <span className="font-semibold">{service.display_name}</span>
           <span className="badge badge-ghost badge-xs">{service.unit}</span>
+          {!defaultImage ? <span className="badge badge-warning badge-xs">缺少镜像</span> : null}
           {currentTag ? (
             <span className="badge badge-ghost badge-xs text-base-content/60">{currentTag}</span>
           ) : null}
@@ -84,7 +93,7 @@ export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) 
         <div className="grid gap-2 md:grid-cols-3">
           <input
             className="input input-xs input-bordered"
-            placeholder={service.default_image ? 'override image' : 'image (optional)'}
+            placeholder={defaultImage ? 'override image (blank uses default)' : 'image (required)'}
             value={image}
             onChange={(event) => setImage(event.target.value)}
           />
@@ -118,7 +127,7 @@ export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) 
             onChange={(event) => setDryRun(event.target.checked)}
           />
         </label>
-        <button type="submit" className="btn btn-primary btn-xs" disabled={pending}>
+        <button type="submit" className="btn btn-primary btn-xs" disabled={pending || !canDeploy}>
           <Icon icon="mdi:play" className="text-lg" />
           部署
         </button>
