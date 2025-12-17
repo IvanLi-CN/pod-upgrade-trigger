@@ -50,7 +50,7 @@ echo "[e2e-ssh] deploying SSH target container (podup-test, 2222:22)"
 
 export PODUP_E2E_SSH=1
 export PODUP_SSH_TARGET="ssh://ivan@${host}:2222"
-export PODUP_CONTAINER_DIR="/home/ivan/.local/share/podup-e2e/quadlets"
+export PODUP_CONTAINER_DIR="/home/ivan/.config/containers/systemd"
 export PODUP_AUTO_UPDATE_LOG_DIR="/home/ivan/.local/share/podup-e2e/logs-missing"
 
 echo "[e2e-ssh] running: cargo test --locked --test e2e_ssh -- --nocapture"

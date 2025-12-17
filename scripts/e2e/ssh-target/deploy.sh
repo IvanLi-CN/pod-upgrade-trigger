@@ -194,7 +194,7 @@ install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.config/
 install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.config/containers/systemd\"
 install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.local\"
 install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.local/share\"
-install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.local/share/podup-e2e/quadlets\"
+install -d -m 0755 -o \"\$OPS_UID\" -g \"\$OPS_GID\" \"/home/\$OPS_USER/.local/share/podup-e2e\"
 
 cat >\"/home/\$OPS_USER/.config/containers/storage.conf\" <<\"EOF\"
 [storage]
@@ -246,8 +246,10 @@ ln -sf /usr/lib/systemd/system/sshd.service /etc/systemd/system/multi-user.targe
 '
 
 podman cp '$remote_dir/entrypoint.sh' \"\$build_ctr:/usr/local/bin/entrypoint.sh\"
-podman cp '$remote_dir/podup-e2e-noop.service' \"\$build_ctr:/home/$ops_user/.config/systemd/user/podup-e2e-noop.service\"
-podman cp '$remote_dir/podup-e2e-noop.service' \"\$build_ctr:/home/$ops_user/.local/share/podup-e2e/quadlets/podup-e2e-noop.service\"
+podman cp '$remote_dir/podup-e2e-noop.container' \"\$build_ctr:/home/$ops_user/.config/containers/systemd/podup-e2e-noop.container\"
+podman cp '$remote_dir/svc-alpha.container' \"\$build_ctr:/home/$ops_user/.config/containers/systemd/svc-alpha.container\"
+podman cp '$remote_dir/svc-beta.container' \"\$build_ctr:/home/$ops_user/.config/containers/systemd/svc-beta.container\"
+podman cp '$remote_dir/svc-gamma.container' \"\$build_ctr:/home/$ops_user/.config/containers/systemd/svc-gamma.container\"
 
 podman exec --env OPS_USER='$ops_user' --env OPS_UID='$ops_uid' --env OPS_GID='$ops_gid' \"\$build_ctr\" bash -lc '
 set -euo pipefail
@@ -257,11 +259,17 @@ home=\"/home/\$OPS_USER\"
 mkdir -p \"\$home/.config/systemd/user\"
 chown \"\$OPS_UID:\$OPS_GID\" \"\$home/.config/systemd\" \"\$home/.config/systemd/user\"
 
-chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.config/systemd/user/podup-e2e-noop.service\"
-chmod 0644 \"/home/\$OPS_USER/.config/systemd/user/podup-e2e-noop.service\"
+chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.config/containers/systemd/podup-e2e-noop.container\"
+chmod 0644 \"/home/\$OPS_USER/.config/containers/systemd/podup-e2e-noop.container\"
 
-chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.local/share/podup-e2e/quadlets/podup-e2e-noop.service\"
-chmod 0644 \"/home/\$OPS_USER/.local/share/podup-e2e/quadlets/podup-e2e-noop.service\"
+chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.config/containers/systemd/svc-alpha.container\"
+chmod 0644 \"/home/\$OPS_USER/.config/containers/systemd/svc-alpha.container\"
+
+chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.config/containers/systemd/svc-beta.container\"
+chmod 0644 \"/home/\$OPS_USER/.config/containers/systemd/svc-beta.container\"
+
+chown \"\$OPS_UID:\$OPS_GID\" \"/home/\$OPS_USER/.config/containers/systemd/svc-gamma.container\"
+chmod 0644 \"/home/\$OPS_USER/.config/containers/systemd/svc-gamma.container\"
 '
 
 podman commit \
