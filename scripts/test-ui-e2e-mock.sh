@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 log_file="$repo_root/ui-e2e-mock.log"
+out_dir="dist-mock"
 
 cd "$repo_root/web"
 
@@ -10,8 +11,9 @@ echo "[ui-e2e-mock] installing front-end dependencies with Bun"
 if command -v bun >/dev/null 2>&1; then
   export VITE_ENABLE_MOCKS="true"
   bun install --frozen-lockfile || bun install
-  echo "[ui-e2e-mock] building front-end dist with Bun"
-  bun run build
+  echo "[ui-e2e-mock] building front-end dist with Bun (outDir=$out_dir)"
+  bunx tsc -b
+  VITE_ENABLE_MOCKS=true bunx vite build --outDir "$out_dir"
 else
   echo "[ui-e2e-mock] bun is not available; please install Bun or adjust the script." >&2
   exit 1
@@ -21,7 +23,7 @@ cd "$repo_root/web"
 : >"$log_file"
 
 echo "[ui-e2e-mock] starting Vite preview with mocks on 127.0.0.1:25211"
-VITE_ENABLE_MOCKS=true bunx vite preview --host 127.0.0.1 --port 25211 --strictPort >"$log_file" 2>&1 &
+VITE_ENABLE_MOCKS=true bunx vite preview --outDir "$out_dir" --host 127.0.0.1 --port 25211 --strictPort >"$log_file" 2>&1 &
 server_pid=$!
 
 cleanup() {
