@@ -4,7 +4,7 @@ import { cleanup, render } from '@testing-library/react'
 import { expect, screen } from '@storybook/test'
 import * as ManualServicesCardStories from './ManualServicesCard.stories'
 
-const { Empty, Mixed, Refreshing } = composeStories(ManualServicesCardStories)
+const { Empty, Mixed, Refreshing, Loading } = composeStories(ManualServicesCardStories)
 
 afterEach(() => cleanup())
 
@@ -27,5 +27,11 @@ describe('ManualServicesCard stories', () => {
     const button = await screen.findByRole('button', { name: '刷新更新状态' })
     expect(button).toBeDisabled()
     expect(button.querySelector('.animate-spin')).not.toBeNull()
+  })
+
+  it('renders loading state when services are loading', async () => {
+    render(<Loading />)
+    expect(await screen.findByText('正在加载服务列表…')).toBeInTheDocument()
+    expect(screen.queryByText('暂无可部署的服务。')).toBeNull()
   })
 })
