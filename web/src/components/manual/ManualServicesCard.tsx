@@ -1,6 +1,8 @@
 import { Icon } from '@iconify/react'
 import { ManualServiceRow, type ManualServiceRowService, type ManualServiceRowTriggerParams } from './ManualServiceRow'
 
+const SERVICE_SKELETON_KEYS = ['service-skeleton-1', 'service-skeleton-2', 'service-skeleton-3'] as const
+
 export type ManualServicesCardProps = {
   services: ManualServiceRowService[]
   refreshing: boolean
@@ -56,16 +58,15 @@ export function ManualServicesCard({
 
           {showSkeleton ? (
             <>
-              <div
+              <output
                 className="flex items-center gap-2 text-xs text-base-content/60"
-                role="status"
                 aria-live="polite"
               >
                 <span className="loading loading-dots loading-xs" />
                 <span>正在加载服务列表…</span>
-              </div>
-              {Array.from({ length: 3 }).map((_, idx) => (
-                <ManualServiceRowSkeleton key={`service-skeleton-${idx}`} />
+              </output>
+              {SERVICE_SKELETON_KEYS.map((key) => (
+                <ManualServiceRowSkeleton key={key} />
               ))}
             </>
           ) : null}
