@@ -139,7 +139,8 @@
 
 语义：
 - `dry_run=true`：保持原有 dry-run 行为（不创建 Task）。
-- `dry_run=false`：创建 Task 并异步执行，返回 202 并包含 `task_id`（由后端决定是否使用 `image` 覆盖默认镜像）。
+- `dry_run=false`：创建 Task 并异步执行，返回 202 并包含 `task_id`。UI 会始终传入 `image`（默认使用 `default_image`，仅在需要时手动覆盖），以确保执行 `podman pull` + `restart` 的部署语义。
+  - 若 `image` 为空：后端将跳过 `podman pull`（等价于 restart-only），但 **UI 不允许** 以这种方式触发部署。
 
 ### 4) `POST /api/manual/auto-update/run`（auto-update 卡片）
 

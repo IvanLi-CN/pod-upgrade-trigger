@@ -26,7 +26,7 @@
 ### `/manual` Services（部署控制台）
 
 - “部署全部服务（Deploy all）”表单：映射 `POST /api/manual/deploy`，字段 `all/dry_run/caller/reason`；该批量部署会自动排除 auto-update 单元，并跳过缺少默认镜像的服务。
-- “按服务部署”列表：通过 `GET /api/manual/services` 拉取服务与 `default_image`；每行含输入 `image/dry_run/caller/reason` 与部署按钮（`POST /api/manual/services/<slug>`）。
+- “按服务部署”列表：通过 `GET /api/manual/services` 拉取服务与 `default_image`；每行 Deploy 会携带 `image`（默认使用 `default_image`，为空则禁用 Deploy 以避免 restart-only），并支持 `dry_run/caller/reason`（`POST /api/manual/services/<slug>`）。
 - “Auto-update” 独立卡片：映射 `POST /api/manual/auto-update/run`（与 deploy 分离）；该入口属于 admin side-effect API，受 ForwardAuth + CSRF 约束。
 - 历史记录：保留最近部署记录；点击项跳转到 `/events?request_id=...`；非 dry-run 时可打开 task drawer 查看任务详情与日志。
 

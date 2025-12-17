@@ -5,7 +5,7 @@
 当前 `/manual`（UI 标签：**Services**）页面主要提供两类能力：
 
 - 列出可触发的 systemd unit（来自 `GET /api/manual/services`），并展示其默认镜像（来自 Quadlet / unit 定义中的 `Image=`）。
-- 对单个服务或全部可部署服务发起部署（`POST /api/manual/services/<slug>` / `POST /api/manual/deploy`），后端执行 `podman pull <image>` + `systemctl/busctl restart|start <unit>`（auto-update excluded；缺少默认镜像的服务会被跳过）。
+- 对单个服务或全部可部署服务发起部署（`POST /api/manual/services/<slug>` / `POST /api/manual/deploy`），后端执行 `podman pull <image>` + `systemctl/busctl restart|start <unit>`（auto-update excluded；批量 deploy 会跳过缺少默认镜像的服务；按服务 deploy 由 UI 保证传入 `image`，避免退化为 restart-only）。
 
 但 UI 缺少“是否有可更新内容”的提示。主人希望在服务列表项上看到两种不同语义的更新标记：
 
