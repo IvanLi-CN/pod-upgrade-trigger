@@ -30,8 +30,16 @@ type UnitActionResult = {
   message?: string
 }
 
-type ManualTriggerResponse = {
-  triggered: UnitActionResult[]
+type DeployActionResult = {
+  unit: string
+  image?: string | null
+  status: string
+  message?: string | null
+}
+
+type ManualDeployResponse = {
+  deploying: DeployActionResult[]
+  skipped: UnitActionResult[]
   dry_run: boolean
   caller?: string | null
   reason?: string | null
@@ -69,9 +77,12 @@ export default function ManualPage() {
   const [allDryRun, setAllDryRun] = useState(false)
   const [allCaller, setAllCaller] = useState('')
   const [allReason, setAllReason] = useState('')
+  const [autoUpdateDryRun, setAutoUpdateDryRun] = useState(false)
+  const [autoUpdateCaller, setAutoUpdateCaller] = useState('')
+  const [autoUpdateReason, setAutoUpdateReason] = useState('')
+  const [autoUpdatePending, setAutoUpdatePending] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const navigate = useNavigate()
-
 
   useEffect(() => {
     let cancelled = false
@@ -109,7 +120,7 @@ export default function ManualPage() {
     setHistory((prev) => [entry, ...prev].slice(0, 20))
   }
 
-  const handleTriggerAll = async (event: FormEvent) => {
+  const handleDeployAll = async (event: FormEvent) => {
     event.preventDefault()
     try {
       const body = {
@@ -118,25 +129,25 @@ export default function ManualPage() {
         caller: allCaller.trim() || undefined,
         reason: allReason.trim() || undefined,
       }
-      const response = await postJson<ManualTriggerResponse>('/api/manual/trigger', body)
-      const ok = response.triggered.every(
-        (r) =>
-          r.status === 'triggered' ||
-          r.status === 'dry-run' ||
-          r.status === 'pending',
-      )
+      const response = await postJson<ManualDeployResponse>('/api/manual/deploy', body)
+      const deployingCount = Array.isArray(response.deploying) ? response.deploying.length : 0
+      const skippedCount = Array.isArray(response.skipped) ? response.skipped.length : 0
+
       pushToast({
-        variant: ok ? 'success' : 'warning',
-        title: ok ? '触发成功' : '部分失败',
-        message: `触发 ${response.triggered.length} 个单元（dry_run=${response.dry_run}）。`,
+        variant: deployingCount > 0 ? 'success' : 'warning',
+        title: deployingCount > 0 ? '部署请求已提交' : 'No deployable services',
+        message: `deploying=${deployingCount}, skipped=${skippedCount}, dry_run=${response.dry_run}`,
       })
-      pushHistory(response, `trigger-all (${response.triggered.length})`)
+      pushHistory(
+        response,
+        `deploy-all (deploying=${deployingCount}, skipped=${skippedCount}, dry_run=${response.dry_run})`,
+      )
 
       if (!response.dry_run && response.task_id) {
         pushToast({
           variant: 'info',
           title: '已创建任务',
-          message: '已在当前页面打开任务抽屉以跟踪本次触发。',
+          message: '已在当前页面打开任务抽屉以跟踪本次部署。',
         })
         setTaskDrawerInitialTaskId(response.task_id)
         setTaskDrawerVisible(true)
@@ -148,88 +159,54 @@ export default function ManualPage() {
           : 'Unknown error'
       pushToast({
         variant: 'error',
-        title: '触发失败',
+        title: '部署失败',
         message,
       })
     }
   }
 
-  const handleTriggerService = async (
+  const handleDeployService = async (
     service: ManualService,
     params: { dryRun: boolean; image?: string; caller?: string; reason?: string },
   ) => {
     try {
-      const isAutoUpdate = service.is_auto_update === true
-
-      if (isAutoUpdate) {
-        const response = await postJson<ServiceTriggerResponse>(
-          '/api/manual/auto-update/run',
-          {
-            dry_run: params.dryRun,
-            caller: params.caller?.trim() || undefined,
-            reason: params.reason?.trim() || undefined,
-          },
-        )
-
-        const status = response?.status ?? 'unknown'
-        const alreadyRunning = status === 'already-running'
-        const ok =
-          status === 'pending' ||
-          status === 'triggered' ||
-          status === 'dry-run' ||
-          alreadyRunning
-
+      if (service.is_auto_update === true) {
         pushToast({
-          variant: alreadyRunning ? 'info' : ok ? 'success' : 'warning',
-          title: alreadyRunning ? '已有 auto-update 在运行' : ok ? 'auto-update 执行已开始' : '单元触发失败',
-          message: `${service.unit} · status=${status}`,
+          variant: 'warning',
+          title: 'auto-update 不是服务部署目标',
+          message: '请使用下方的 auto-update 卡片执行。',
         })
-        pushHistory(
-          response,
-          alreadyRunning
-            ? `auto-update-already-running ${service.unit}`
-            : `auto-update-run ${service.unit}`,
-        )
+        return
+      }
 
-        if (!params.dryRun && response.task_id) {
-          pushToast({
-            variant: 'info',
-            title: alreadyRunning ? '正在跟踪现有任务' : '已创建任务',
-            message: '已在当前页面打开任务抽屉以跟踪 auto-update 执行。',
-          })
-          setTaskDrawerInitialTaskId(response.task_id)
-          setTaskDrawerVisible(true)
-        }
-      } else {
-        const response = await postJson<ServiceTriggerResponse>(
-          `/api/manual/services/${encodeURIComponent(service.slug)}`,
-          {
-            dry_run: params.dryRun,
-            image: params.image || undefined,
-            caller: params.caller?.trim() || undefined,
-            reason: params.reason?.trim() || undefined,
-          },
-        )
-        const ok =
-          response?.status === 'triggered' ||
-          response?.status === 'dry-run' ||
-          response?.status === 'pending'
+      const response = await postJson<ServiceTriggerResponse>(
+        `/api/manual/services/${encodeURIComponent(service.slug)}`,
+        {
+          dry_run: params.dryRun,
+          image: params.image || undefined,
+          caller: params.caller?.trim() || undefined,
+          reason: params.reason?.trim() || undefined,
+        },
+      )
+      const ok =
+        response?.status === 'triggered' ||
+        response?.status === 'dry-run' ||
+        response?.status === 'pending'
+      pushToast({
+        variant: ok ? 'success' : 'warning',
+        title: ok ? '服务部署成功' : '服务部署失败',
+        message: `${service.unit} · status=${response?.status ?? 'unknown'}`,
+      })
+      pushHistory(response, `deploy-service ${service.unit}`)
+
+      if (!params.dryRun && response.task_id) {
         pushToast({
-          variant: ok ? 'success' : 'warning',
-          title: ok ? '单元触发成功' : '单元触发失败',
-          message: `${service.unit} · status=${response?.status ?? 'unknown'}`,
+          variant: 'info',
+          title: '已创建任务',
+          message: '已在当前页面打开任务抽屉以跟踪本次部署。',
         })
-        pushHistory(response, `trigger-unit ${service.unit}`)
-
-        if (!params.dryRun && response.task_id) {
-          pushToast({
-            variant: 'info',
-            title: '已创建任务',
-            message: '已在当前页面打开任务抽屉以跟踪本次触发。',
-          })
-          setTaskDrawerInitialTaskId(response.task_id)
-          setTaskDrawerVisible(true)
-        }
+        setTaskDrawerInitialTaskId(response.task_id)
+        setTaskDrawerVisible(true)
       }
     } catch (error) {
       const message =
@@ -238,9 +215,67 @@ export default function ManualPage() {
           : 'Unknown error'
       pushToast({
         variant: 'error',
-        title: '单元触发失败',
+        title: '服务部署失败',
         message,
       })
+    }
+  }
+
+  const autoUpdateService = services.find((service) => service.is_auto_update === true) ?? null
+  const deployServices = services.filter((service) => service.is_auto_update !== true)
+
+  const handleRunAutoUpdate = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!autoUpdateService) return
+    setAutoUpdatePending(true)
+    try {
+      const response = await postJson<ServiceTriggerResponse>('/api/manual/auto-update/run', {
+        dry_run: autoUpdateDryRun,
+        caller: autoUpdateCaller.trim() || undefined,
+        reason: autoUpdateReason.trim() || undefined,
+      })
+
+      const status = response?.status ?? 'unknown'
+      const alreadyRunning = status === 'already-running'
+      const ok =
+        status === 'pending' ||
+        status === 'triggered' ||
+        status === 'dry-run' ||
+        alreadyRunning
+
+      pushToast({
+        variant: alreadyRunning ? 'info' : ok ? 'success' : 'warning',
+        title: alreadyRunning ? '已有 auto-update 在运行' : ok ? 'auto-update 执行已开始' : 'auto-update 执行失败',
+        message: `${autoUpdateService.unit} · status=${status}`,
+      })
+      pushHistory(
+        response,
+        alreadyRunning
+          ? `auto-update-already-running ${autoUpdateService.unit}`
+          : `auto-update-run ${autoUpdateService.unit}`,
+      )
+
+      if (!autoUpdateDryRun && response.task_id) {
+        pushToast({
+          variant: 'info',
+          title: alreadyRunning ? '正在跟踪现有任务' : '已创建任务',
+          message: '已在当前页面打开任务抽屉以跟踪 auto-update 执行。',
+        })
+        setTaskDrawerInitialTaskId(response.task_id)
+        setTaskDrawerVisible(true)
+      }
+    } catch (error) {
+      const message =
+        error && typeof error === 'object' && 'message' in error && error.message
+          ? String(error.message)
+          : 'Unknown error'
+      pushToast({
+        variant: 'error',
+        title: 'auto-update 执行失败',
+        message,
+      })
+    } finally {
+      setAutoUpdatePending(false)
     }
   }
 
@@ -274,12 +309,11 @@ export default function ManualPage() {
 
   return (
     <div className="space-y-6">
-
       <section className="card bg-base-100 shadow">
-        <form className="card-body gap-4" onSubmit={handleTriggerAll}>
+        <form className="card-body gap-4" onSubmit={handleDeployAll}>
           <div className="flex items-center justify-between gap-4">
             <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
-              触发全部单元
+              部署全部服务
             </h2>
             <label className="flex cursor-pointer items-center gap-2 text-xs">
               <span>Dry run</span>
@@ -314,20 +348,79 @@ export default function ManualPage() {
           <div className="flex items-center justify-between gap-3">
             <button type="submit" className="btn btn-primary btn-sm">
               <Icon icon="mdi:play-circle" className="text-lg" />
-              触发全部
+              部署全部服务
             </button>
             <span className="text-[11px] text-base-content/60">
-              映射到 POST /api/manual/trigger · all=true
+              POST /api/manual/deploy · all=true（不包含 auto-update）
             </span>
           </div>
         </form>
       </section>
 
+      {autoUpdateService ? (
+        <section className="card bg-base-100 shadow">
+          <form className="card-body gap-4" onSubmit={handleRunAutoUpdate}>
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex min-w-0 flex-1 flex-col">
+                <h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
+                  运行 podman auto-update
+                </h2>
+                <span className="text-[11px] text-base-content/60">
+                  {autoUpdateService.unit} · POST /api/manual/auto-update/run
+                </span>
+              </div>
+              <label className="flex cursor-pointer items-center gap-2 text-xs">
+                <span>Auto dry-run</span>
+                <input
+                  type="checkbox"
+                  className="toggle toggle-xs"
+                  checked={autoUpdateDryRun}
+                  onChange={(event) => setAutoUpdateDryRun(event.target.checked)}
+                />
+              </label>
+            </div>
+            <div className="grid gap-3 md:grid-cols-2 text-xs">
+              <div className="flex flex-col gap-1">
+                <span className="text-xs">Caller</span>
+                <input
+                  className="input input-sm input-bordered"
+                  value={autoUpdateCaller}
+                  onChange={(event) => setAutoUpdateCaller(event.target.value)}
+                  placeholder="who is running auto-update"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-xs">Reason</span>
+                <input
+                  className="input input-sm input-bordered"
+                  value={autoUpdateReason}
+                  onChange={(event) => setAutoUpdateReason(event.target.value)}
+                  placeholder="auto-update reason"
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <button
+                type="submit"
+                className="btn btn-primary btn-sm"
+                disabled={autoUpdatePending}
+              >
+                <Icon icon="mdi:play-circle" className="text-lg" />
+                运行 auto-update
+              </button>
+              <span className="text-[11px] text-base-content/60">
+                仅运行 podman auto-update，不是服务部署。
+              </span>
+            </div>
+          </form>
+        </section>
+      ) : null}
+
       <ManualServicesCard
-        services={services}
+        services={deployServices}
         refreshing={refreshing}
         onRefresh={handleRefresh}
-        onTrigger={handleTriggerService}
+        onTrigger={handleDeployService}
       />
 
       <section className="card bg-base-100 shadow">
@@ -337,12 +430,12 @@ export default function ManualPage() {
               历史记录
             </h2>
             <span className="text-[11px] text-base-content/60">
-              最近 20 次触发，点击可跳转到 Events 视图
+              最近 20 次操作，点击可跳转到 Events 视图
             </span>
           </div>
           <div className="space-y-2">
             {history.length === 0 && (
-              <p className="text-xs text-base-content/60">暂无手动触发记录。</p>
+              <p className="text-xs text-base-content/60">暂无手动部署记录。</p>
             )}
             {history.map((entry) => (
               <button

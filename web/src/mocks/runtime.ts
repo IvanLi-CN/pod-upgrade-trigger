@@ -217,7 +217,7 @@ function buildEvents(now: number, profile: MockProfile, tasks: Task[]): MockEven
       request_id: makeRequestId(),
       ts: baseTs + 120,
       method: 'POST',
-      path: '/api/manual/trigger',
+      path: '/api/manual/deploy',
       status: 200,
       action: 'manual-trigger',
       duration_ms: 320,
@@ -487,7 +487,7 @@ function buildTasks(
       summary: '2/2 units succeeded · nightly manual upgrade',
       trigger: {
         source: 'manual',
-        path: '/api/manual/trigger',
+        path: '/api/manual/deploy',
         caller: 'ops-nightly',
         reason: 'nightly rollout',
       },

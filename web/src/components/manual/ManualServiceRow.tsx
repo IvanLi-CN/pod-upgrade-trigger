@@ -120,7 +120,7 @@ export function ManualServiceRow({ service, onTrigger }: ManualServiceRowProps) 
         </label>
         <button type="submit" className="btn btn-primary btn-xs" disabled={pending}>
           <Icon icon="mdi:play" className="text-lg" />
-          触发
+          部署
         </button>
       </div>
     </form>

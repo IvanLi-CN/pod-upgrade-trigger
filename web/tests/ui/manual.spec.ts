@@ -2,13 +2,13 @@ import { expect, test } from '@playwright/test'
 
 async function openManualPage(page: import('@playwright/test').Page) {
   await page.goto('/manual?mock=enabled&mock=profile=happy-path')
-  await expect(page.getByText('触发全部单元')).toBeVisible()
-  await expect(page.getByText('按单元触发')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '部署全部服务' })).toBeVisible()
+  await expect(page.getByText('按服务部署')).toBeVisible()
   await expect(page.getByText('历史记录')).toBeVisible()
 }
 
-test.describe('Manual triggers', () => {
-  test('loads services and supports trigger-all dry-run', async ({ page }) => {
+test.describe('Services deploy console', () => {
+  test('loads services and supports deploy-all dry-run', async ({ page }) => {
     await openManualPage(page)
 
     await expect(page.getByText('svc-alpha.service').first()).toBeVisible()
@@ -21,16 +21,16 @@ test.describe('Manual triggers', () => {
     await page.getByLabel('Dry run').check()
 
     await page.getByPlaceholder('who is triggering').fill('ui-e2e')
-    await page.getByPlaceholder('short free-form reason').fill('trigger-all dry-run')
+    await page.getByPlaceholder('short free-form reason').fill('deploy-all dry-run')
 
-    await page.getByRole('button', { name: '触发全部' }).click()
+    await page.getByRole('button', { name: '部署全部服务' }).click()
 
-    await expect(page.getByText('触发成功')).toBeVisible()
+    await expect(page.getByText('部署请求已提交')).toBeVisible()
 
-    await expect(page.getByText(/trigger-all \(\d+\)/)).toBeVisible()
+    await expect(page.getByText(/deploy-all \(/)).toBeVisible()
   })
 
-  test('supports per-service trigger with dry toggle', async ({ page }) => {
+  test('supports per-service deploy with dry toggle', async ({ page }) => {
     await openManualPage(page)
 
     const row = page.locator('form', { hasText: 'svc-alpha.service' }).first()
@@ -41,19 +41,19 @@ test.describe('Manual triggers', () => {
 
     await row.getByLabel('Dry').check()
 
-    await row.getByRole('button', { name: '触发' }).click()
+    await row.getByRole('button', { name: '部署' }).click()
 
-    await expect(page.getByText('单元触发成功')).toBeVisible()
-    await expect(page.getByText(/trigger-unit svc-alpha\.service/)).toBeVisible()
+    await expect(page.getByText('服务部署成功')).toBeVisible()
+    await expect(page.getByText(/deploy-service svc-alpha\.service/)).toBeVisible()
   })
 
-  test('shows error toast when trigger-all fails', async ({ page }) => {
+  test('shows error toast when deploy-all fails', async ({ page }) => {
     await page.addInitScript(() => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ;(window as any).__MOCK_FORCE_MANUAL_FAILURE__ = true
     })
 
-    await page.route('**/api/manual/trigger', async (route) => {
+    await page.route('**/api/manual/deploy', async (route) => {
       await route.fulfill({
         status: 500,
         contentType: 'application/json',
@@ -63,10 +63,10 @@ test.describe('Manual triggers', () => {
 
     await openManualPage(page)
 
-    await page.getByRole('button', { name: '触发全部' }).click()
+    await page.getByRole('button', { name: '部署全部服务' }).click()
 
-    await expect(page.getByText('触发失败')).toBeVisible()
-    await expect(page.getByText('暂无手动触发记录。')).toBeVisible()
+    await expect(page.getByText('部署失败')).toBeVisible()
+    await expect(page.getByText('暂无手动部署记录。')).toBeVisible()
   })
 
   test('clicking refresh button triggers refresh request', async ({ page }) => {
@@ -90,12 +90,12 @@ test.describe('Manual triggers', () => {
     await page.getByLabel('Dry run').check()
     await page.getByPlaceholder('who is triggering').fill('ui-e2e-history')
     await page.getByPlaceholder('short free-form reason').fill('history-to-events')
-    await page.getByRole('button', { name: '触发全部' }).click()
+    await page.getByRole('button', { name: '部署全部服务' }).click()
 
-    await expect(page.getByText('触发成功')).toBeVisible()
+    await expect(page.getByText('部署请求已提交')).toBeVisible()
 
     const historyEntry = page.getByRole('button', {
-      name: /trigger-all \(\d+\)/,
+      name: /deploy-all \(/,
     }).first()
     await expect(historyEntry).toBeVisible()
 
@@ -120,7 +120,7 @@ test.describe('Manual triggers', () => {
 
     const svcRow = page.locator('form', { hasText: 'svc-alpha.service' }).first()
     await svcRow.getByLabel('Dry').uncheck()
-    await svcRow.getByRole('button', { name: '触发' }).click()
+    await svcRow.getByRole('button', { name: '部署' }).click()
 
     await expect(page.getByText('任务中心')).toBeVisible()
 
