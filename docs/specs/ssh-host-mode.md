@@ -323,7 +323,7 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
   - Host backend 命令白名单与 meta 记录（截断规则）。
   - LocalChildExecutor stop/force-stop 行为。
 - 集成/E2E：
-  - 在远端准备最小 Quadlet 单元，验证 `/api/manual/services` discovery 与 `/api/manual/trigger` 重启行为。
+  - 在远端准备最小 Quadlet 单元，验证 `/api/manual/services` discovery 与 `POST /api/manual/deploy`（pull + restart；auto-update excluded）的主路径行为；可选覆盖 legacy `POST /api/manual/trigger`（restart-only）。
   - 选取 1-2 条最关键生产路径（GitHub webhook dispatch + unit restart + 失败诊断抓取）做真实环境回归。
 
 ## 交付物（本次必须完成）

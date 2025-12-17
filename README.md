@@ -125,7 +125,7 @@ add them explicitly.
 Example:
 
 ```bash
-curl -X POST "http://127.0.0.1:25111/api/manual/trigger" \
+curl -X POST "http://127.0.0.1:25111/api/manual/deploy" \
   -H 'Content-Type: application/json' \
   -H 'x-podup-csrf: 1' \
   -d '{"all":true,"dry_run":false,"caller":"ci","reason":"nightly"}'
@@ -148,8 +148,8 @@ curl -X POST "http://127.0.0.1:25111/api/manual/trigger" \
   restarts the listed services immediately.
 - `pod-upgrade-trigger trigger-all --dry-run` shows which units would be touched
   without contacting systemd.
-- HTTP callers can use `POST /api/manual/trigger` with a JSON payload (remember the
-  `x-podup-csrf: 1` header for `POST`):
+- Recommended batch deploy API: `POST /api/manual/deploy` (pull + restart; auto-update excluded).
+  Remember the `x-podup-csrf: 1` header for `POST`:
   ```json
   {
     "all": true,
@@ -158,8 +158,10 @@ curl -X POST "http://127.0.0.1:25111/api/manual/trigger" \
     "reason": "nightly"
   }
   ```
-- Service-specific redeploys live under `/api/manual/services/<name>` and accept
-  optional `image`, `caller`, and `reason` fields.
+- Service-specific deploys live under `/api/manual/services/<name>` and accept
+  optional `dry_run`, `image`, `caller`, and `reason` fields.
+- Legacy (compatibility only): `POST /api/manual/trigger` is restart-only and is not
+  used by the Web UI (prefer `/api/manual/deploy` / `/api/manual/services/<name>`).
 
 ## Release Process
 

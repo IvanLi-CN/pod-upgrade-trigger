@@ -46,8 +46,10 @@ web/
 - POST `/api/tasks/:id/force-stop`（强制停止任务）
 - POST `/api/tasks/:id/retry`（从终态任务创建重试任务）
 - GET `/api/manual/services`
-- POST `/api/manual/trigger`
+- POST `/api/manual/deploy`
 - POST `/api/manual/services/:slug`
+- POST `/api/manual/auto-update/run`
+- POST `/api/manual/trigger`（legacy：restart-only，兼容保留）
 - GET `/api/webhooks/status`
 - GET `/api/image-locks`
 - DELETE `/api/image-locks/:bucket`
@@ -89,7 +91,7 @@ web/
    - `dev:mock`: `VITE_ENABLE_MOCKS=true vite`
    - `preview:mock`: `VITE_ENABLE_MOCKS=true vite preview`
 5) 实现 Mock 控制台（仅 mock 模式渲染），支持切换场景与重置数据。
-6) Playwright/E2E：新增“mock happy-path”用例访问 Dashboard/Manual/Webhooks/Events 并断言渲染。
+6) Playwright/E2E：新增“mock happy-path”用例访问 Dashboard/Services/Webhooks/Events 并断言渲染。
 7) 自测：`npm run dev:mock`，确认所有页面无后端也可工作；记录未覆盖接口并补齐。
 
 ## 8. 验证清单

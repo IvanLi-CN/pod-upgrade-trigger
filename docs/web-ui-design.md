@@ -7,7 +7,7 @@
 - 顶部状态条：常驻健康状态(`/health`)、调度器 interval/迭代次数、系统时间；全局可见。
 - 左侧导航：
   - `/` Dashboard
-  - `/manual` 手动触发控制台
+  - `/manual` Services（部署控制台）
   - `/webhooks` GitHub Webhook 面板
   - `/events` 事件与审计
   - `/maintenance` 维护工具
@@ -23,12 +23,12 @@
 - 速率限制提示：展示 `rate_limit_tokens` 近窗口的使用情况；若接近阈值，跳转按钮链接到 `/maintenance#ratelimit`。
 - 资源存在性：检查 `data/pod-upgrade-trigger.db`、`last_payload.bin`、`web/dist` 是否存在，异常时提示跳到 `/maintenance`。
 
-### `/manual` 手动触发控制台
+### `/manual` Services（部署控制台）
 
-- “触发全部”表单：映射 `POST /api/manual/trigger`，字段 `all/dry_run/caller/reason`；提交后在下方历史卡片展示请求与响应。
-- “按单元触发”列表：通过新 `GET /api/manual/services` 拉取 slug；每行含输入 `image/caller/reason` 与触发按钮（`/api/manual/services/<slug>`）。
-- “传统 /auto-update 触发”模块：用于兼容旧流程（不再依赖 token 鉴权）；该入口属于 admin side-effect API，受 ForwardAuth + CSRF 约束。
-- 历史记录：保留最近触发记录，点击项跳转到 `/events?request_id=...`。
+- “部署全部服务（Deploy all）”表单：映射 `POST /api/manual/deploy`，字段 `all/dry_run/caller/reason`；该批量部署会自动排除 auto-update 单元，并跳过缺少默认镜像的服务。
+- “按服务部署”列表：通过 `GET /api/manual/services` 拉取服务与 `default_image`；每行含输入 `image/dry_run/caller/reason` 与部署按钮（`POST /api/manual/services/<slug>`）。
+- “Auto-update” 独立卡片：映射 `POST /api/manual/auto-update/run`（与 deploy 分离）；该入口属于 admin side-effect API，受 ForwardAuth + CSRF 约束。
+- 历史记录：保留最近部署记录；点击项跳转到 `/events?request_id=...`；非 dry-run 时可打开 task drawer 查看任务详情与日志。
 
 ### `/webhooks` GitHub Webhook 面板
 
@@ -79,6 +79,8 @@
 
 - `GET /api/events`：支持分页、过滤、按 request_id 查询；为 Dashboard/Events 使用。
 - `GET /api/manual/services`：列出可触发的 unit 与可选默认镜像。
+- `POST /api/manual/deploy`：批量部署（pull + restart；auto-update excluded；dry-run 不创建 task）。
+- `POST /api/manual/auto-update/run`：手动运行 auto-update（独立卡片）。
 - `GET /api/webhooks/status`：返回各 unit 的最近触发时间、成功/失败状态、HMAC 校验结果。
 - `GET /api/image-locks` 与 `DELETE /api/image-locks/<name>`：查询/释放镜像锁。
 - `POST /api/prune-state`：触发清理任务（或提供 CLI 代理 HTTP 入口）。
