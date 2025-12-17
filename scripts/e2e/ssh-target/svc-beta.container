@@ -1,0 +1,11 @@
+[Unit]
+Description=pod-upgrade-trigger E2E svc-beta
+
+[Container]
+Image=registry.fedoraproject.org/fedora:42
+Exec=sh -c "sleep infinity"
+Network=none
+AutoUpdate=registry
+
+[Install]
+WantedBy=default.target

@@ -9,7 +9,7 @@ async function seedEvents(request: APIRequestContext) {
   if (seeded) return
 
   for (let i = 0; i < 3; i += 1) {
-    await request.post('/api/manual/trigger', {
+    await request.post('/api/manual/deploy', {
       headers: { 'Content-Type': 'application/json', 'x-podup-csrf': '1' },
       data: {
         all: true,

@@ -507,7 +507,7 @@ const handlers = [
     return HttpResponse.json({ services }, { headers: JSON_HEADERS })
   }),
 
-  http.post('/api/manual/trigger', async ({ request }) => {
+  http.post('/api/manual/deploy', async ({ request }) => {
     const url = new URL(request.url)
     const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
     if (failure) return failure
@@ -517,17 +517,25 @@ const handlers = [
     await withLatency()
 
     const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
-
-
     const services = runtime.cloneData().services
     const dryRun = Boolean(body.dry_run)
 
-    const units = services.map((svc) => svc.unit)
+    const deployableServices = services.filter((svc) => svc.is_auto_update !== true)
+    const skippedServices = services.filter((svc) => svc.is_auto_update === true)
 
-    const triggered = units.map((unit) => ({
-      unit,
-      status: dryRun ? 'dry-run' : 'pending',
-      message: dryRun ? 'ok' : 'scheduled via task',
+    const units = deployableServices.map((svc) => svc.unit)
+
+    const deploying = deployableServices.map((svc) => ({
+      unit: svc.unit,
+      image: svc.default_image ?? null,
+      status: dryRun ? 'planned' : 'pending',
+      message: dryRun ? 'planned' : 'scheduled via task',
+    }))
+
+    const skipped = skippedServices.map((svc) => ({
+      unit: svc.unit,
+      status: 'skipped',
+      message: 'auto-update is not deployable via deploy-all',
     }))
 
     const caller =
@@ -543,8 +551,8 @@ const handlers = [
       request_id: caller ?? `manual-${Date.now()}`,
       ts: Math.floor(Date.now() / 1000),
       method: 'POST',
-      path: '/api/manual/trigger',
-      status: 200,
+      path: '/api/manual/deploy',
+      status: dryRun ? 200 : 202,
       action: 'manual-trigger',
       duration_ms: 180,
       meta: body,
@@ -558,7 +566,7 @@ const handlers = [
         units,
         caller,
         reason,
-        path: '/api/manual/trigger',
+        path: '/api/manual/deploy',
         is_long_running: true,
       })
       taskId = task.task_id
@@ -566,7 +574,8 @@ const handlers = [
 
     return HttpResponse.json(
       {
-        triggered,
+        deploying,
+        skipped,
         dry_run: dryRun,
         request_id: requestId,
         caller,

@@ -72,7 +72,7 @@ function SideNav() {
   const location = useLocation()
   const entries = [
     { to: '/', label: 'Dashboard', icon: 'mdi:view-dashboard' },
-    { to: '/manual', label: 'Manual', icon: 'mdi:play-circle-outline' },
+    { to: '/manual', label: 'Services', icon: 'mdi:play-circle-outline' },
     { to: '/webhooks', label: 'Webhooks', icon: 'mdi:webhook' },
     { to: '/tasks', label: 'Tasks', icon: 'mdi:clipboard-text-clock-outline' },
     { to: '/events', label: 'Events', icon: 'mdi:file-document-multiple-outline' },

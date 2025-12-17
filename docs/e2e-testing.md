@@ -32,7 +32,7 @@
 ### 4. 客户端与数据构造
 
 - 提供 helper 生成 GitHub `package` 与 `registry_package` 事件 JSON，并使用 `PODUP_GH_WEBHOOK_SECRET` 计算 `x-hub-signature-256`。
-- 封装 `/api/manual/trigger`、`/api/manual/services/<name>`、`/auto-update` 的 HTTP 请求构建，支持 dry-run/实跑。
+- 封装 `POST /api/manual/deploy`、`POST /api/manual/services/<name>`、`POST /api/manual/auto-update/run` 与 legacy `POST /api/manual/trigger`（restart-only，兼容保留）的 HTTP 请求构建，支持 dry-run/实跑。
 - 对静态资源测试，在 `TempDir/web/dist` 写入伪造的 `index.html`、`assets/` 内容。
 
 ### 5. 状态验证工具
@@ -52,7 +52,7 @@
 
 1. **GitHub Webhook 正常流程**：发送签名请求 → 通过镜像限流 → `systemd-run` mock 触发 `run-task` → `podman pull` 与 `systemctl restart` 按顺序记入日志 → `event_log` 存储对应行。
 2. **速率限制与清理**：预填 `rate_limit_tokens`，短时间重复触发得到 HTTP 429，执行 `pod-upgrade-trigger prune-state --max-age-hours 48` 后重试成功。
-3. **手动触发 API**：`POST /api/manual/trigger`（`all=true`、`dry_run` 与正常模式）以及 `/api/manual/services/<slug>`（携带 `image/caller/reason`）；断言 dry-run 不产生 systemctl 调用、审计字段正确写入。
+3. **Services 手动部署 API**：`POST /api/manual/deploy`（`all=true`、`dry_run` 与正常模式）以及 `POST /api/manual/services/<slug>`（携带 `dry_run/image/caller/reason`）；断言 dry-run 不产生 systemctl 调用、审计字段正确写入。legacy `POST /api/manual/trigger` 仅作为兼容路径可选覆盖。
 4. **调度器循环**：`pod-upgrade-trigger scheduler --interval 1 --max-iterations 2`；验证 mock 里 `podman-auto-update.service` 的调用和 `record_system_event` 记录。
 5. **错误路径**：设置 `MOCK_PODMAN_FAIL=1` 或 `MOCK_SYSTEMD_RUN_FAIL=unitA`；确认 HTTP/CLI 返回值、SQLite 中的失败事件，以及 `last_payload.bin` dump。
 6. **静态资源与健康检查**：`GET /health` 正常返回；`PODUP_STATE_DIR/web/dist` 或内置 `/srv/app/web` 存在时 `GET /`、`/assets/*` 提供对应文件。
@@ -162,7 +162,7 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
      - Scheduler 显示 interval（如 `900s`）与 tick（无事件时允许为 `--`）；
      - SSE badge 在 `/sse/hello` 成功后显示 `SSE ok`。
    - 左侧导航：
-     - Dashboard / Manual / Webhooks / Events / Maintenance / Settings 均存在；
+     - Dashboard / Services / Webhooks / Events / Maintenance / Settings 均存在；
      - 点击每个入口，高亮状态与 URL 路径变化正确（例如 `/manual`、`/webhooks`）。
 
 2. **SPA 路由兜底**
@@ -177,36 +177,36 @@ Playwright 配置中的 `baseURL` 对应 `http://127.0.0.1:25211`。
        - 前端跳转 `/401`，显示 “未授权 · 401” 提示与当前请求路径；
        - 通过 `history.replaceState`，地址栏保持 `/settings`，刷新后仍停留在 Settings 路由。
 
-#### B. Manual 手动触发控制台（manual.spec.ts）
+#### B. Services 部署控制台（manual.spec.ts）
 
 1. **服务列表加载**
    - 访问 `/manual`：
-     - 标题 “触发全部单元”、“按单元触发”、“历史记录”；
+     - 标题 “部署全部服务”、“按服务部署”、“历史记录”；
      - 从 `/api/manual/services` 返回的 `svc-alpha.service`、`svc-beta.service` 在列表中展示：
        - 每行包含 `display_name`、`unit`、image/caller/reason 输入框；
-       - Dry 开关与 “触发” 按钮；
+       - Dry 开关与 “部署” 按钮；
        - GitHub 路径 badge：`/github-package-update/<slug>`。
 
-2. **触发全部（dry-run）**
-   - 将 Dry run 打开，填写 Caller/Reason，点击 “触发全部”：
-     - 发送 `POST /api/manual/trigger`，body 包含 `all:true`、`dry_run:true`、caller/reason；
+2. **部署全部服务（dry-run）**
+   - 将 Dry run 打开，填写 Caller/Reason，点击 “部署全部服务”：
+     - 发送 `POST /api/manual/deploy`，body 包含 `all:true`、`dry_run:true`、caller/reason；
      - 返回 202/207 时：
        - 顶部出现成功或部分失败 Toast；
-       - “历史记录” 增加一条 `trigger-all (N)` 记录，时间接近当前；
+       - “历史记录” 增加一条 `deploy-all (N)` 记录，时间接近当前；
        - 点击历史记录项跳转 `/events?request_id=...`。
 
-3. **按单元触发**
+3. **按服务部署**
    - 对某个 unit（如 `svc-alpha.service`）：
-     - Dry=false，填写 image/caller/reason，点击 “触发”：
-       - 请求 `POST /api/manual/services/svc-alpha`，body 包含字段；
-       - 返回 status 为 `triggered` 或 `dry-run`；
-       - 弹出对应 Toast，历史记录增加 `trigger-unit svc-alpha.service`。
+     - Dry=false，填写 image/caller/reason，点击 “部署”：
+        - 请求 `POST /api/manual/services/svc-alpha`，body 包含字段；
+        - 返回 status 为 `triggered` 或 `dry-run`；
+       - 弹出对应 Toast（例如 “服务部署成功”），历史记录增加 `deploy-service svc-alpha.service`。
 
 4. **错误处理**
-   - 通过 env/后端控制使 `POST /api/manual/trigger` 返回 500：
-     - UI 显示错误 Toast；
-     - 历史记录不新增成功条目；
-     - 页面不崩溃，仍可再次尝试触发。
+   - 通过 env/后端控制使 `POST /api/manual/deploy` 返回 500：
+      - UI 显示错误 Toast；
+     - 历史记录不新增成功条目（例如仍显示 “暂无手动部署记录。”）；
+     - 页面不崩溃，仍可再次尝试部署。
 
 #### C. Webhooks GitHub 面板（webhooks.spec.ts）
 

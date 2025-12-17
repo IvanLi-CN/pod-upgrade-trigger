@@ -4467,6 +4467,10 @@ fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
         return handle_manual_trigger(ctx);
     }
 
+    if ctx.path == "/api/manual/deploy" {
+        return handle_manual_deploy(ctx);
+    }
+
     if let Some(rest) = ctx.path.strip_prefix("/api/manual/services/") {
         return handle_manual_service(ctx, rest);
     }
@@ -5175,6 +5179,234 @@ fn handle_manual_trigger(ctx: &RequestContext) -> Result<(), String> {
     )
 }
 
+fn handle_manual_deploy(ctx: &RequestContext) -> Result<(), String> {
+    if !ensure_admin(ctx, "manual-deploy")? {
+        return Ok(());
+    }
+    if !ensure_csrf(ctx, "manual-deploy")? {
+        return Ok(());
+    }
+
+    let request: ManualDeployRequest = match parse_json_body(ctx) {
+        Ok(body) => body,
+        Err(err) => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "invalid request",
+                "manual-deploy",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let all = request.all;
+    let dry_run = request.dry_run;
+    let auto_unit = manual_auto_update_unit();
+
+    // Plan targets: manual_unit_list() minus auto-update unit, and only units
+    // that have a configured image (no restart-only fallback).
+    let mut deploying_specs: Vec<ManualDeployUnitSpec> = Vec::new();
+    let mut skipped: Vec<UnitActionResult> = Vec::new();
+    let mut skipped_meta: Vec<ManualDeploySkippedUnit> = Vec::new();
+
+    skipped.push(UnitActionResult {
+        unit: auto_unit.clone(),
+        status: "skipped".to_string(),
+        message: Some("auto-update-unit".to_string()),
+    });
+    skipped_meta.push(ManualDeploySkippedUnit {
+        unit: auto_unit.clone(),
+        message: "auto-update-unit".to_string(),
+    });
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for unit in manual_unit_list() {
+        if unit == auto_unit {
+            continue;
+        }
+        if !seen.insert(unit.clone()) {
+            continue;
+        }
+
+        match unit_configured_image(&unit) {
+            Some(image) => deploying_specs.push(ManualDeployUnitSpec { unit, image }),
+            None => {
+                skipped.push(UnitActionResult {
+                    unit: unit.clone(),
+                    status: "skipped".to_string(),
+                    message: Some("image-missing".to_string()),
+                });
+                skipped_meta.push(ManualDeploySkippedUnit {
+                    unit,
+                    message: "image-missing".to_string(),
+                });
+            }
+        }
+    }
+
+    if dry_run {
+        let deploying: Vec<Value> = deploying_specs
+            .iter()
+            .map(|spec| {
+                json!({
+                    "unit": spec.unit,
+                    "image": spec.image,
+                    "status": "dry-run",
+                    "message": format!("Would pull {} then restart {}", spec.image, spec.unit),
+                })
+            })
+            .collect();
+        let skipped_json: Vec<Value> = skipped
+            .iter()
+            .map(|item| {
+                json!({
+                    "unit": item.unit,
+                    "status": item.status,
+                    "message": item.message,
+                })
+            })
+            .collect();
+
+        let response = json!({
+            "deploying": deploying,
+            "skipped": skipped_json,
+            "dry_run": true,
+            "caller": request.caller,
+            "reason": request.reason,
+            "request_id": ctx.request_id,
+        });
+
+        respond_json(
+            ctx,
+            202,
+            "Accepted",
+            &response,
+            "manual-deploy",
+            Some(json!({
+                "all": all,
+                "dry_run": true,
+                "deploying": deploying_specs.len(),
+                "skipped": skipped_meta.len(),
+            })),
+        )?;
+        return Ok(());
+    }
+
+    let meta = TaskMeta::ManualDeploy {
+        all,
+        dry_run,
+        units: deploying_specs.clone(),
+        skipped: skipped_meta,
+    };
+
+    let task_id = match create_manual_deploy_task(
+        &deploying_specs,
+        &request.caller,
+        &request.reason,
+        &ctx.request_id,
+        &ctx.path,
+        meta,
+    ) {
+        Ok(id) => id,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to schedule manual deploy",
+                "manual-deploy",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if let Err(err) = spawn_manual_task(&task_id, "manual-deploy") {
+        mark_task_dispatch_failed(
+            &task_id,
+            None,
+            "manual",
+            "manual-deploy",
+            &err,
+            json!({
+                "caller": request.caller.clone(),
+                "reason": request.reason.clone(),
+                "path": ctx.path.clone(),
+                "request_id": ctx.request_id.clone(),
+            }),
+        );
+
+        let error_response = json!({
+            "status": "error",
+            "message": "failed to dispatch manual deploy task",
+            "task_id": task_id,
+            "dry_run": false,
+            "caller": request.caller,
+            "reason": request.reason,
+            "request_id": ctx.request_id,
+        });
+
+        respond_json(
+            ctx,
+            500,
+            "InternalServerError",
+            &error_response,
+            "manual-deploy",
+            Some(json!({ "task_id": task_id, "error": err })),
+        )?;
+        return Ok(());
+    }
+
+    let deploying: Vec<Value> = deploying_specs
+        .iter()
+        .map(|spec| {
+            json!({
+                "unit": spec.unit,
+                "image": spec.image,
+                "status": "pending",
+                "message": "scheduled via task",
+            })
+        })
+        .collect();
+    let skipped_json: Vec<Value> = skipped
+        .iter()
+        .map(|item| {
+            json!({
+                "unit": item.unit,
+                "status": item.status,
+                "message": item.message,
+            })
+        })
+        .collect();
+
+    let response = json!({
+        "deploying": deploying,
+        "skipped": skipped_json,
+        "dry_run": false,
+        "caller": request.caller,
+        "reason": request.reason,
+        "task_id": task_id,
+        "request_id": ctx.request_id,
+    });
+
+    respond_json(
+        ctx,
+        202,
+        "Accepted",
+        &response,
+        "manual-deploy",
+        Some(json!({
+            "all": all,
+            "dry_run": false,
+            "task_id": task_id,
+            "deploying": deploying_specs.len(),
+        })),
+    )
+}
+
 fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String> {
     if !ensure_admin(ctx, "manual-service")? {
         return Ok(());
@@ -5389,6 +5621,16 @@ struct ServiceTriggerRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct ManualDeployRequest {
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    dry_run: bool,
+    caller: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PruneStateRequest {
     max_age_hours: Option<u64>,
     #[serde(default)]
@@ -5433,6 +5675,18 @@ struct ManualTriggerResponse {
 // --- Task domain types (backend representation mirroring web/src/domain/tasks.ts) ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct ManualDeployUnitSpec {
+    unit: String,
+    image: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ManualDeploySkippedUnit {
+    unit: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum TaskMeta {
     #[serde(rename = "manual-trigger")]
@@ -5441,6 +5695,16 @@ enum TaskMeta {
         all: bool,
         #[serde(default)]
         dry_run: bool,
+    },
+    #[serde(rename = "manual-deploy")]
+    ManualDeploy {
+        #[serde(default)]
+        all: bool,
+        #[serde(default)]
+        dry_run: bool,
+        units: Vec<ManualDeployUnitSpec>,
+        #[serde(default)]
+        skipped: Vec<ManualDeploySkippedUnit>,
     },
     #[serde(rename = "manual-service")]
     ManualService {
@@ -5946,6 +6210,126 @@ fn create_manual_trigger_task(
                     "units": units_owned,
                     "caller": caller_owned,
                     "reason": reason_owned,
+                }),
+                host_backend_meta(),
+            ))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_manual_deploy_task(
+    units: &[ManualDeployUnitSpec],
+    caller: &Option<String>,
+    reason: &Option<String>,
+    request_id: &str,
+    path: &str,
+    meta: TaskMeta,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = format!("tsk_{}", next_request_id());
+    let trigger_source = "manual".to_string();
+
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let units_owned: Vec<ManualDeployUnitSpec> = units.to_vec();
+    let caller_owned = caller.clone();
+    let reason_owned = reason.clone();
+    let request_id_owned = request_id.to_string();
+    let path_owned = path.to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("manual")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("Manual deploy task created".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(Some(path_owned.clone()))
+        .bind(&caller_owned)
+        .bind(&reason_owned)
+        .bind(Option::<i64>::None)
+        .bind(0_i64) // can_stop (manual deploy tasks cannot be safely cancelled at system level)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        for spec in &units_owned {
+            sqlx::query(
+                "INSERT INTO task_units \
+                 (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+                  duration_ms, message, error) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&task_id_clone)
+            .bind(&spec.unit)
+            .bind(Some(
+                spec.unit
+                    .trim_end_matches(".service")
+                    .trim_matches('/')
+                    .to_string(),
+            ))
+            .bind(&spec.unit)
+            .bind("running")
+            .bind(Some("queued"))
+            .bind(Some(now))
+            .bind(Option::<i64>::None)
+            .bind(Option::<i64>::None)
+            .bind(Some("Manual deploy scheduled from API".to_string()))
+            .bind(Option::<String>::None)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Manual deploy task created from API")
+        .bind(Option::<String>::None)
+        .bind(
+            serde_json::to_string(&merge_task_meta(
+                json!({
+                    "units": units_owned,
+                    "caller": caller_owned,
+                    "reason": reason_owned,
+                    "source": trigger_source,
+                    "path": path_owned,
                 }),
                 host_backend_meta(),
             ))
@@ -6972,6 +7356,7 @@ fn run_task_by_id(task_id: &str) -> Result<(), String> {
             },
         ) => run_background_task(task_id, &unit, &image, &event, &delivery, &path),
         ("manual", TaskMeta::ManualTrigger { .. }) => run_manual_trigger_task(task_id),
+        ("manual", TaskMeta::ManualDeploy { .. }) => run_manual_deploy_task(task_id),
         (
             "manual",
             TaskMeta::ManualService {
@@ -9904,6 +10289,13 @@ fn evaluate_unit_health(props: &HashMap<String, String>) -> UnitHealthVerdict {
 }
 
 fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict, String) {
+    // Quadlet/podman container units can legitimately take >5s to settle after a
+    // restart because the stop+start cycle is async (especially when the unit
+    // is still in ActiveState=deactivating/activating). Give it a larger
+    // window to avoid misclassifying healthy deploys as "unknown".
+    const HEALTH_STABILIZE_TIMEOUT_MS: u64 = 20_000;
+    const HEALTH_STABILIZE_POLL_MS: u64 = 200;
+
     let command = format!(
         "systemctl --user show {unit} --property=ActiveState --property=SubState --property=Result --property=Type --property=ExecMainStatus"
     );
@@ -9929,14 +10321,50 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
         "--property=ExecMainStatus".to_string(),
     ];
 
-    let outcome = host_backend()
-        .systemctl_user(&args)
-        .map_err(host_backend_error_to_string);
+    let started_at = std::time::Instant::now();
+    let mut attempts: u32 = 0;
+    let mut last_props: HashMap<String, String> = HashMap::new();
+    let outcome = loop {
+        attempts = attempts.saturating_add(1);
+        let outcome = host_backend()
+            .systemctl_user(&args)
+            .map_err(host_backend_error_to_string);
+
+        let Ok(result) = &outcome else {
+            break outcome;
+        };
+        if !result.success() {
+            break outcome;
+        }
+
+        last_props = parse_systemctl_show_properties(&result.stdout);
+        let active_state = last_props
+            .get("ActiveState")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let service_type = last_props
+            .get("Type")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        // For non-oneshot services, a restart/start job may temporarily report
+        // inactive/activating/deactivating. Give it a short window to settle
+        // before classifying health, otherwise we risk marking successful
+        // deploys as "unknown" due to a race.
+        if service_type != "oneshot" && active_state != "active" && active_state != "failed" {
+            if started_at.elapsed().as_millis() < HEALTH_STABILIZE_TIMEOUT_MS as u128 {
+                thread::sleep(Duration::from_millis(HEALTH_STABILIZE_POLL_MS));
+                continue;
+            }
+        }
+
+        break outcome;
+    };
 
     let (verdict, summary, meta) = match outcome {
         Ok(result) => {
             let props = if result.success() {
-                parse_systemctl_show_properties(&result.stdout)
+                last_props
             } else {
                 HashMap::new()
             };
@@ -9985,6 +10413,8 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
                 "result": props.get("Result"),
                 "service_type": props.get("Type"),
                 "exec_main_status": props.get("ExecMainStatus"),
+                "attempts": attempts,
+                "waited_ms": started_at.elapsed().as_millis() as u64,
             });
 
             let meta = build_command_meta(&command, &argv, &result, Some(extra_meta));
@@ -10160,7 +10590,20 @@ fn pull_container_image(image: &str) -> Result<CommandExecResult, String> {
         last_result = Some(result);
 
         if attempt < PULL_RETRY_ATTEMPTS {
-            thread::sleep(Duration::from_secs(PULL_RETRY_DELAY_SECS));
+            // Keep failure-path tests fast by skipping the backoff delay.
+            let delay_secs = {
+                #[cfg(test)]
+                {
+                    0_u64
+                }
+                #[cfg(not(test))]
+                {
+                    PULL_RETRY_DELAY_SECS
+                }
+            };
+            if delay_secs > 0 {
+                thread::sleep(Duration::from_secs(delay_secs));
+            }
         }
     }
 
@@ -11479,6 +11922,404 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn update_task_unit_done(
+    task_id: &str,
+    unit: &str,
+    unit_status: &str,
+    message: Option<&str>,
+    error: Option<&str>,
+) {
+    let task_id_owned = task_id.to_string();
+    let unit_owned = unit.to_string();
+    let unit_status_owned = unit_status.to_string();
+    let message_owned = message.map(|s| s.to_string());
+    let error_owned = error.map(|s| truncate_unit_error_summary(s));
+    let now = current_unix_secs() as i64;
+
+    let _ = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query("UPDATE tasks SET updated_at = ? WHERE task_id = ?")
+            .bind(now)
+            .bind(&task_id_owned)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "UPDATE task_units \
+             SET status = ?, \
+                 phase = 'done', \
+                 finished_at = COALESCE(finished_at, ?), \
+                 duration_ms = COALESCE(duration_ms, (? - COALESCE(started_at, ?)) * 1000), \
+                 message = ?, \
+                 error = ? \
+             WHERE task_id = ? AND unit = ?",
+        )
+        .bind(&unit_status_owned)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(message_owned)
+        .bind(error_owned)
+        .bind(&task_id_owned)
+        .bind(&unit_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+}
+
+fn finalize_task_status(task_id: &str, status: &str, summary: &str) {
+    let task_id_owned = task_id.to_string();
+    let status_owned = status.to_string();
+    let summary_owned = summary.to_string();
+    let now = current_unix_secs() as i64;
+
+    let _ = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "UPDATE tasks \
+             SET status = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?, summary = ? \
+             WHERE task_id = ?",
+        )
+        .bind(&status_owned)
+        .bind(now)
+        .bind(now)
+        .bind(&summary_owned)
+        .bind(&task_id_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE task_logs \
+             SET status = ? \
+             WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
+        )
+        .bind(&status_owned)
+        .bind(&task_id_owned)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+}
+
+fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
+    let task_id_owned = task_id.to_string();
+    let meta_str: String = with_db(|pool| async move {
+        let row: SqliteRow = sqlx::query("SELECT meta FROM tasks WHERE task_id = ? LIMIT 1")
+            .bind(&task_id_owned)
+            .fetch_one(&pool)
+            .await?;
+        Ok::<String, sqlx::Error>(row.get("meta"))
+    })?;
+
+    let meta: TaskMeta = serde_json::from_str(&meta_str)
+        .map_err(|_| format!("task-meta-invalid task_id={task_id}"))?;
+
+    let (deploy_units, skipped_units, dry_run) = match meta {
+        TaskMeta::ManualDeploy {
+            units,
+            skipped,
+            dry_run,
+            ..
+        } => (units, skipped, dry_run),
+        _ => {
+            return Err(format!(
+                "task-meta-unexpected task_id={task_id} meta=manual-deploy"
+            ));
+        }
+    };
+
+    if dry_run {
+        let skipped_count = skipped_units.len();
+        let total = deploy_units.len().saturating_add(skipped_count);
+        let summary = format!("0/{total} units deployed, 0 failed, {skipped_count} skipped");
+        finalize_task_status(task_id, "succeeded", &summary);
+        append_task_log(
+            task_id,
+            "info",
+            "manual-deploy-run",
+            "succeeded",
+            "Manual deploy dry-run completed",
+            None,
+            json!({ "deploying": deploy_units.len(), "skipped": skipped_count, "dry_run": true }),
+        );
+        return Ok(());
+    }
+
+    let diagnostics_enabled = task_diagnostics_enabled();
+    let diagnostics_journal_lines = if diagnostics_enabled {
+        task_diagnostics_journal_lines_from_env()
+    } else {
+        0
+    };
+
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut unknown = 0usize;
+    let mut unit_results: Vec<Value> = Vec::with_capacity(deploy_units.len());
+
+    for spec in deploy_units.iter() {
+        let unit = spec.unit.clone();
+        let image = spec.image.clone();
+
+        update_task_unit_phase(task_id, &unit, "pulling-image");
+        let pull_command = format!("podman pull {image}");
+        let pull_argv = ["podman", "pull", image.as_str()];
+
+        let pull_result = match pull_container_image(&image) {
+            Ok(res) => res,
+            Err(err) => {
+                let error_summary = unit_error_summary_from_exec_error(&err)
+                    .unwrap_or_else(|| truncate_unit_error_summary(&err));
+                log_message(&format!(
+                    "500 manual-deploy-image-pull-error task_id={task_id} unit={unit} image={image} err={err}"
+                ));
+                let meta = merge_task_meta(
+                    json!({
+                        "type": "command",
+                        "command": pull_command,
+                        "argv": pull_argv,
+                        "error": &err,
+                    }),
+                    json!({ "unit": &unit, "image": &image }),
+                );
+                append_task_log(
+                    task_id,
+                    "error",
+                    "image-pull",
+                    "failed",
+                    "Image pull failed",
+                    Some(&spec.unit),
+                    meta,
+                );
+                update_task_unit_done(
+                    task_id,
+                    &spec.unit,
+                    "failed",
+                    Some("image-pull failed"),
+                    Some(&error_summary),
+                );
+                failed = failed.saturating_add(1);
+                unit_results.push(json!({
+                    "unit": unit,
+                    "image": image,
+                    "status": "failed",
+                    "error": error_summary,
+                }));
+                continue;
+            }
+        };
+
+        if !pull_result.success() {
+            let error_summary = unit_error_summary_from_command_result(&pull_result)
+                .unwrap_or_else(|| "image-pull failed".to_string());
+            log_message(&format!(
+                "500 manual-deploy-image-pull-failed task_id={task_id} unit={unit} image={image} err={error_summary}"
+            ));
+
+            let meta = build_command_meta(
+                &pull_command,
+                &pull_argv,
+                &pull_result,
+                Some(json!({ "unit": &unit, "image": &image })),
+            );
+            append_task_log(
+                task_id,
+                "error",
+                "image-pull",
+                "failed",
+                "Image pull failed",
+                Some(&spec.unit),
+                meta,
+            );
+            update_task_unit_done(
+                task_id,
+                &spec.unit,
+                "failed",
+                Some("image-pull failed"),
+                Some(&error_summary),
+            );
+            failed = failed.saturating_add(1);
+            unit_results.push(json!({
+                "unit": unit,
+                "image": image,
+                "status": "failed",
+                "error": error_summary,
+            }));
+            continue;
+        }
+
+        let meta = build_command_meta(
+            &pull_command,
+            &pull_argv,
+            &pull_result,
+            Some(json!({ "unit": &unit, "image": &image })),
+        );
+        append_task_log(
+            task_id,
+            "info",
+            "image-pull",
+            "succeeded",
+            "Image pull succeeded",
+            Some(&unit),
+            meta,
+        );
+
+        update_task_unit_phase(task_id, &unit, "restarting");
+        let run = run_unit_operation(&unit, UnitOperationPurpose::Restart);
+        let op_result = unit_action_result_from_operation(&unit, &run.result);
+        let mut unit_status = match op_result.status.as_str() {
+            "triggered" => "succeeded",
+            "failed" | "error" => "failed",
+            _ => "unknown",
+        };
+
+        let mut unit_error = if unit_status == "failed" {
+            match &run.result {
+                Ok(res) => unit_error_summary_from_command_result(res),
+                Err(err) => unit_error_summary_from_exec_error(err),
+            }
+        } else {
+            None
+        };
+
+        let restart_meta = build_unit_operation_command_meta(
+            &unit,
+            Some(&image),
+            run.runner,
+            run.purpose,
+            &run.command,
+            &run.argv,
+            run.runner_command.as_deref(),
+            &run.result,
+            &op_result.status,
+            &op_result.message,
+        );
+        append_task_log(
+            task_id,
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
+            "restart-unit",
+            unit_status,
+            if unit_status == "failed" {
+                "Restart unit failed"
+            } else {
+                "Restart unit succeeded"
+            },
+            Some(&unit),
+            restart_meta,
+        );
+
+        if unit_status != "failed" {
+            update_task_unit_phase(task_id, &unit, "verifying");
+            let (verdict, health_summary) = append_unit_health_check_log(task_id, &unit);
+            match verdict {
+                UnitHealthVerdict::Healthy => {}
+                UnitHealthVerdict::Failed => {
+                    unit_status = "failed";
+                    unit_error = Some(health_summary);
+                }
+                UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
+                    unit_status = "unknown";
+                    unit_error = Some(health_summary);
+                }
+            }
+        }
+
+        if unit_status == "failed" && diagnostics_enabled {
+            for entry in capture_unit_failure_diagnostics(&unit, diagnostics_journal_lines) {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
+        }
+
+        let unit_message = match unit_status {
+            "succeeded" => "deployed",
+            "unknown" => "completed with warnings",
+            _ => "failed",
+        };
+        update_task_unit_done(
+            task_id,
+            &unit,
+            unit_status,
+            Some(unit_message),
+            unit_error.as_deref(),
+        );
+
+        match unit_status {
+            "succeeded" => succeeded = succeeded.saturating_add(1),
+            "unknown" => unknown = unknown.saturating_add(1),
+            _ => failed = failed.saturating_add(1),
+        }
+
+        unit_results.push(json!({
+            "unit": unit,
+            "image": image,
+            "status": unit_status,
+            "error": unit_error,
+        }));
+    }
+
+    let skipped_count = skipped_units.len();
+    let deploying_total = deploy_units.len();
+    let total = deploying_total.saturating_add(skipped_count);
+
+    let status = if failed > 0 {
+        "failed"
+    } else if unknown > 0 {
+        "unknown"
+    } else {
+        "succeeded"
+    };
+
+    let mut summary =
+        format!("{succeeded}/{total} units deployed, {failed} failed, {skipped_count} skipped");
+    if unknown > 0 {
+        summary.push_str(&format!(", {unknown} unknown"));
+    }
+
+    finalize_task_status(task_id, status, &summary);
+
+    append_task_log(
+        task_id,
+        if failed > 0 || unknown > 0 {
+            "warning"
+        } else {
+            "info"
+        },
+        "manual-deploy-run",
+        status,
+        &summary,
+        None,
+        json!({
+            "deploying_total": deploying_total,
+            "skipped_total": skipped_count,
+            "succeeded": succeeded,
+            "failed": failed,
+            "unknown": unknown,
+            "results": unit_results,
+        }),
+    );
+
+    Ok(())
+}
+
 fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Result<(), String> {
     let unit_owned = unit.to_string();
     if let Some(image) = image {
@@ -11552,6 +12393,19 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
             "Image pull succeeded",
             Some(&unit_owned),
             meta,
+        );
+    } else {
+        append_task_log(
+            task_id,
+            "info",
+            "image-pull",
+            "skipped",
+            "Image pull skipped (no image provided)",
+            Some(&unit_owned),
+            json!({
+                "unit": unit_owned.clone(),
+                "image": Option::<String>::None,
+            }),
         );
     }
 
@@ -12577,6 +13431,7 @@ mod tests {
     use std::fs;
     use std::fs::File;
     use std::io::Write;
+    use std::path::Path;
     use std::sync::{Mutex, MutexGuard, Once};
     use tempfile::{NamedTempFile, TempDir};
 
@@ -12912,6 +13767,428 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn manual_deploy_api_creates_task_with_deployable_units_only() {
+        let _lock = env_test_lock();
+        init_test_db_with_systemctl_mock();
+
+        // Ensure admin checks are always open in unit tests.
+        set_env(super::ENV_DEV_OPEN_ADMIN, "1");
+        set_env("PODUP_ENV", "dev");
+        let _ = super::forward_auth_config();
+
+        // Seed env units: auto-update is always present via manual_env_unit_list,
+        // and we include 2 deployable units + 1 image-missing unit.
+        set_env(
+            super::ENV_MANUAL_UNITS,
+            "svc-alpha.service,svc-beta.service,svc-missing.service",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        set_env(
+            super::ENV_CONTAINER_DIR,
+            dir.path().to_string_lossy().as_ref(),
+        );
+
+        fs::write(
+            dir.path().join("svc-alpha.container"),
+            "[Container]\nImage=ghcr.io/example/svc-alpha:latest\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("svc-beta.container"),
+            "[Container]\nImage=ghcr.io/example/svc-beta:latest\n",
+        )
+        .unwrap();
+
+        let request_id = "req-manual-deploy-create";
+        let ctx = RequestContext {
+            method: "POST".to_string(),
+            path: "/api/manual/deploy".to_string(),
+            query: None,
+            headers: HashMap::from([
+                ("x-podup-csrf".to_string(), "1".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ]),
+            body: br#"{"all":true,"dry_run":false,"caller":"tests","reason":"deploy"}"#.to_vec(),
+            raw_request: String::new(),
+            request_id: request_id.to_string(),
+            started_at: Instant::now(),
+            received_at: SystemTime::now(),
+        };
+
+        handle_manual_api(&ctx).expect("manual deploy handler should not error");
+
+        let request_id_owned = request_id.to_string();
+        let (task_id, kind, trigger_path) = with_db(|pool| async move {
+            let row: SqliteRow = sqlx::query(
+                "SELECT task_id, kind, trigger_path \
+                 FROM tasks WHERE trigger_request_id = ? \
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .bind(&request_id_owned)
+            .fetch_one(&pool)
+            .await?;
+
+            Ok::<(String, String, Option<String>), sqlx::Error>((
+                row.get("task_id"),
+                row.get("kind"),
+                row.get("trigger_path"),
+            ))
+        })
+        .expect("db query should succeed");
+
+        assert_eq!(kind, "manual");
+        assert_eq!(trigger_path.as_deref(), Some("/api/manual/deploy"));
+
+        let task_id_clone = task_id.clone();
+        let units: Vec<String> = with_db(|pool| async move {
+            let rows: Vec<SqliteRow> =
+                sqlx::query("SELECT unit FROM task_units WHERE task_id = ? ORDER BY unit")
+                    .bind(&task_id_clone)
+                    .fetch_all(&pool)
+                    .await?;
+            Ok::<Vec<String>, sqlx::Error>(rows.into_iter().map(|r| r.get("unit")).collect())
+        })
+        .expect("task_units query");
+
+        let auto_unit = super::manual_auto_update_unit();
+        assert!(
+            !units.contains(&auto_unit),
+            "auto-update unit must not be a deploy target"
+        );
+        assert!(
+            !units.contains(&"svc-missing.service".to_string()),
+            "image-missing unit must be skipped"
+        );
+        assert!(
+            units.contains(&"svc-alpha.service".to_string())
+                && units.contains(&"svc-beta.service".to_string()),
+            "expected alpha+beta deploy units, got={units:?}"
+        );
+        assert_eq!(units.len(), 2);
+
+        remove_env(super::ENV_MANUAL_UNITS);
+        remove_env(super::ENV_CONTAINER_DIR);
+    }
+
+    #[test]
+    fn manual_deploy_api_dry_run_does_not_create_task() {
+        let _lock = env_test_lock();
+        init_test_db_with_systemctl_mock();
+
+        // Ensure admin checks are always open in unit tests.
+        set_env(super::ENV_DEV_OPEN_ADMIN, "1");
+        set_env("PODUP_ENV", "dev");
+        let _ = super::forward_auth_config();
+
+        set_env(
+            super::ENV_MANUAL_UNITS,
+            "svc-alpha.service,svc-beta.service",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        set_env(
+            super::ENV_CONTAINER_DIR,
+            dir.path().to_string_lossy().as_ref(),
+        );
+
+        fs::write(
+            dir.path().join("svc-alpha.container"),
+            "[Container]\nImage=ghcr.io/example/svc-alpha:latest\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("svc-beta.container"),
+            "[Container]\nImage=ghcr.io/example/svc-beta:latest\n",
+        )
+        .unwrap();
+
+        let request_id = "req-manual-deploy-dry-run";
+        let ctx = RequestContext {
+            method: "POST".to_string(),
+            path: "/api/manual/deploy".to_string(),
+            query: None,
+            headers: HashMap::from([
+                ("x-podup-csrf".to_string(), "1".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ]),
+            body: br#"{"all":true,"dry_run":true,"caller":"tests","reason":"deploy-dry-run"}"#
+                .to_vec(),
+            raw_request: String::new(),
+            request_id: request_id.to_string(),
+            started_at: Instant::now(),
+            received_at: SystemTime::now(),
+        };
+
+        handle_manual_api(&ctx).expect("manual deploy dry-run handler should not error");
+
+        let request_id_owned = request_id.to_string();
+        let task_count: i64 = with_db(|pool| async move {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE trigger_request_id = ?")
+                    .bind(&request_id_owned)
+                    .fetch_one(&pool)
+                    .await?;
+            Ok::<i64, sqlx::Error>(count)
+        })
+        .expect("db query should succeed");
+
+        assert_eq!(task_count, 0, "dry-run must not create a task");
+
+        remove_env(super::ENV_MANUAL_UNITS);
+        remove_env(super::ENV_CONTAINER_DIR);
+    }
+
+    #[test]
+    fn manual_deploy_run_task_executes_pull_and_restart() {
+        let _lock = env_test_lock();
+        init_test_db_with_systemctl_mock();
+
+        let units = vec![
+            ManualDeployUnitSpec {
+                unit: "svc-alpha.service".to_string(),
+                image: "ghcr.io/example/svc-alpha:latest".to_string(),
+            },
+            ManualDeployUnitSpec {
+                unit: "svc-beta.service".to_string(),
+                image: "ghcr.io/example/svc-beta:latest".to_string(),
+            },
+        ];
+
+        let caller = Some("tests".to_string());
+        let reason = Some("run".to_string());
+        let meta = TaskMeta::ManualDeploy {
+            all: true,
+            dry_run: false,
+            units: units.clone(),
+            skipped: Vec::new(),
+        };
+
+        let task_id = create_manual_deploy_task(
+            &units,
+            &caller,
+            &reason,
+            "req-manual-deploy-run",
+            "/api/manual/deploy",
+            meta,
+        )
+        .expect("manual deploy task created");
+
+        run_task_by_id(&task_id).expect("run-task should succeed");
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let log_path = format!("{manifest_dir}/tests/mock-bin/log.txt");
+        let log_contents = fs::read_to_string(&log_path).expect("mock log should exist");
+
+        assert!(
+            log_contents.contains("podman pull ghcr.io/example/svc-alpha:latest"),
+            "expected podman pull for svc-alpha, log:\n{log_contents}"
+        );
+        assert!(
+            log_contents.contains("podman pull ghcr.io/example/svc-beta:latest"),
+            "expected podman pull for svc-beta, log:\n{log_contents}"
+        );
+
+        // Restart is performed via busctl when available, with systemctl as a fallback.
+        let alpha_restart = log_contents.contains("busctl --user call")
+            && log_contents.contains("RestartUnit")
+            && log_contents.contains("svc-alpha.service");
+        let beta_restart = log_contents.contains("busctl --user call")
+            && log_contents.contains("RestartUnit")
+            && log_contents.contains("svc-beta.service");
+        let alpha_restart_systemctl =
+            log_contents.contains("systemctl --user restart svc-alpha.service");
+        let beta_restart_systemctl =
+            log_contents.contains("systemctl --user restart svc-beta.service");
+
+        assert!(
+            alpha_restart || alpha_restart_systemctl,
+            "expected restart for svc-alpha via busctl or systemctl, log:\n{log_contents}"
+        );
+        assert!(
+            beta_restart || beta_restart_systemctl,
+            "expected restart for svc-beta via busctl or systemctl, log:\n{log_contents}"
+        );
+    }
+
+    #[test]
+    fn manual_deploy_run_task_records_failures_for_podman_pull() {
+        let _lock = env_test_lock();
+        init_test_db_with_systemctl_mock();
+
+        set_env("MOCK_PODMAN_FAIL", "1");
+
+        let units = vec![ManualDeployUnitSpec {
+            unit: "svc-alpha.service".to_string(),
+            image: "ghcr.io/example/svc-alpha:latest".to_string(),
+        }];
+
+        let meta = TaskMeta::ManualDeploy {
+            all: true,
+            dry_run: false,
+            units: units.clone(),
+            skipped: Vec::new(),
+        };
+
+        let task_id = create_manual_deploy_task(
+            &units,
+            &None,
+            &None,
+            "req-manual-deploy-pull-fail",
+            "/api/manual/deploy",
+            meta,
+        )
+        .expect("manual deploy task created");
+
+        run_task_by_id(&task_id).expect("run-task should not error even on pull failure");
+
+        let task_id_clone = task_id.clone();
+        let (task_status, unit_status) = with_db(|pool| async move {
+            let task_row: SqliteRow =
+                sqlx::query("SELECT status FROM tasks WHERE task_id = ? LIMIT 1")
+                    .bind(&task_id_clone)
+                    .fetch_one(&pool)
+                    .await?;
+            let unit_row: SqliteRow =
+                sqlx::query("SELECT status FROM task_units WHERE task_id = ? AND unit = ? LIMIT 1")
+                    .bind(&task_id_clone)
+                    .bind("svc-alpha.service")
+                    .fetch_one(&pool)
+                    .await?;
+            Ok::<(String, String), sqlx::Error>((task_row.get("status"), unit_row.get("status")))
+        })
+        .expect("db query");
+
+        assert_eq!(task_status, "failed");
+        assert_eq!(unit_status, "failed");
+
+        remove_env("MOCK_PODMAN_FAIL");
+    }
+
+    #[test]
+    fn manual_deploy_run_task_records_failures_for_systemctl_restart_and_appends_diagnostics() {
+        let _lock = env_test_lock();
+        init_test_db_with_systemctl_mock();
+
+        // Force systemctl runner by hiding busctl from PATH so MOCK_SYSTEMCTL_FAIL applies.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mock_src = Path::new(manifest_dir).join("tests").join("mock-bin");
+        let isolated = tempfile::tempdir().unwrap();
+        for name in ["podman", "systemctl", "journalctl"] {
+            let src = mock_src.join(name);
+            let dst = isolated.path().join(name);
+            fs::copy(&src, &dst).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&dst).unwrap().permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&dst, perms).unwrap();
+            }
+        }
+        // The mock-bin scripts use `dirname` and `mkdir`. When we constrain PATH
+        // to hide `busctl`, provide a minimal `dirname` shim in the isolated
+        // PATH so the scripts still run.
+        let dirname_path = isolated.path().join("dirname");
+        fs::write(
+            &dirname_path,
+            r#"#!/bin/sh
+path="${1:-}"
+case "$path" in
+  */*) echo "${path%/*}" ;;
+  *) echo "." ;;
+esac
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dirname_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&dirname_path, perms).unwrap();
+        }
+        let old_path = env::var("PATH").unwrap_or_default();
+        let isolated_path = format!("{}:/bin", isolated.path().to_string_lossy());
+        set_env("PATH", &isolated_path);
+
+        set_env("MOCK_SYSTEMCTL_FAIL", "svc-alpha.service");
+        set_env(super::ENV_TASK_DIAGNOSTICS, "1");
+
+        let units = vec![
+            ManualDeployUnitSpec {
+                unit: "svc-alpha.service".to_string(),
+                image: "ghcr.io/example/svc-alpha:latest".to_string(),
+            },
+            ManualDeployUnitSpec {
+                unit: "svc-beta.service".to_string(),
+                image: "ghcr.io/example/svc-beta:latest".to_string(),
+            },
+        ];
+
+        let meta = TaskMeta::ManualDeploy {
+            all: true,
+            dry_run: false,
+            units: units.clone(),
+            skipped: Vec::new(),
+        };
+
+        let task_id = create_manual_deploy_task(
+            &units,
+            &None,
+            &None,
+            "req-manual-deploy-restart-fail",
+            "/api/manual/deploy",
+            meta,
+        )
+        .expect("manual deploy task created");
+
+        run_task_by_id(&task_id).expect("run-task should not error even on unit restart failure");
+
+        let task_id_clone = task_id.clone();
+        let (task_status, alpha_status, diag_count) = with_db(|pool| async move {
+            let task_row: SqliteRow =
+                sqlx::query("SELECT status FROM tasks WHERE task_id = ? LIMIT 1")
+                    .bind(&task_id_clone)
+                    .fetch_one(&pool)
+                    .await?;
+            let alpha_row: SqliteRow = sqlx::query(
+                "SELECT status FROM task_units WHERE task_id = ? AND unit = ? LIMIT 1",
+            )
+            .bind(&task_id_clone)
+            .bind("svc-alpha.service")
+            .fetch_one(&pool)
+            .await?;
+            let diag: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_logs \
+                 WHERE task_id = ? AND unit = ? AND action IN ('unit-diagnose-status','unit-diagnose-journal')",
+            )
+            .bind(&task_id_clone)
+            .bind("svc-alpha.service")
+            .fetch_one(&pool)
+            .await?;
+            Ok::<(String, String, i64), sqlx::Error>((
+                task_row.get("status"),
+                alpha_row.get("status"),
+                diag,
+            ))
+        })
+        .expect("db query");
+
+        assert_eq!(task_status, "failed");
+        assert_eq!(alpha_status, "failed");
+        assert!(
+            diag_count > 0,
+            "expected diagnostics logs for failing unit when diagnostics enabled"
+        );
+
+        // Restore environment.
+        set_env("PATH", &old_path);
+        remove_env("MOCK_SYSTEMCTL_FAIL");
+        remove_env(super::ENV_TASK_DIAGNOSTICS);
     }
 
     #[test]

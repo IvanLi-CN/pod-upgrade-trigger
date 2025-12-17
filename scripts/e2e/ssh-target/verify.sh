@@ -72,8 +72,21 @@ check "ssh login works (id)" "ssh -o BatchMode=yes -o StrictHostKeyChecking=acce
 check "systemctl --user works (no bus error)" "ssh_target 'systemctl --user list-units --no-pager >/dev/null'"
 check "podman --version returns 0" "ssh_target 'podman --version'"
 
+check "podup-e2e-noop.container fixture present" "ssh_target 'test -f /home/${ops_user}/.config/containers/systemd/podup-e2e-noop.container'"
+check "podup-e2e-noop.container has Image=" "ssh_target 'grep -q \"^Image=\" /home/${ops_user}/.config/containers/systemd/podup-e2e-noop.container'"
+check "svc-alpha.container fixture present" "ssh_target 'test -f /home/${ops_user}/.config/containers/systemd/svc-alpha.container'"
+check "svc-alpha.container has Image=" "ssh_target 'grep -q \"^Image=\" /home/${ops_user}/.config/containers/systemd/svc-alpha.container'"
+check "svc-beta.container fixture present" "ssh_target 'test -f /home/${ops_user}/.config/containers/systemd/svc-beta.container'"
+check "svc-beta.container has Image=" "ssh_target 'grep -q \"^Image=\" /home/${ops_user}/.config/containers/systemd/svc-beta.container'"
+check "svc-gamma.container fixture present" "ssh_target 'test -f /home/${ops_user}/.config/containers/systemd/svc-gamma.container'"
+check "svc-gamma.container has Image=" "ssh_target 'grep -q \"^Image=\" /home/${ops_user}/.config/containers/systemd/svc-gamma.container'"
+
 check "daemon-reload ok" "ssh_target 'systemctl --user daemon-reload'"
-check "enable --now podup-e2e-noop.service" "ssh_target 'systemctl --user enable --now --no-block podup-e2e-noop.service; for i in {1..30}; do systemctl --user is-active --quiet podup-e2e-noop.service && exit 0; sleep 1; done; systemctl --user status podup-e2e-noop.service --no-pager || true; exit 1'"
+check "podup-e2e-noop.service loaded" "ssh_target 'systemctl --user show podup-e2e-noop.service -p LoadState --value | grep -qx loaded'"
+check "svc-alpha.service loaded" "ssh_target 'systemctl --user show svc-alpha.service -p LoadState --value | grep -qx loaded'"
+check "svc-beta.service loaded" "ssh_target 'systemctl --user show svc-beta.service -p LoadState --value | grep -qx loaded'"
+check "svc-gamma.service loaded" "ssh_target 'systemctl --user show svc-gamma.service -p LoadState --value | grep -qx loaded'"
+check "start podup-e2e-noop.service" "ssh_target 'systemctl --user start --no-block podup-e2e-noop.service; for i in {1..30}; do systemctl --user is-active --quiet podup-e2e-noop.service && exit 0; sleep 1; done; systemctl --user status podup-e2e-noop.service --no-pager || true; exit 1'"
 check "restart podup-e2e-noop.service" "ssh_target 'systemctl --user restart --no-block podup-e2e-noop.service; for i in {1..30}; do systemctl --user is-active --quiet podup-e2e-noop.service && exit 0; sleep 1; done; systemctl --user status podup-e2e-noop.service --no-pager || true; exit 1'"
 check "stop podup-e2e-noop.service" "ssh_target 'systemctl --user stop --no-block podup-e2e-noop.service; for i in {1..30}; do systemctl --user is-active --quiet podup-e2e-noop.service || exit 0; sleep 1; done; systemctl --user status podup-e2e-noop.service --no-pager || true; exit 1'"
 

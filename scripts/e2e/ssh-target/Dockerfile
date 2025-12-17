@@ -46,7 +46,6 @@ RUN set -euo pipefail; \
   install -d -m 0755 -o "${OPS_UID}" -g "${OPS_GID}" "/home/${OPS_USER}/.config/containers/systemd"; \
   install -d -m 0755 -o "${OPS_UID}" -g "${OPS_GID}" "/home/${OPS_USER}/.local"; \
   install -d -m 0755 -o "${OPS_UID}" -g "${OPS_GID}" "/home/${OPS_USER}/.local/share"; \
-  install -d -m 0755 -o "${OPS_UID}" -g "${OPS_GID}" "/home/${OPS_USER}/.local/share/podup-e2e/quadlets"; \
   install -d -m 0755 "/var/lib/podup-ssh-target/ssh-host-keys"; \
   install -d -m 0755 "/var/lib/systemd/linger"; \
   : >"/var/lib/systemd/linger/${OPS_USER}"; \
@@ -90,15 +89,19 @@ RUN set -euo pipefail; \
   ln -sf /usr/lib/systemd/system/sshd.service /etc/systemd/system/multi-user.target.wants/sshd.service
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY podup-e2e-noop.service /usr/local/share/podup-e2e-noop.service
+COPY podup-e2e-noop.container /usr/local/share/podup-e2e-noop.container
+COPY svc-alpha.container /usr/local/share/svc-alpha.container
+COPY svc-beta.container /usr/local/share/svc-beta.container
+COPY svc-gamma.container /usr/local/share/svc-gamma.container
 
 RUN set -euo pipefail; \
   chmod 0755 /usr/local/bin/entrypoint.sh; \
   ops_uid="${OPS_UID}"; \
   ops_gid="${OPS_GID}"; \
-  install -d -m 0755 -o "${ops_uid}" -g "${ops_gid}" "/home/${OPS_USER}/.config/systemd/user"; \
-  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/podup-e2e-noop.service "/home/${OPS_USER}/.config/systemd/user/podup-e2e-noop.service"; \
-  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/podup-e2e-noop.service "/home/${OPS_USER}/.local/share/podup-e2e/quadlets/podup-e2e-noop.service"
+  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/podup-e2e-noop.container "/home/${OPS_USER}/.config/containers/systemd/podup-e2e-noop.container"; \
+  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/svc-alpha.container "/home/${OPS_USER}/.config/containers/systemd/svc-alpha.container"; \
+  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/svc-beta.container "/home/${OPS_USER}/.config/containers/systemd/svc-beta.container"; \
+  install -o "${ops_uid}" -g "${ops_gid}" -m 0644 /usr/local/share/svc-gamma.container "/home/${OPS_USER}/.config/containers/systemd/svc-gamma.container"
 
 RUN set -euo pipefail; \
   printf '%s\n' '[storage]' 'driver = "vfs"' >"/home/${OPS_USER}/.config/containers/storage.conf"; \

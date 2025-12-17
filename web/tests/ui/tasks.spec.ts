@@ -53,7 +53,7 @@ test.describe('Tasks page (mock)', () => {
     await expect(page.getByText('来源 · manual')).toBeVisible()
     await expect(page.getByText('caller · ops-nightly')).toBeVisible()
     await expect(page.getByText('reason · nightly rollout')).toBeVisible()
-    await expect(page.getByText('path · /api/manual/trigger')).toBeVisible()
+    await expect(page.getByText('path · /api/manual/deploy')).toBeVisible()
 
     await expect(page.getByText('单元状态')).toBeVisible()
     await expect(

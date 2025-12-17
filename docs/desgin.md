@@ -17,8 +17,10 @@
 
 3. **手动触发 API 与 CLI**
    - `/auto-update`：历史兼容的 token 触发路径，主要启动 `podman-auto-update.service`。
-   - `/api/manual/trigger`：POST JSON，支持 `all/units/dry_run/caller/reason` 等字段，可批量触发或纯 dry-run。
-   - `/api/manual/services/<slug>`：面向单个 unit 的 JSON API，可附加 `image` 以提前拉取镜像。
+   - `/api/manual/deploy`：批量部署（pull + restart），支持 `all/dry_run/caller/reason`；自动排除 auto-update 单元，且仅对“有默认镜像”的服务生效（dry-run 不创建 task）。
+   - `/api/manual/services/<slug>`：按服务部署的 JSON API，可附加 `dry_run/image/caller/reason`。
+   - `/api/manual/auto-update/run`：手动运行 auto-update（独立入口，非 Services deploy 流程）。
+   - `/api/manual/trigger`：legacy（兼容保留，仅 restart-only；不再作为 UI 主路径）。
    - CLI 子命令：`server`（守护进程）、`scheduler`、`trigger-units`、`trigger-all`、`prune-state`、`run-task` 与 HTTP API 共享实现，便于脚本化集成。
 
 4. **后台调度器**

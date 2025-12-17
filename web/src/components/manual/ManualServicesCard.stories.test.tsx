@@ -11,7 +11,7 @@ afterEach(() => cleanup())
 describe('ManualServicesCard stories', () => {
   it('renders empty message when no services', async () => {
     render(<Empty />)
-    expect(await screen.findByText('暂无可触发的 systemd 单元。')).toBeInTheDocument()
+    expect(await screen.findByText('暂无可部署的服务。')).toBeInTheDocument()
   })
 
   it('renders mixed update badge states', async () => {

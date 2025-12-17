@@ -59,15 +59,15 @@
 ### SSH 模式的关键配置（必需）
 
 - `PODUP_SSH_TARGET`：SSH 目标（`user@host` 或 `~/.ssh/config` 的 Host alias）。当前推荐使用 **Host alias** 来承载端口映射后的端口（避免把 `-p` 之类参数揉进业务配置）。
-- `PODUP_CONTAINER_DIR`：远端 Quadlet 目录（示例：`/home/ivan/.config/containers/systemd`）。
-- `PODUP_AUTO_UPDATE_LOG_DIR`：远端 auto-update 日志目录（示例：`/home/ivan/.local/share/podman-auto-update/logs`）。
+- `PODUP_CONTAINER_DIR`：远端“容器单元定义目录”（Quadlet/`.service`）；生产常见为 `~/.config/containers/systemd`，本项目 SSH target E2E 也固定为 `~/.config/containers/systemd`（由 `scripts/e2e/ssh-target/deploy.sh` 写入，以确保 quadlet 能生成对应的 `.service` 单元）。
+- `PODUP_AUTO_UPDATE_LOG_DIR`：远端 auto-update 日志目录；生产常见为 `~/.local/share/podman-auto-update/logs`，本项目 SSH target E2E 默认使用一个“缺失目录”来覆盖容错路径（见 `scripts/test-e2e-ssh.sh`）。
 
 示例：
 
 ```bash
 export PODUP_SSH_TARGET="podup-test"
 export PODUP_CONTAINER_DIR="/home/ivan/.config/containers/systemd"
-export PODUP_AUTO_UPDATE_LOG_DIR="/home/ivan/.local/share/podman-auto-update/logs"
+export PODUP_AUTO_UPDATE_LOG_DIR="/home/ivan/.local/share/podup-e2e/logs-missing"
 ```
 
 ### 本次建议增加的可选配置（为后续扩展预留）
@@ -294,7 +294,7 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
   - 导出并固定本次 E2E 所需 env：
     - `PODUP_E2E_SSH=1`（用于让 `tests/e2e_ssh.rs` 默认跳过，避免 CI 误跑）
     - `PODUP_SSH_TARGET=ssh://ivan@<host>:2222`
-    - `PODUP_CONTAINER_DIR=/home/ivan/.local/share/podup-e2e/quadlets`
+    - `PODUP_CONTAINER_DIR=/home/ivan/.config/containers/systemd`
     - `PODUP_AUTO_UPDATE_LOG_DIR=/home/ivan/.local/share/podup-e2e/logs-missing`
   - 运行 `cargo test --locked --test e2e_ssh -- --nocapture`（不得注入 `tests/mock-bin` 到 `PATH`）。
 
@@ -323,7 +323,7 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
   - Host backend 命令白名单与 meta 记录（截断规则）。
   - LocalChildExecutor stop/force-stop 行为。
 - 集成/E2E：
-  - 在远端准备最小 Quadlet 单元，验证 `/api/manual/services` discovery 与 `/api/manual/trigger` 重启行为。
+  - 在远端准备最小 Quadlet 单元，验证 `/api/manual/services` discovery 与 `POST /api/manual/deploy`（pull + restart；auto-update excluded）的主路径行为；可选覆盖 legacy `POST /api/manual/trigger`（restart-only）。
   - 选取 1-2 条最关键生产路径（GitHub webhook dispatch + unit restart + 失败诊断抓取）做真实环境回归。
 
 ## 交付物（本次必须完成）

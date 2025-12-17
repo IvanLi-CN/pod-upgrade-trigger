@@ -12,13 +12,13 @@ test.describe('Dashboard and navigation', () => {
 
     const nav = page.getByRole('navigation')
     await expect(nav.getByRole('link', { name: 'Dashboard' })).toBeVisible()
-    await expect(nav.getByRole('link', { name: 'Manual' })).toBeVisible()
+    await expect(nav.getByRole('link', { name: 'Services' })).toBeVisible()
     await expect(nav.getByRole('link', { name: 'Webhooks' })).toBeVisible()
     await expect(nav.getByRole('link', { name: 'Events' })).toBeVisible()
     await expect(nav.getByRole('link', { name: 'Maintenance' })).toBeVisible()
     await expect(nav.getByRole('link', { name: 'Settings' })).toBeVisible()
 
-    await page.getByRole('link', { name: 'Manual' }).click()
+    await page.getByRole('link', { name: 'Services' }).click()
     await expect(page).toHaveURL(/\/manual$/)
 
     await page.getByRole('link', { name: 'Webhooks' }).click()

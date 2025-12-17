@@ -1,11 +1,11 @@
-# Manual 页面更新提示（tag 内/外）设计
+# Services 页面更新提示（tag 内/外）设计
 
 ## 背景
 
-当前 `/manual` 手动触发页面主要提供两类能力：
+当前 `/manual`（UI 标签：**Services**）页面主要提供两类能力：
 
 - 列出可触发的 systemd unit（来自 `GET /api/manual/services`），并展示其默认镜像（来自 Quadlet / unit 定义中的 `Image=`）。
-- 对单个 unit 或全部 unit 发起手动触发（`POST /api/manual/services/<slug>` / `POST /api/manual/trigger`），后端执行 `podman pull <image>`（可选）+ `systemctl/busctl restart|start <unit>`。
+- 对单个服务或全部可部署服务发起部署（`POST /api/manual/services/<slug>` / `POST /api/manual/deploy`），后端执行 `podman pull <image>` + `systemctl/busctl restart|start <unit>`（auto-update excluded；批量 deploy 会跳过缺少默认镜像的服务；按服务 deploy 由 UI 保证传入 `image`，避免退化为 restart-only）。
 
 但 UI 缺少“是否有可更新内容”的提示。主人希望在服务列表项上看到两种不同语义的更新标记：
 
@@ -16,7 +16,7 @@
 
 ## 目标
 
-1. 在 Manual 的服务列表项上展示更新状态标记，并区分：
+1. 在 Services 的服务列表项上展示更新状态标记，并区分：
    - `tag_update_available`（tag 内有更新，可直接触发更新解决；UI 文案：**有新版本**）
    - `latest_ahead`（tag 外有更新，仅提示；UI 文案：**有更高版本**）
    - `up_to_date`（无更新）
@@ -53,7 +53,7 @@
 
 ## 关键用例 / 用户流程
 
-1. 主人打开 `/manual`：
+1. 主人打开 `/manual`（Services）：
    - UI 调用 `GET /api/manual/services` 获取服务列表与 `update` 信息。
    - 列表项显示：
      - `tag_update_available`：显著提示“有新版本”，并暗示可直接触发更新。
@@ -178,7 +178,7 @@
 - `latest_ahead` 的语义只表示“latest 与当前 tag 的 digest 不同”，不承诺“更高 semver”，避免误导。
 - 本次判定策略只使用“digest 不同”作为更新信号，不引入语义化版本比较、发布时间比较等复杂逻辑。
 
-## 前端设计（ManualPage）
+## 前端设计（Services 页面）
 
 ### 展示
 
