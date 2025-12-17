@@ -10363,7 +10363,11 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
 
     let (verdict, summary, meta) = match outcome {
         Ok(result) => {
-            let props = if result.success() { last_props } else { HashMap::new() };
+            let props = if result.success() {
+                last_props
+            } else {
+                HashMap::new()
+            };
             let state_summary = unit_state_summary(&props);
             let verdict = if result.success() && !props.is_empty() {
                 evaluate_unit_health(&props)
@@ -12014,8 +12018,8 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
         Ok::<String, sqlx::Error>(row.get("meta"))
     })?;
 
-    let meta: TaskMeta =
-        serde_json::from_str(&meta_str).map_err(|_| format!("task-meta-invalid task_id={task_id}"))?;
+    let meta: TaskMeta = serde_json::from_str(&meta_str)
+        .map_err(|_| format!("task-meta-invalid task_id={task_id}"))?;
 
     let (deploy_units, skipped_units, dry_run) = match meta {
         TaskMeta::ManualDeploy {
@@ -12024,7 +12028,11 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
             dry_run,
             ..
         } => (units, skipped, dry_run),
-        _ => return Err(format!("task-meta-unexpected task_id={task_id} meta=manual-deploy")),
+        _ => {
+            return Err(format!(
+                "task-meta-unexpected task_id={task_id} meta=manual-deploy"
+            ));
+        }
     };
 
     if dry_run {
@@ -12195,7 +12203,11 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
         );
         append_task_log(
             task_id,
-            if unit_status == "failed" { "error" } else { "info" },
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
             "restart-unit",
             unit_status,
             if unit_status == "failed" {
@@ -12276,9 +12288,8 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
         "succeeded"
     };
 
-    let mut summary = format!(
-        "{succeeded}/{total} units deployed, {failed} failed, {skipped_count} skipped"
-    );
+    let mut summary =
+        format!("{succeeded}/{total} units deployed, {failed} failed, {skipped_count} skipped");
     if unknown > 0 {
         summary.push_str(&format!(", {unknown} unknown"));
     }
@@ -12287,7 +12298,11 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
 
     append_task_log(
         task_id,
-        if failed > 0 || unknown > 0 { "warning" } else { "info" },
+        if failed > 0 || unknown > 0 {
+            "warning"
+        } else {
+            "info"
+        },
         "manual-deploy-run",
         status,
         &summary,
@@ -13830,12 +13845,11 @@ mod tests {
 
         let task_id_clone = task_id.clone();
         let units: Vec<String> = with_db(|pool| async move {
-            let rows: Vec<SqliteRow> = sqlx::query(
-                "SELECT unit FROM task_units WHERE task_id = ? ORDER BY unit",
-            )
-            .bind(&task_id_clone)
-            .fetch_all(&pool)
-            .await?;
+            let rows: Vec<SqliteRow> =
+                sqlx::query("SELECT unit FROM task_units WHERE task_id = ? ORDER BY unit")
+                    .bind(&task_id_clone)
+                    .fetch_all(&pool)
+                    .await?;
             Ok::<Vec<String>, sqlx::Error>(rows.into_iter().map(|r| r.get("unit")).collect())
         })
         .expect("task_units query");
@@ -13850,7 +13864,8 @@ mod tests {
             "image-missing unit must be skipped"
         );
         assert!(
-            units.contains(&"svc-alpha.service".to_string()) && units.contains(&"svc-beta.service".to_string()),
+            units.contains(&"svc-alpha.service".to_string())
+                && units.contains(&"svc-beta.service".to_string()),
             "expected alpha+beta deploy units, got={units:?}"
         );
         assert_eq!(units.len(), 2);
@@ -13869,7 +13884,10 @@ mod tests {
         set_env("PODUP_ENV", "dev");
         let _ = super::forward_auth_config();
 
-        set_env(super::ENV_MANUAL_UNITS, "svc-alpha.service,svc-beta.service");
+        set_env(
+            super::ENV_MANUAL_UNITS,
+            "svc-alpha.service,svc-beta.service",
+        );
 
         let dir = tempfile::tempdir().unwrap();
         set_env(
@@ -13909,12 +13927,11 @@ mod tests {
 
         let request_id_owned = request_id.to_string();
         let task_count: i64 = with_db(|pool| async move {
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM tasks WHERE trigger_request_id = ?",
-            )
-            .bind(&request_id_owned)
-            .fetch_one(&pool)
-            .await?;
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE trigger_request_id = ?")
+                    .bind(&request_id_owned)
+                    .fetch_one(&pool)
+                    .await?;
             Ok::<i64, sqlx::Error>(count)
         })
         .expect("db query should succeed");
@@ -14035,13 +14052,12 @@ mod tests {
                     .bind(&task_id_clone)
                     .fetch_one(&pool)
                     .await?;
-            let unit_row: SqliteRow = sqlx::query(
-                "SELECT status FROM task_units WHERE task_id = ? AND unit = ? LIMIT 1",
-            )
-            .bind(&task_id_clone)
-            .bind("svc-alpha.service")
-            .fetch_one(&pool)
-            .await?;
+            let unit_row: SqliteRow =
+                sqlx::query("SELECT status FROM task_units WHERE task_id = ? AND unit = ? LIMIT 1")
+                    .bind(&task_id_clone)
+                    .bind("svc-alpha.service")
+                    .fetch_one(&pool)
+                    .await?;
             Ok::<(String, String), sqlx::Error>((task_row.get("status"), unit_row.get("status")))
         })
         .expect("db query");
