@@ -1,7 +1,7 @@
 import { Icon } from '@iconify/react'
 import type { FormEvent } from 'react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
 import { useToast } from '../components/Toast'
 import type {
@@ -74,8 +74,6 @@ export default function ManualPage() {
   const [servicesLoading, setServicesLoading] = useState(true)
   const [servicesError, setServicesError] = useState<string | null>(null)
   const [history, setHistory] = useState<ManualHistoryEntry[]>([])
-  const [taskDrawerVisible, setTaskDrawerVisible] = useState(false)
-  const [taskDrawerInitialTaskId, setTaskDrawerInitialTaskId] = useState<string | null>(null)
   const [allDryRun, setAllDryRun] = useState(false)
   const [allCaller, setAllCaller] = useState('')
   const [allReason, setAllReason] = useState('')
@@ -85,6 +83,67 @@ export default function ManualPage() {
   const [autoUpdatePending, setAutoUpdatePending] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const updateSearchParams = (mutate: (next: URLSearchParams) => void) => {
+    const next = new URLSearchParams(searchParams)
+    mutate(next)
+    if (next.toString() === searchParams.toString()) return
+    setSearchParams(next, { replace: true })
+  }
+
+  const setTasksDrawerClosed = () => {
+    updateSearchParams((next) => {
+      next.delete('drawer')
+      next.delete('task_id')
+    })
+  }
+
+  const setTasksDrawerList = () => {
+    updateSearchParams((next) => {
+      next.set('drawer', 'tasks')
+      next.delete('task_id')
+    })
+  }
+
+  const setTasksDrawerDetail = (taskId: string) => {
+    updateSearchParams((next) => {
+      next.set('drawer', 'tasks')
+      next.set('task_id', taskId)
+    })
+  }
+
+  const urlTaskId = (() => {
+    const raw = searchParams.get('task_id')
+    const trimmed = raw?.trim()
+    return trimmed ? trimmed : null
+  })()
+  const urlDrawer = searchParams.get('drawer')
+  const tasksDrawerOpen = urlDrawer === 'tasks' || Boolean(urlTaskId)
+  const tasksDrawerView: 'list' | 'detail' = urlTaskId ? 'detail' : 'list'
+
+  // Normalize URL into the required contract:
+  // - drawer list: ?drawer=tasks
+  // - drawer detail: ?drawer=tasks&task_id=...
+  // - allow ?task_id=... to imply drawer detail.
+  useEffect(() => {
+    const next = new URLSearchParams(searchParams)
+    const nextTaskIdRaw = next.get('task_id')
+    const nextTaskId = nextTaskIdRaw?.trim() ? nextTaskIdRaw.trim() : null
+    const nextDrawer = next.get('drawer')
+
+    if (nextTaskIdRaw !== null && !nextTaskId) {
+      next.delete('task_id')
+    }
+
+    if (nextTaskId && nextDrawer !== 'tasks') {
+      next.set('drawer', 'tasks')
+    }
+
+    if (next.toString() !== searchParams.toString()) {
+      setSearchParams(next, { replace: true })
+    }
+  }, [searchParams, setSearchParams])
 
   useEffect(() => {
     let cancelled = false
@@ -162,8 +221,7 @@ export default function ManualPage() {
           title: '已创建任务',
           message: '已在当前页面打开任务抽屉以跟踪本次部署。',
         })
-        setTaskDrawerInitialTaskId(response.task_id)
-        setTaskDrawerVisible(true)
+        setTasksDrawerDetail(response.task_id)
       }
     } catch (error) {
       const message =
@@ -218,8 +276,7 @@ export default function ManualPage() {
           title: '已创建任务',
           message: '已在当前页面打开任务抽屉以跟踪本次部署。',
         })
-        setTaskDrawerInitialTaskId(response.task_id)
-        setTaskDrawerVisible(true)
+        setTasksDrawerDetail(response.task_id)
       }
     } catch (error) {
       const message =
@@ -274,8 +331,7 @@ export default function ManualPage() {
           title: alreadyRunning ? '正在跟踪现有任务' : '已创建任务',
           message: '已在当前页面打开任务抽屉以跟踪 auto-update 执行。',
         })
-        setTaskDrawerInitialTaskId(response.task_id)
-        setTaskDrawerVisible(true)
+        setTasksDrawerDetail(response.task_id)
       }
     } catch (error) {
       const message =
@@ -474,13 +530,13 @@ export default function ManualPage() {
           </div>
         </div>
       </section>
-      {taskDrawerVisible ? (
+      {tasksDrawerOpen ? (
         <ManualTasksDrawer
-          initialTaskId={taskDrawerInitialTaskId}
-          onClose={() => {
-            setTaskDrawerVisible(false)
-            setTaskDrawerInitialTaskId(null)
-          }}
+          view={tasksDrawerView}
+          taskId={urlTaskId}
+          onClose={setTasksDrawerClosed}
+          onShowList={setTasksDrawerList}
+          onShowDetail={setTasksDrawerDetail}
         />
       ) : null}
     </div>
@@ -488,20 +544,27 @@ export default function ManualPage() {
 }
 
 type ManualTasksDrawerProps = {
-  initialTaskId?: string | null
+  view: 'list' | 'detail'
+  taskId: string | null
   onClose: () => void
+  onShowList: () => void
+  onShowDetail: (taskId: string) => void
 }
 
 const TASKS_PAGE_SIZE = 20
 const TASKS_POLL_INTERVAL_MS = 7000
 const TASK_DETAIL_POLL_INTERVAL_MS = 3000
 
-function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
+function ManualTasksDrawer({
+  view,
+  taskId,
+  onClose,
+  onShowList,
+  onShowDetail,
+}: ManualTasksDrawerProps) {
   const { status: appStatus, getJson } = useApi()
   const { pushToast } = useToast()
-  const [activeTab, setActiveTab] = useState<'list' | 'detail'>(
-    initialTaskId ? 'detail' : 'list',
-  )
+  const navigate = useNavigate()
   const [tasks, setTasks] = useState<Task[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
@@ -509,22 +572,14 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(
-    initialTaskId ?? null,
-  )
+  const activeTab = view
+  const selectedTaskId = taskId
   const [detail, setDetail] = useState<TaskDetailResponse | null>(null)
   const [detailLogs, setDetailLogs] = useState<TaskLogEntry[] | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
   const [expandedCommandLogs, setExpandedCommandLogs] = useState<Record<number, boolean>>({})
   const detailStatus = detail?.status
-
-  // Keep drawer focused on the latest task when parent updates initialTaskId
-  useEffect(() => {
-    if (!initialTaskId) return
-    setSelectedTaskId(initialTaskId)
-    setActiveTab('detail')
-  }, [initialTaskId])
 
   useEffect(() => {
     let cancelled = false
@@ -809,20 +864,62 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
     }
   }
 
+  const handleCopyTaskId = async () => {
+    if (!selectedTaskId) return
+    try {
+      await navigator.clipboard.writeText(selectedTaskId)
+      pushToast({
+        variant: 'success',
+        title: '已复制 task_id',
+        message: selectedTaskId,
+      })
+    } catch {
+      pushToast({
+        variant: 'warning',
+        title: '复制失败',
+        message: '浏览器未允许访问剪贴板。',
+      })
+    }
+  }
+
+  const handleOpenTasksPage = () => {
+    if (selectedTaskId) {
+      navigate(`/tasks?task_id=${encodeURIComponent(selectedTaskId)}`)
+      return
+    }
+    navigate('/tasks')
+  }
+
   return (
-    <div className="fixed inset-0 z-40 flex justify-end bg-base-300/40">
-      <div className="flex h-full w-full max-w-4xl flex-col border-l border-base-300 bg-base-100 shadow-xl">
+    <div
+      className="fixed inset-0 z-40 flex justify-end bg-base-300/40"
+      onClick={onClose}
+    >
+      <div
+        className="flex h-full w-full max-w-4xl flex-col border-l border-base-300 bg-base-100 shadow-xl"
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="flex items-center justify-between border-b border-base-200 px-4 py-3">
           <div className="flex items-center gap-2">
             <span className="text-sm font-semibold">任务中心</span>
           </div>
-          <button
-            type="button"
-            className="btn btn-ghost btn-xs"
-            onClick={onClose}
-          >
-            <Icon icon="mdi:close" className="text-lg" />
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className="btn btn-ghost btn-xs"
+              onClick={handleOpenTasksPage}
+            >
+              <Icon icon="mdi:open-in-new" className="text-lg" />
+              打开 Tasks
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-xs"
+              onClick={onClose}
+            >
+              <Icon icon="mdi:close" className="text-lg" />
+            </button>
+          </div>
         </div>
 
         <div className="border-b border-base-200 px-4 pt-2">
@@ -830,14 +927,18 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
             <button
               type="button"
               className={`tab ${activeTab === 'list' ? 'tab-active' : ''}`}
-              onClick={() => setActiveTab('list')}
+              onClick={onShowList}
             >
               任务列表
             </button>
             <button
               type="button"
               className={`tab ${activeTab === 'detail' ? 'tab-active' : ''}`}
-              onClick={() => setActiveTab('detail')}
+              onClick={() => {
+                if (selectedTaskId) {
+                  onShowDetail(selectedTaskId)
+                }
+              }}
               disabled={!selectedTaskId}
             >
               任务详情
@@ -911,8 +1012,7 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                         key={task.task_id}
                         className="cursor-pointer hover:bg-base-200"
                         onClick={() => {
-                          setSelectedTaskId(task.task_id)
-                          setActiveTab('detail')
+                          onShowDetail(task.task_id)
                         }}
                       >
                         <td>
@@ -1027,6 +1127,29 @@ function ManualTasksDrawer({ initialTaskId, onClose }: ManualTasksDrawerProps) {
                         </span>
                         <span>耗时 · {formatDuration(detail)}</span>
                       </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className="text-base-content/60">task_id</span>
+                      <span className="font-mono text-[11px]">{selectedTaskId}</span>
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-xs"
+                        onClick={handleCopyTaskId}
+                      >
+                        <Icon icon="mdi:content-copy" className="text-base" />
+                        复制
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-outline btn-xs"
+                        onClick={() =>
+                          navigate(`/tasks?task_id=${encodeURIComponent(selectedTaskId ?? '')}`)
+                        }
+                        disabled={!selectedTaskId}
+                      >
+                        <Icon icon="mdi:arrow-right" className="text-base" />
+                        在 Tasks 中打开
+                      </button>
                     </div>
                     <p className="text-xs text-base-content/70">
                       {detail.summary ?? '暂无摘要说明。'}
