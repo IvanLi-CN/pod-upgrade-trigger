@@ -93,3 +93,17 @@ export const Refreshing: Story = {
     expect(button.querySelector('.animate-spin')).not.toBeNull()
   },
 }
+
+export const Loading: Story = {
+  args: {
+    services: [],
+    refreshing: false,
+    loading: true,
+    onRefresh: noop,
+    onTrigger: noop,
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement)
+    expect(await canvas.findByText('正在加载服务列表…')).toBeInTheDocument()
+  },
+}

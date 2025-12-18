@@ -71,6 +71,8 @@ export default function ManualPage() {
   const { getJson, postJson } = useApi()
   const { pushToast } = useToast()
   const [services, setServices] = useState<ManualService[]>([])
+  const [servicesLoading, setServicesLoading] = useState(true)
+  const [servicesError, setServicesError] = useState<string | null>(null)
   const [history, setHistory] = useState<ManualHistoryEntry[]>([])
   const [taskDrawerVisible, setTaskDrawerVisible] = useState(false)
   const [taskDrawerInitialTaskId, setTaskDrawerInitialTaskId] = useState<string | null>(null)
@@ -87,13 +89,24 @@ export default function ManualPage() {
   useEffect(() => {
     let cancelled = false
       ; (async () => {
+        setServicesLoading(true)
+        setServicesError(null)
         try {
           const data = await getJson<ManualServicesResponse>('/api/manual/services')
-          if (!cancelled && Array.isArray(data.services)) {
-            setServices(data.services)
-          }
+          if (cancelled) return
+          setServices(Array.isArray(data.services) ? data.services : [])
         } catch (err) {
+          if (cancelled) return
+          const message =
+            err && typeof err === 'object' && 'message' in err && err.message
+              ? String(err.message)
+              : '加载服务列表失败'
           console.error('Failed to load services', err)
+          setServicesError(message)
+        } finally {
+          if (!cancelled) {
+            setServicesLoading(false)
+          }
         }
       })()
     return () => {
@@ -287,6 +300,7 @@ export default function ManualPage() {
 
   const handleRefresh = async () => {
     setRefreshing(true)
+    setServicesError(null)
     try {
       const data = await getJson<ManualServicesResponse>('/api/manual/services?refresh=1')
       if (Array.isArray(data.services)) {
@@ -297,6 +311,7 @@ export default function ManualPage() {
         err && typeof err === 'object' && 'message' in err && err.message
           ? String(err.message)
           : '刷新失败'
+      setServicesError(message)
       pushToast({
         variant: 'error',
         title: '更新刷新失败',
@@ -418,6 +433,8 @@ export default function ManualPage() {
 
       <ManualServicesCard
         services={deployServices}
+        loading={servicesLoading}
+        error={servicesError}
         refreshing={refreshing}
         onRefresh={handleRefresh}
         onTrigger={handleDeployService}
