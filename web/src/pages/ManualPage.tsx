@@ -3,6 +3,8 @@ import type { FormEvent } from 'react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useApi } from '../hooks/useApi'
+import { usePresence, type PresencePhase } from '../hooks/usePresence'
+import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion'
 import { useToast } from '../components/Toast'
 import type {
   Task,
@@ -121,6 +123,17 @@ export default function ManualPage() {
   const urlDrawer = searchParams.get('drawer')
   const tasksDrawerOpen = urlDrawer === 'tasks' || Boolean(urlTaskId)
   const tasksDrawerView: 'list' | 'detail' = urlTaskId ? 'detail' : 'list'
+  const prefersReducedMotion = usePrefersReducedMotion()
+  const tasksDrawerPresence = usePresence(tasksDrawerOpen, {
+    enterMs: prefersReducedMotion ? 0 : 200,
+    exitMs: prefersReducedMotion ? 0 : 200,
+  })
+  const [tasksDrawerSnapshot, setTasksDrawerSnapshot] = useState<{
+    view: 'list' | 'detail'
+    taskId: string | null
+  }>({ view: 'list', taskId: null })
+  const tasksDrawerEffectiveView = tasksDrawerOpen ? tasksDrawerView : tasksDrawerSnapshot.view
+  const tasksDrawerEffectiveTaskId = tasksDrawerOpen ? urlTaskId : tasksDrawerSnapshot.taskId
 
   // Normalize URL into the required contract:
   // - drawer list: ?drawer=tasks
@@ -144,6 +157,12 @@ export default function ManualPage() {
       setSearchParams(next, { replace: true })
     }
   }, [searchParams, setSearchParams])
+
+  useEffect(() => {
+    if (tasksDrawerOpen) {
+      setTasksDrawerSnapshot({ view: tasksDrawerView, taskId: urlTaskId })
+    }
+  }, [tasksDrawerOpen, tasksDrawerView, urlTaskId])
 
   useEffect(() => {
     let cancelled = false
@@ -530,10 +549,12 @@ export default function ManualPage() {
           </div>
         </div>
       </section>
-      {tasksDrawerOpen ? (
+      {tasksDrawerPresence.present ? (
         <ManualTasksDrawer
-          view={tasksDrawerView}
-          taskId={urlTaskId}
+          view={tasksDrawerEffectiveView}
+          taskId={tasksDrawerEffectiveTaskId}
+          presencePhase={tasksDrawerPresence.phase}
+          presenceVisible={tasksDrawerPresence.visible}
           onClose={setTasksDrawerClosed}
           onShowList={setTasksDrawerList}
           onShowDetail={setTasksDrawerDetail}
@@ -546,6 +567,8 @@ export default function ManualPage() {
 type ManualTasksDrawerProps = {
   view: 'list' | 'detail'
   taskId: string | null
+  presencePhase: PresencePhase
+  presenceVisible: boolean
   onClose: () => void
   onShowList: () => void
   onShowDetail: (taskId: string) => void
@@ -558,6 +581,8 @@ const TASK_DETAIL_POLL_INTERVAL_MS = 3000
 function ManualTasksDrawer({
   view,
   taskId,
+  presencePhase,
+  presenceVisible,
   onClose,
   onShowList,
   onShowDetail,
@@ -892,11 +917,25 @@ function ManualTasksDrawer({
 
   return (
     <div
-      className="fixed inset-0 z-40 flex justify-end bg-base-300/40"
-      onClick={onClose}
+      className={[
+        'fixed inset-0 z-40',
+        presencePhase !== 'open' ? 'pointer-events-none' : '',
+      ].join(' ')}
     >
       <div
-        className="flex h-full w-full max-w-4xl flex-col border-l border-base-300 bg-base-100 shadow-xl"
+        className={[
+          'absolute inset-0 bg-base-300/40 transition-opacity duration-200 motion-reduce:transition-none',
+          presenceVisible ? 'opacity-100' : 'opacity-0',
+        ].join(' ')}
+        onClick={onClose}
+      />
+      <div
+        className={[
+          'relative ml-auto flex h-full w-full max-w-4xl flex-col border-l border-base-300 bg-base-100 shadow-xl',
+          'transform transition-transform duration-200 motion-reduce:transition-none',
+          presenceVisible ? 'translate-x-0' : 'translate-x-full',
+          presencePhase === 'exiting' ? 'ease-in' : 'ease-out',
+        ].join(' ')}
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-base-200 px-4 py-3">
