@@ -23,6 +23,7 @@ subtle = "2"
 semver = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rust-embed = "8"
+nanoid = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
