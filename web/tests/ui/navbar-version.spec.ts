@@ -44,8 +44,13 @@ test.describe('Navbar version + self-update (mock)', () => {
       'https://github.com/ivanli-cn/pod-upgrade-trigger/tree/v0.9.2',
     )
 
-    page.once('dialog', (dialog) => dialog.accept())
     await updateNow.click()
+
+    const confirmDialog = page.getByRole('dialog', { name: '自更新确认对话框' })
+    await expect(confirmDialog).toBeVisible()
+    await expect(confirmDialog.getByText('确认立即更新？')).toBeVisible()
+
+    await confirmDialog.getByRole('button', { name: '确认更新' }).click()
 
     await expect(page).toHaveURL(/\/tasks\?task_id=/)
     await expect(page.getByText('任务详情', { exact: true })).toBeVisible()

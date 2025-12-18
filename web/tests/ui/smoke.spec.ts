@@ -46,7 +46,11 @@ test.describe('Dashboard and navigation', () => {
           return
         } catch (error) {
           const message = String(error)
-          if (message.includes('interrupted by another navigation')) {
+          if (
+            message.includes('interrupted by another navigation') ||
+            message.includes('net::ERR_ABORTED') ||
+            message.includes('ERR_ABORTED')
+          ) {
             continue
           }
           throw error

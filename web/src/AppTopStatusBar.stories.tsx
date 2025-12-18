@@ -93,5 +93,12 @@ export const UpdateMenu: Story = {
       'href',
       'https://github.com/ivanli-cn/pod-upgrade-trigger/tree/v0.9.2',
     )
+
+    await userEvent.click(await page.findByRole('button', { name: '立即更新' }))
+    expect(
+      await page.findByRole('dialog', { name: '自更新确认对话框' }),
+    ).toBeInTheDocument()
+    expect(await page.findByText('确认立即更新？')).toBeInTheDocument()
+    expect(await page.findByRole('button', { name: '确认更新' })).toBeInTheDocument()
   },
 }

@@ -20,6 +20,7 @@ import { ApiProvider, useApi } from "./hooks/useApi";
 import { ToastProvider, ToastViewport, useToast } from "./components/Toast";
 import MockConsole from "./mocks/MockConsole";
 import { useVersionCheck } from "./hooks/useVersionCheck";
+import { useRef, useState } from "react";
 
 function ensureLeadingV(value: string | null | undefined): string | null {
 	if (!value) return null;
@@ -45,6 +46,8 @@ export function TopStatusBar() {
 	const navigate = useNavigate();
 	const { pushToast } = useToast();
 	const version = useVersionCheck();
+	const selfUpdateDialogRef = useRef<HTMLDialogElement | null>(null);
+	const [selfUpdateRunning, setSelfUpdateRunning] = useState(false);
 
 	const latestTag = version.latest?.releaseTag;
 	const showNewVersion = version.hasUpdate === true && latestTag;
@@ -54,23 +57,28 @@ export function TopStatusBar() {
 		packageVersion: status.version.package,
 	});
 
+	const openSelfUpdateDialog = () => {
+		selfUpdateDialogRef.current?.showModal();
+	};
+
+	const closeSelfUpdateDialog = () => {
+		try {
+			selfUpdateDialogRef.current?.close();
+		} catch {
+			// ignore
+		}
+	};
+
 	const handleSelfUpdate = async () => {
 		if (!latestTag) return;
 
-		const ok = window.confirm(
-			[
-				"将触发后端自更新（self-update）。",
-				"服务可能短暂重启，页面可能在短时间内不可用或刷新失败。",
-				"是否继续？（是否 dry-run 由服务端环境变量决定）",
-			].join("\n"),
-		);
-		if (!ok) return;
-
 		type SelfUpdateResponse = { task_id?: string | null; dry_run?: boolean | null };
 		try {
+			setSelfUpdateRunning(true);
 			const data = await postJson<SelfUpdateResponse>("/api/self-update/run", {});
 			const taskId = data.task_id ? String(data.task_id) : "";
 			if (!taskId) {
+				closeSelfUpdateDialog();
 				pushToast({
 					variant: "error",
 					title: "更新已触发，但未返回 task_id",
@@ -80,6 +88,7 @@ export function TopStatusBar() {
 				return;
 			}
 
+			closeSelfUpdateDialog();
 			pushToast({
 				variant: "success",
 				title: data.dry_run ? "已触发更新（dry-run）" : "已触发更新任务",
@@ -98,6 +107,8 @@ export function TopStatusBar() {
 				title: "触发更新失败",
 				message: statusCode ? `${statusCode} · ${message}` : message,
 			});
+		} finally {
+			setSelfUpdateRunning(false);
 		}
 	};
 
@@ -129,7 +140,7 @@ export function TopStatusBar() {
 							className="dropdown-content menu menu-sm z-[60] mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow"
 						>
 							<li>
-								<button type="button" onClick={handleSelfUpdate}>
+								<button type="button" onClick={openSelfUpdateDialog}>
 									立即更新
 								</button>
 							</li>
@@ -178,6 +189,49 @@ export function TopStatusBar() {
 					{now.toLocaleTimeString()}
 				</span>
 			</div>
+
+			<dialog
+				ref={selfUpdateDialogRef}
+				className="modal"
+				aria-label="自更新确认对话框"
+			>
+				<div className="modal-box">
+					<h3 className="text-lg font-bold">确认立即更新？</h3>
+					<p className="mt-3 text-sm text-base-content/70">
+						将触发后端自更新（self-update）。更新期间服务可能短暂重启，页面可能在短时间内不可用或刷新失败。
+					</p>
+					<p className="mt-2 text-sm text-base-content/70">
+						提示：是否 dry-run 由服务端环境变量决定（UI 不强制真实更新）。
+					</p>
+					<div className="modal-action">
+						<form method="dialog">
+							<button
+								type="submit"
+								className="btn btn-ghost"
+								disabled={selfUpdateRunning}
+							>
+								取消
+							</button>
+						</form>
+						<button
+							type="button"
+							className="btn btn-warning"
+							onClick={handleSelfUpdate}
+							disabled={selfUpdateRunning}
+						>
+							{selfUpdateRunning ? (
+								<span className="loading loading-spinner loading-sm" />
+							) : null}
+							确认更新
+						</button>
+					</div>
+				</div>
+				<form method="dialog" className="modal-backdrop">
+					<button type="submit" aria-label="关闭" disabled={selfUpdateRunning}>
+						close
+					</button>
+				</form>
+			</dialog>
 		</header>
 	);
 }
