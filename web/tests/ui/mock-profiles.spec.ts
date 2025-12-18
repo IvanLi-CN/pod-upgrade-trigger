@@ -27,7 +27,7 @@ async function resetProfile(page: Parameters<typeof test>[0]['page']) {
 
 test.describe('Mock profile: empty-state', () => {
   test('shows empty manual and tasks views without errors', async ({ page }) => {
-    await gotoProfile(page, '/manual', 'empty-state')
+    await gotoProfile(page, '/services', 'empty-state')
 
     await expect(page.getByText('按服务部署')).toBeVisible()
     await expect(
@@ -173,7 +173,7 @@ test.describe('Mock profile: degraded', () => {
 
 test.describe('Mock console profile switching', () => {
   test('switches profiles and persists selection across reloads', async ({ page }) => {
-    await gotoWithMock(page, '/manual')
+    await gotoWithMock(page, '/services')
 
     await expect(
       page.getByText('暂无可部署的服务。'),
