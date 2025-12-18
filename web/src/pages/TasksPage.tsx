@@ -12,6 +12,8 @@ import type {
 } from '../domain/tasks'
 import { isCommandMeta } from '../domain/tasks'
 import { useApi } from '../hooks/useApi'
+import { usePresence } from '../hooks/usePresence'
+import { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion'
 import { useToast } from '../components/Toast'
 import { AutoUpdateWarningsBlock } from '../components/AutoUpdateWarningsBlock'
 import { TaskLogMetaDetails } from '../components/TaskLogMetaDetails'
@@ -83,12 +85,23 @@ export default function TasksPage() {
   const [kindFilter, setKindFilter] = useState<string>('')
   const [unitQuery, setUnitQuery] = useState('')
 
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [drawerTask, setDrawerTask] = useState<TaskDetailResponse | null>(null)
   const [drawerLogs, setDrawerLogs] = useState<TaskLogEntry[] | null>(null)
   const [drawerLoading, setDrawerLoading] = useState(false)
   const [drawerError, setDrawerError] = useState<string | null>(null)
   const [expandedCommandLogs, setExpandedCommandLogs] = useState<Record<number, boolean>>({})
+  const urlTaskId = (() => {
+    const raw = params.get('task_id')
+    const trimmed = raw?.trim()
+    return trimmed ? trimmed : null
+  })()
+  const prefersReducedMotion = usePrefersReducedMotion()
+  const drawerPresence = usePresence(Boolean(urlTaskId), {
+    enterMs: prefersReducedMotion ? 0 : 200,
+    exitMs: prefersReducedMotion ? 0 : 200,
+  })
+  const [drawerTaskIdSnapshot, setDrawerTaskIdSnapshot] = useState<string | null>(urlTaskId)
+  const drawerEffectiveTaskId = urlTaskId ?? drawerTaskIdSnapshot
 
   const effectiveKindFilter = useMemo(() => {
     if (kindFilter) return kindFilter
@@ -173,34 +186,25 @@ export default function TasksPage() {
   }
 
   useEffect(() => {
-    const initialTaskId = params.get('task_id')
-    if (initialTaskId) {
-      setSelectedTaskId(initialTaskId)
-    } else {
-      setSelectedTaskId(null)
+    if (urlTaskId) {
+      setDrawerTaskIdSnapshot(urlTaskId)
     }
-  }, [params])
+  }, [urlTaskId])
 
   const handleRowClick = (task: Task) => {
-    setSelectedTaskId(task.task_id)
     const next = new URLSearchParams(params)
     next.set('task_id', task.task_id)
     setParams(next, { replace: true })
   }
 
   const handleCloseDrawer = () => {
-    setSelectedTaskId(null)
-    setDrawerTask(null)
-    setDrawerLogs(null)
-    setDrawerError(null)
-    setDrawerLoading(false)
     const next = new URLSearchParams(params)
     next.delete('task_id')
     setParams(next, { replace: true })
   }
 
   useEffect(() => {
-    if (!selectedTaskId) return
+    if (!urlTaskId) return
 
     let cancelled = false
     let timeoutId: number | undefined
@@ -210,7 +214,7 @@ export default function TasksPage() {
       setDrawerLoading(true)
       setDrawerError(null)
       try {
-        const data = await getJson<TaskDetailResponse>(`/api/tasks/${encodeURIComponent(selectedTaskId)}`)
+        const data = await getJson<TaskDetailResponse>(`/api/tasks/${encodeURIComponent(urlTaskId)}`)
         if (cancelled) return
         setDrawerTask(data)
         setDrawerLogs(Array.isArray(data.logs) ? data.logs : [])
@@ -245,12 +249,12 @@ export default function TasksPage() {
         window.clearTimeout(timeoutId)
       }
     }
-  }, [getJson, selectedTaskId])
+  }, [getJson, urlTaskId])
 
   useEffect(() => {
-    if (!selectedTaskId) return
+    if (!urlTaskId) return
     setExpandedCommandLogs({})
-  }, [selectedTaskId])
+  }, [urlTaskId])
 
   // 当首次看到命令型日志时，默认展开命令输出（避免任务执行太快导致永远折叠）。
   useEffect(() => {
@@ -271,12 +275,12 @@ export default function TasksPage() {
   const drawerStatus = drawerTask?.status
 
   useEffect(() => {
-    if (!selectedTaskId) return
+    if (!urlTaskId) return
     if (drawerStatus !== 'running') return
     if (typeof EventSource === 'undefined') return
 
     let cancelled = false
-    const url = `/sse/task-logs?task_id=${encodeURIComponent(selectedTaskId)}`
+    const url = `/sse/task-logs?task_id=${encodeURIComponent(urlTaskId)}`
     let source: EventSource
     try {
       source = new EventSource(url)
@@ -322,7 +326,17 @@ export default function TasksPage() {
       source.removeEventListener('end', handleEnd)
       source.close()
     }
-  }, [drawerStatus, selectedTaskId])
+  }, [drawerStatus, urlTaskId])
+
+  useEffect(() => {
+    if (drawerPresence.present) return
+    setDrawerTaskIdSnapshot(null)
+    setDrawerTask(null)
+    setDrawerLogs(null)
+    setDrawerError(null)
+    setDrawerLoading(false)
+    setExpandedCommandLogs({})
+  }, [drawerPresence.present])
 
   const pageLabel = useMemo(() => {
     if (!total || total <= PAGE_SIZE) return `第 ${page} 页`
@@ -510,7 +524,6 @@ export default function TasksPage() {
       )
       setDrawerTask(data)
       setTasks((prev) => [data, ...prev])
-      setSelectedTaskId(data.task_id)
       const next = new URLSearchParams(params)
       next.set('task_id', data.task_id)
       setParams(next, { replace: true })
@@ -789,9 +802,27 @@ export default function TasksPage() {
         </div>
       </section>
 
-      {selectedTaskId ? (
-        <div className="fixed inset-0 z-40 flex justify-end bg-base-300/40">
-          <div className="flex h-full w-full max-w-xl flex-col border-l border-base-300 bg-base-100 shadow-xl">
+      {drawerPresence.present && drawerEffectiveTaskId ? (
+        <div
+          className={[
+            'fixed inset-0 z-40',
+            drawerPresence.phase !== 'open' ? 'pointer-events-none' : '',
+          ].join(' ')}
+        >
+          <div
+            className={[
+              'absolute inset-0 bg-base-300/40 transition-opacity duration-200 motion-reduce:transition-none',
+              drawerPresence.visible ? 'opacity-100' : 'opacity-0',
+            ].join(' ')}
+          />
+          <div
+            className={[
+              'relative ml-auto flex h-full w-full max-w-xl flex-col border-l border-base-300 bg-base-100 shadow-xl',
+              'transform transition-transform duration-200 motion-reduce:transition-none',
+              drawerPresence.visible ? 'translate-x-0' : 'translate-x-full',
+              drawerPresence.phase === 'exiting' ? 'ease-in' : 'ease-out',
+            ].join(' ')}
+          >
             <div className="flex items-center justify-between border-b border-base-200 px-4 py-3">
               <div className="flex items-center gap-2">
                 <span className="text-sm font-semibold">

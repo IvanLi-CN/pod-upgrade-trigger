@@ -19,7 +19,7 @@ test.describe('Dashboard and navigation', () => {
     await expect(nav.getByRole('link', { name: 'Settings' })).toBeVisible()
 
     await page.getByRole('link', { name: 'Services' }).click()
-    await expect(page).toHaveURL(/\/manual$/)
+    await expect(page).toHaveURL(/\/services$/)
 
     await page.getByRole('link', { name: 'Webhooks' }).click()
     await expect(page).toHaveURL(/\/webhooks$/)
@@ -35,10 +35,13 @@ test.describe('Dashboard and navigation', () => {
   })
 
   test('supports direct deep links for core routes', async ({ page }) => {
-    const paths = ['/manual', '/webhooks', '/events', '/maintenance', '/settings']
+    const paths = ['/services', '/manual', '/webhooks', '/events', '/maintenance', '/settings']
 
     for (const path of paths) {
       await page.goto(path)
+      if (path === '/manual') {
+        await expect(page).toHaveURL(/\/services(\?|#|$)/)
+      }
       await expect(page.getByText('404 · 页面不存在')).toHaveCount(0)
     }
   })

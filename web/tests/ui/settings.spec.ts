@@ -44,6 +44,6 @@ test.describe('Settings page', () => {
 
     const manualLink = systemdCard.getByRole('link', { name: '手动触发' }).first()
     await manualLink.click()
-    await expect(page).toHaveURL(/\/manual$/)
+    await expect(page).toHaveURL(/\/services$/)
   })
 })

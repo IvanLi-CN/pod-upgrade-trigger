@@ -1,13 +1,20 @@
 import { expect, test } from '@playwright/test'
 
 async function openManualPage(page: import('@playwright/test').Page) {
-  await page.goto('/manual?mock=enabled&mock=profile=happy-path')
+  await page.goto('/services?mock=enabled&mock=profile=happy-path')
   await expect(page.getByRole('heading', { name: '部署全部服务' })).toBeVisible()
   await expect(page.getByText('按服务部署')).toBeVisible()
   await expect(page.getByText('历史记录')).toBeVisible()
 }
 
 test.describe('Services deploy console', () => {
+  test('redirects legacy /manual to /services (preserves query + hash)', async ({ page }) => {
+    await page.goto('/manual?mock=enabled&mock=profile=happy-path#baz')
+    await expect(page).toHaveURL('/services?mock=enabled&mock=profile=happy-path#baz')
+    await expect(page.getByText('404 · 页面不存在')).toHaveCount(0)
+    await expect(page.getByRole('heading', { name: '部署全部服务' })).toBeVisible()
+  })
+
   test('loads services and supports deploy-all dry-run', async ({ page }) => {
     await openManualPage(page)
 
@@ -163,5 +170,109 @@ test.describe('Services deploy console', () => {
       ),
     ).toBeVisible()
     await expect(manualServiceCard.getByText('result_status · failed')).toBeVisible()
+  })
+
+  test.describe('Tasks drawer URL deep links', () => {
+    const installDeterministicMockSeed = async (page: import('@playwright/test').Page) => {
+      await page.addInitScript(({ nowMs, seed }) => {
+        // Make mock runtime data deterministic across reloads so deeplink behavior is stable.
+        Date.now = () => nowMs
+
+        const mulberry32 = (a) => {
+          return () => {
+            let t = (a += 0x6d2b79f5)
+            t = Math.imul(t ^ (t >>> 15), t | 1)
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+          }
+        }
+
+        Math.random = mulberry32(seed)
+      }, { nowMs: 1_731_000_000_000, seed: 1337 })
+    }
+
+    const getDrawerTaskId = async (page: import('@playwright/test').Page) => {
+      const id = ((await page.locator('span.font-mono').first().textContent()) ?? '').trim()
+      expect(id).toMatch(/^tsk_/)
+      return id
+    }
+
+    test('opens list deeplink, closes via overlay, and preserves mock params', async ({ page }) => {
+      await installDeterministicMockSeed(page)
+
+      await page.goto('/services?drawer=tasks&mock=enabled&mock=profile=happy-path')
+      await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+
+      await expect(page.getByText('任务中心')).toBeVisible()
+      await expect(page.getByRole('button', { name: '任务列表' })).toBeVisible()
+      await expect(page.locator('table tbody tr').first()).toBeVisible()
+
+      // Restore from URL should be stable across reloads.
+      await page.reload()
+      await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+      await expect(page.getByText('任务中心')).toBeVisible()
+      await expect(page.getByRole('button', { name: '任务列表' })).toBeVisible()
+      await expect(page.locator('table tbody tr').first()).toBeVisible()
+
+      // Overlay click closes drawer.
+      const overlay = page.getByRole('button', { name: '关闭任务中心' })
+      await overlay.click({ position: { x: 1, y: 1 } })
+
+      await expect(page.getByText('任务中心')).toHaveCount(0)
+
+      const url = new URL(page.url())
+      expect(url.pathname).toBe('/services')
+      expect(url.searchParams.getAll('mock')).toEqual(['enabled', 'profile=happy-path'])
+      expect(url.searchParams.get('drawer')).toBeNull()
+      expect(url.searchParams.get('task_id')).toBeNull()
+    })
+
+    test('opens detail deeplink, shows task_id, and list/detail switches update URL', async ({ page }) => {
+      await installDeterministicMockSeed(page)
+
+      // Discover a stable task id in this seeded mock session.
+      await page.goto('/services?drawer=tasks&mock=enabled&mock=profile=happy-path')
+      await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+
+      await expect(page.getByText('任务中心')).toBeVisible()
+      await expect(page.getByRole('button', { name: '任务列表' })).toBeVisible()
+      const firstRow = page.locator('table tbody tr').first()
+      await expect(firstRow).toBeVisible()
+      await firstRow.click()
+      await expect(page.getByRole('button', { name: '任务详情' })).toBeVisible()
+
+      const taskId = await getDrawerTaskId(page)
+
+      // Open the detail deeplink directly using the known task id.
+      await page.goto(`/services?drawer=tasks&task_id=${taskId}&mock=enabled&mock=profile=happy-path`)
+      await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+
+      await expect(page.getByText('任务中心')).toBeVisible()
+      await expect(page.getByRole('button', { name: '任务详情' })).toBeVisible()
+      await expect(page.getByText(taskId)).toBeVisible()
+
+      // Restore from URL should be stable across reloads.
+      await page.reload()
+      await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+      await expect(page.getByText('任务中心')).toBeVisible()
+      await expect(page.getByText(taskId)).toBeVisible()
+
+      // Switch to list removes task_id but keeps drawer=tasks.
+      await page.getByRole('button', { name: '任务列表' }).click()
+      await expect(page).toHaveURL(/\/services\?/)
+      expect(page.url()).toContain('drawer=tasks')
+      expect(page.url()).not.toContain('task_id=')
+
+      // Clicking a row opens detail and sets task_id.
+      const row = page.locator('table tbody tr').first()
+      await expect(row).toBeVisible()
+      await row.click()
+      const taskId2 = await getDrawerTaskId(page)
+      expect(page.url()).toContain(`task_id=${taskId2}`)
+
+      // "Open in Tasks" navigates to /tasks?task_id=...
+      await page.getByRole('button', { name: '在 Tasks 中打开' }).click()
+      await expect(page).toHaveURL(`/tasks?task_id=${taskId2}`)
+    })
   })
 })

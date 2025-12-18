@@ -1,5 +1,6 @@
 use hex::decode;
 use hmac::{Hmac, Mac};
+use nanoid::nanoid;
 use regex::Regex;
 use reqwest::Client;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
@@ -2799,7 +2800,7 @@ fn handle_tasks_create(ctx: &RequestContext) -> Result<(), String> {
     };
 
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_request_id = Some(ctx.request_id.clone());
     let caller = request
         .caller
@@ -4061,7 +4062,7 @@ fn handle_task_retry(ctx: &RequestContext, task_id: &str) -> Result<(), String> 
             ));
         }
 
-        let new_task_id = format!("retry_{}", next_request_id());
+        let new_task_id = next_task_id("retry");
         let is_long_running_i64: Option<i64> =
             original_is_long_running.map(|v| if v != 0 { 1 } else { 0 });
 
@@ -5998,7 +5999,7 @@ fn create_github_task(
     meta: &TaskMeta,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "webhook".to_string();
 
     let meta_value = serde_json::to_value(meta).map_err(|e| e.to_string())?;
@@ -6121,7 +6122,7 @@ fn create_manual_trigger_task(
     meta: TaskMeta,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "manual".to_string();
 
     let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
@@ -6237,7 +6238,7 @@ fn create_manual_deploy_task(
     meta: TaskMeta,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "manual".to_string();
 
     let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
@@ -6355,7 +6356,7 @@ fn create_cli_manual_trigger_task(
     reason: &Option<String>,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "cli".to_string();
 
     let meta = TaskMeta::ManualTrigger {
@@ -6478,7 +6479,7 @@ fn create_manual_service_task(
     meta: TaskMeta,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "manual".to_string();
 
     let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
@@ -6616,7 +6617,7 @@ fn create_manual_auto_update_task(
     path: &str,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "manual".to_string();
 
     let meta = TaskMeta::AutoUpdate {
@@ -6730,7 +6731,7 @@ fn create_manual_auto_update_run_task(
     dry_run: bool,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "manual".to_string();
 
     let meta = TaskMeta::AutoUpdateRun {
@@ -6857,7 +6858,7 @@ fn create_manual_auto_update_run_task(
 
 fn create_scheduler_auto_update_task(unit: &str, iteration: u64) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "scheduler".to_string();
 
     let meta = TaskMeta::AutoUpdate {
@@ -6970,7 +6971,7 @@ fn create_maintenance_prune_task_for_api(
     ctx: &RequestContext,
 ) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "maintenance".to_string();
 
     let meta = TaskMeta::MaintenancePrune {
@@ -7079,7 +7080,7 @@ fn create_maintenance_prune_task_for_api(
 
 fn create_cli_maintenance_prune_task(max_age_hours: u64, dry_run: bool) -> Result<String, String> {
     let now = current_unix_secs() as i64;
-    let task_id = format!("tsk_{}", next_request_id());
+    let task_id = next_task_id("tsk");
     let trigger_source = "cli".to_string();
 
     let meta = TaskMeta::MaintenancePrune {
@@ -8847,8 +8848,8 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     let head_only = ctx.method == "HEAD";
 
     let relative = match ctx.path.as_str() {
-        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/tasks" | "/maintenance"
-        | "/settings" | "/401" => PathBuf::from("index.html"),
+        "/" | "/index.html" | "/manual" | "/services" | "/webhooks" | "/events" | "/tasks"
+        | "/maintenance" | "/settings" | "/401" => PathBuf::from("index.html"),
         path if path.starts_with("/assets/") => match sanitize_frontend_path(path) {
             Some(p) => p,
             None => return Ok(false),
@@ -11547,7 +11548,7 @@ fn import_self_update_reports_once() -> Result<(), String> {
         });
         let log_meta_str = serde_json::to_string(&log_meta).unwrap_or_else(|_| "{}".to_string());
 
-        let task_id = format!("tsk_{}", next_request_id());
+        let task_id = next_task_id("tsk");
         let task_id_clone = task_id.clone();
         let kind = "self-update".to_string();
         let summary_clone = summary.clone();
@@ -13498,6 +13499,38 @@ mod tests {
         fs::create_dir_all(&log_dir).unwrap();
         let log_dir_str = log_dir.to_string_lossy().into_owned();
         (dir, log_dir_str)
+    }
+
+    #[test]
+    fn task_id_generation_is_ocr_friendly() {
+        let allowed: HashSet<char> = TASK_ID_ALPHABET.into_iter().collect();
+
+        for prefix in ["tsk", "retry"] {
+            let task_id = next_task_id(prefix);
+            let expected_prefix = format!("{prefix}_");
+            assert!(
+                task_id.starts_with(&expected_prefix),
+                "task_id must start with {expected_prefix}, got {task_id}"
+            );
+
+            let suffix = task_id
+                .strip_prefix(&expected_prefix)
+                .expect("prefix must exist");
+            assert_eq!(suffix.chars().count(), TASK_ID_LEN);
+            assert!(
+                suffix.chars().all(|c| allowed.contains(&c)),
+                "task_id suffix must only contain OCR-friendly characters, got {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_id_generation_has_no_collisions_in_smoke_check() {
+        let mut seen = HashSet::new();
+        for _ in 0..1000 {
+            let task_id = next_task_id("tsk");
+            assert!(seen.insert(task_id), "task_id collision detected");
+        }
     }
 
     #[test]
@@ -15603,6 +15636,17 @@ fn next_request_id() -> String {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis();
     format!("{ts:x}-{seq:04x}")
+}
+
+const TASK_ID_ALPHABET: [char; 23] = [
+    '3', '4', '7', '9', 'A', 'C', 'D', 'E', 'F', 'H', 'J', 'K', 'M', 'N', 'P', 'Q', 'R', 'T', 'U',
+    'V', 'W', 'X', 'Y',
+];
+const TASK_ID_LEN: usize = 16;
+
+fn next_task_id(prefix: &str) -> String {
+    let suffix = nanoid!(TASK_ID_LEN, &TASK_ID_ALPHABET);
+    format!("{prefix}_{suffix}")
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, String> {
