@@ -49,7 +49,7 @@ function normalizeEpochMs(value?: number | null): number | null {
 }
 
 export function useVersionCheck(): VersionInfo {
-  const { getJson } = useApi()
+  const { getJson, mockEnabled } = useApi()
 
   const initialLastChecked = useMemo(() => readNumber(LAST_CHECK_KEY), [])
   const initialLatestTag = useMemo(() => readString(LAST_TAG_KEY), [])
@@ -68,6 +68,7 @@ export function useVersionCheck(): VersionInfo {
   const cancelledRef = useRef(false)
 
   useEffect(() => {
+    cancelledRef.current = false
     return () => {
       cancelledRef.current = true
     }
@@ -145,6 +146,12 @@ export function useVersionCheck(): VersionInfo {
   }, [getJson, persistSnapshot])
 
   const maybeCheck = useCallback(() => {
+    // In mock mode we want deterministic UI state regardless of previous localStorage snapshots.
+    if (mockEnabled) {
+      void fetchVersion()
+      return
+    }
+
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
       return
     }
@@ -156,7 +163,7 @@ export function useVersionCheck(): VersionInfo {
     }
 
     void fetchVersion()
-  }, [fetchVersion])
+  }, [fetchVersion, mockEnabled])
 
   useEffect(() => {
     const onFocus = () => {

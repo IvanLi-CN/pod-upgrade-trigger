@@ -53,6 +53,7 @@ export const settingsSchema = z
     version: z
       .object({
         package: z.string().optional(),
+        release_tag: z.string().nullable().optional(),
         build_timestamp: z.string().nullable().optional(),
       })
       .passthrough(),

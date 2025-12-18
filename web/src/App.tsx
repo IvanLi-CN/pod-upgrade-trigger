@@ -17,16 +17,89 @@ import WebhooksPage from "./pages/WebhooksPage";
 import TasksPage from "./pages/TasksPage";
 import UnauthorizedPage from "./pages/UnauthorizedPage";
 import { ApiProvider, useApi } from "./hooks/useApi";
-import { ToastProvider, ToastViewport } from "./components/Toast";
+import { ToastProvider, ToastViewport, useToast } from "./components/Toast";
 import MockConsole from "./mocks/MockConsole";
 import { useVersionCheck } from "./hooks/useVersionCheck";
 
+function ensureLeadingV(value: string | null | undefined): string | null {
+	if (!value) return null;
+	const trimmed = value.trim();
+	if (!trimmed) return null;
+	return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+}
+
+function formatCurrentVersionLabel(input: {
+	releaseTag: string | null;
+	packageVersion: string | null;
+}): string {
+	const tag = ensureLeadingV(input.releaseTag);
+	if (tag) return tag;
+	const pkg = ensureLeadingV(input.packageVersion);
+	if (pkg) return pkg;
+	return "v--";
+}
+
 function TopStatusBar() {
-	const { health, scheduler, sseStatus, now } = useAppStatus();
+	const { status, postJson } = useApi();
+	const { health, scheduler, sseStatus, now } = status;
+	const navigate = useNavigate();
+	const { pushToast } = useToast();
 	const version = useVersionCheck();
 
 	const latestTag = version.latest?.releaseTag;
 	const showNewVersion = version.hasUpdate === true && latestTag;
+
+	const currentVersionLabel = formatCurrentVersionLabel({
+		releaseTag: status.version.releaseTag,
+		packageVersion: status.version.package,
+	});
+
+	const handleSelfUpdate = async () => {
+		if (!latestTag) return;
+
+		const ok = window.confirm(
+			[
+				"将触发后端自更新（self-update）。",
+				"服务可能短暂重启，页面可能在短时间内不可用或刷新失败。",
+				"是否继续？（是否 dry-run 由服务端环境变量决定）",
+			].join("\n"),
+		);
+		if (!ok) return;
+
+		type SelfUpdateResponse = { task_id?: string | null; dry_run?: boolean | null };
+		try {
+			const data = await postJson<SelfUpdateResponse>("/api/self-update/run", {});
+			const taskId = data.task_id ? String(data.task_id) : "";
+			if (!taskId) {
+				pushToast({
+					variant: "error",
+					title: "更新已触发，但未返回 task_id",
+					message: "请稍后在 Tasks 页面确认任务状态。",
+				});
+				navigate("/tasks");
+				return;
+			}
+
+			pushToast({
+				variant: "success",
+				title: data.dry_run ? "已触发更新（dry-run）" : "已触发更新任务",
+				message: `task_id=${taskId}${data.dry_run ? " · dry-run，仅验证下载/校验" : ""}`,
+			});
+			navigate(`/tasks?task_id=${encodeURIComponent(taskId)}`);
+		} catch (err) {
+			const statusCode =
+				err && typeof err === "object" && "status" in err ? String(err.status) : "";
+			const message =
+				err && typeof err === "object" && "message" in err && err.message
+					? String(err.message)
+					: "触发更新失败";
+			pushToast({
+				variant: "error",
+				title: "触发更新失败",
+				message: statusCode ? `${statusCode} · ${message}` : message,
+			});
+		}
+	};
 
 	return (
 		<header className="navbar sticky top-0 z-20 border-b border-base-300 bg-base-100/90 backdrop-blur">
@@ -35,19 +108,42 @@ function TopStatusBar() {
 					<Icon icon="mdi:cat" className="text-2xl text-primary" />
 					Pod Upgrade Trigger
 				</span>
+				<span className="badge badge-sm badge-outline">
+					{currentVersionLabel}
+				</span>
 				{showNewVersion ? (
-					<a
-						className="badge badge-warning badge-sm gap-1"
-						href={`https://github.com/ivanli-cn/pod-upgrade-trigger/releases/tag/${encodeURIComponent(latestTag)}`}
-						target="_blank"
-						rel="noreferrer"
-					>
-						<Icon
-							icon="mdi:arrow-up-bold-circle-outline"
-							className="text-base"
-						/>
-						新版本 {latestTag} 可用
-					</a>
+					<div className="dropdown">
+						<button
+							type="button"
+							className="badge badge-warning badge-sm gap-1"
+							tabIndex={0}
+							aria-label={`新版本菜单 ${latestTag}`}
+						>
+							<Icon
+								icon="mdi:arrow-up-bold-circle-outline"
+								className="text-base"
+							/>
+							{latestTag}
+						</button>
+						<ul
+							className="dropdown-content menu menu-sm z-[60] mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow"
+						>
+							<li>
+								<button type="button" onClick={handleSelfUpdate}>
+									立即更新
+								</button>
+							</li>
+							<li>
+								<a
+									href={`https://github.com/ivanli-cn/pod-upgrade-trigger/tree/${encodeURIComponent(latestTag)}`}
+									target="_blank"
+									rel="noreferrer"
+								>
+									跳转到该版本代码页
+								</a>
+							</li>
+						</ul>
+					</div>
 				) : null}
 				<span className="badge badge-sm badge-outline hidden sm:inline-flex">
 					{health === "ok"
@@ -131,11 +227,6 @@ function SideNav() {
 			</nav>
 		</aside>
 	);
-}
-
-function useAppStatus() {
-	const { status } = useApi();
-	return status;
 }
 
 function Layout() {
