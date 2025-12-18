@@ -39,7 +39,7 @@ function formatCurrentVersionLabel(input: {
 	return "v--";
 }
 
-function TopStatusBar() {
+export function TopStatusBar() {
 	const { status, postJson } = useApi();
 	const { health, scheduler, sseStatus, now } = status;
 	const navigate = useNavigate();
