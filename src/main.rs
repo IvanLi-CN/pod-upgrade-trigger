@@ -8848,8 +8848,8 @@ fn try_serve_frontend(ctx: &RequestContext) -> Result<bool, String> {
     let head_only = ctx.method == "HEAD";
 
     let relative = match ctx.path.as_str() {
-        "/" | "/index.html" | "/manual" | "/webhooks" | "/events" | "/tasks" | "/maintenance"
-        | "/settings" | "/401" => PathBuf::from("index.html"),
+        "/" | "/index.html" | "/manual" | "/services" | "/webhooks" | "/events" | "/tasks"
+        | "/maintenance" | "/settings" | "/401" => PathBuf::from("index.html"),
         path if path.starts_with("/assets/") => match sanitize_frontend_path(path) {
             Some(p) => p,
             None => return Ok(false),

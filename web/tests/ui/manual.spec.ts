@@ -215,7 +215,7 @@ test.describe('Services deploy console', () => {
       await expect(page.locator('table tbody tr').first()).toBeVisible()
 
       // Overlay click closes drawer.
-      const overlay = page.locator('div[class*="bg-base-300/40"]').first()
+      const overlay = page.getByRole('button', { name: '关闭任务中心' })
       await overlay.click({ position: { x: 1, y: 1 } })
 
       await expect(page.getByText('任务中心')).toHaveCount(0)
