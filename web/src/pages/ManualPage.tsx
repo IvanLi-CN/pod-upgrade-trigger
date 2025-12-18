@@ -922,7 +922,9 @@ function ManualTasksDrawer({
         presencePhase !== 'open' ? 'pointer-events-none' : '',
       ].join(' ')}
     >
-      <div
+      <button
+        type="button"
+        aria-label="关闭任务中心"
         className={[
           'absolute inset-0 bg-base-300/40 transition-opacity duration-200 motion-reduce:transition-none',
           presenceVisible ? 'opacity-100' : 'opacity-0',
@@ -936,7 +938,6 @@ function ManualTasksDrawer({
           presenceVisible ? 'translate-x-0' : 'translate-x-full',
           presencePhase === 'exiting' ? 'ease-in' : 'ease-out',
         ].join(' ')}
-        onClick={(event) => event.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-base-200 px-4 py-3">
           <div className="flex items-center gap-2">

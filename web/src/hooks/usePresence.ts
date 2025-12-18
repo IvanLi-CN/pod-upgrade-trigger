@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 export type PresencePhase = 'closed' | 'entering' | 'open' | 'exiting'
 
@@ -21,19 +21,19 @@ export function usePresence(open: boolean, options: Options): Presence {
   const exitTimeoutRef = useRef<number | null>(null)
   const rafRef = useRef<number | null>(null)
 
-  const clearExitTimer = () => {
+  const clearExitTimer = useCallback(() => {
     if (exitTimeoutRef.current !== null) {
       window.clearTimeout(exitTimeoutRef.current)
       exitTimeoutRef.current = null
     }
-  }
+  }, [])
 
-  const clearRaf = () => {
+  const clearRaf = useCallback(() => {
     if (rafRef.current !== null) {
       window.cancelAnimationFrame(rafRef.current)
       rafRef.current = null
     }
-  }
+  }, [])
 
   useEffect(() => {
     const prevOpen = prevOpenRef.current
@@ -79,14 +79,14 @@ export function usePresence(open: boolean, options: Options): Presence {
       setPresent(false)
       exitTimeoutRef.current = null
     }, exitMs)
-  }, [enterMs, exitMs, open, present])
+  }, [enterMs, exitMs, open, present, clearExitTimer, clearRaf])
 
   useEffect(() => {
     return () => {
       clearExitTimer()
       clearRaf()
     }
-  }, [])
+  }, [clearExitTimer, clearRaf])
 
   const phase = useMemo<PresencePhase>(() => {
     if (!present && !open) return 'closed'
@@ -97,4 +97,3 @@ export function usePresence(open: boolean, options: Options): Presence {
 
   return { present, visible, phase }
 }
-
