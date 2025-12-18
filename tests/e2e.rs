@@ -7,6 +7,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +31,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     scenario_settings_tasks_retention().await?;
     scenario_manual_api().await?;
     scenario_csrf_guard().await?;
+    scenario_self_update_api().await?;
     scenario_forwardauth_and_csrf_strict_mode().await?;
     scenario_manual_services_update_tag_update_available().await?;
     scenario_manual_services_update_latest_ahead().await?;
@@ -83,6 +85,98 @@ async fn scenario_csrf_guard() -> AnyResult<()> {
     let body = ok.json_body()?;
     let task_id = body["task_id"].as_str().unwrap_or_default();
     assert!(!task_id.is_empty(), "tasks-create should return a task_id");
+
+    Ok(())
+}
+
+async fn scenario_self_update_api() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+
+    let missing_csrf = env.send_request(
+        HttpRequest::post("/api/self-update/run")
+            .header("content-type", "application/json")
+            .body(b"{}".to_vec()),
+    )?;
+    assert_eq!(
+        missing_csrf.status,
+        403,
+        "POST /api/self-update/run without x-podup-csrf must be rejected: {}",
+        missing_csrf.body_text()
+    );
+
+    let missing_command = env.send_request_with_env(
+        HttpRequest::post("/api/self-update/run")
+            .header("x-podup-csrf", "1")
+            .header("content-type", "application/json")
+            .body(b"{}".to_vec()),
+        |cmd| {
+            cmd.env_remove("PODUP_SELF_UPDATE_COMMAND");
+        },
+    )?;
+    assert_eq!(
+        missing_command.status,
+        503,
+        "missing self-update command should return 503: {}",
+        missing_command.body_text()
+    );
+    let missing_body = missing_command.json_body()?;
+    assert_eq!(
+        missing_body["error"],
+        Value::from("self-update-command-missing")
+    );
+
+    let script = env.state_dir.join("fake-self-update.sh");
+    fs::write(
+        &script,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) ;;
+    *) ;;
+  esac
+  shift
+done
+echo "self-update-ok"
+"#,
+    )?;
+    let mut perms = fs::metadata(&script)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms)?;
+
+    let ok = env.send_request_with_env(
+        HttpRequest::post("/api/self-update/run")
+            .header("x-podup-csrf", "1")
+            .header("content-type", "application/json")
+            .body(b"{}".to_vec()),
+        |cmd| {
+            cmd.env("PODUP_SELF_UPDATE_COMMAND", &script);
+            cmd.env("PODUP_SELF_UPDATE_DRY_RUN", "1");
+        },
+    )?;
+    assert_eq!(ok.status, 202, "expected 202: {}", ok.body_text());
+    let body = ok.json_body()?;
+    let task_id = body["task_id"].as_str().unwrap_or_default().to_string();
+    assert!(!task_id.is_empty(), "expected non-empty task_id");
+    assert_eq!(body["dry_run"], Value::from(true));
+
+    let pool = env.connect_db().await?;
+    let mut status = String::new();
+    for _ in 0..50 {
+        let row = sqlx::query("SELECT status FROM tasks WHERE task_id = ? LIMIT 1")
+            .bind(&task_id)
+            .fetch_optional(&pool)
+            .await?;
+        if let Some(row) = row {
+            status = row.get::<String, _>("status");
+            if status == "succeeded" || status == "failed" {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(status, "succeeded", "task should succeed");
 
     Ok(())
 }
