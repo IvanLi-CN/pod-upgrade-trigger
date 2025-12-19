@@ -29,11 +29,17 @@ export type SchedulerStatus = {
   lastIteration: number | null
 }
 
+export type AppVersionStatus = {
+  package: string | null
+  releaseTag: string | null
+}
+
 export type AppStatus = {
   health: 'idle' | 'ok' | 'error'
   sseStatus: StreamStatus
   scheduler: SchedulerStatus
   now: Date
+  version: AppVersionStatus
 }
 
 function isMockEnabled(): boolean {
@@ -73,6 +79,10 @@ export function ApiProvider({ children }: PropsWithChildren) {
     lastIteration: null,
   })
   const [now, setNow] = useState<Date>(new Date())
+  const [version, setVersion] = useState<AppVersionStatus>({
+    package: null,
+    releaseTag: null,
+  })
 
   const navigate = useNavigate()
   const location = useLocation()
@@ -123,6 +133,7 @@ export function ApiProvider({ children }: PropsWithChildren) {
       }
       type SettingsSnapshot = {
         scheduler?: SchedulerSnapshot
+        version?: { package?: string | null; release_tag?: string | null }
       }
 
       try {
@@ -148,6 +159,16 @@ export function ApiProvider({ children }: PropsWithChildren) {
         }
 
         setScheduler({ intervalSecs, lastIteration })
+
+        const releaseTag =
+          typeof data.version?.release_tag === 'string' && data.version.release_tag.trim()
+            ? data.version.release_tag.trim()
+            : null
+        const packageVersion =
+          typeof data.version?.package === 'string' && data.version.package.trim()
+            ? data.version.package.trim()
+            : null
+        setVersion({ package: packageVersion, releaseTag })
       } catch {
         // ignore
       }
@@ -279,12 +300,12 @@ export function ApiProvider({ children }: PropsWithChildren) {
 
   const value: ApiContextValue = useMemo(
     () => ({
-      status: { health, sseStatus, scheduler, now },
+      status: { health, sseStatus, scheduler, now, version },
       mockEnabled,
       getJson,
       postJson,
     }),
-    [getJson, health, mockEnabled, now, scheduler, sseStatus, postJson],
+    [getJson, health, mockEnabled, now, scheduler, sseStatus, postJson, version],
   )
 
   return <ApiContext.Provider value={value}>{children}</ApiContext.Provider>

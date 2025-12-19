@@ -100,6 +100,7 @@ export type SettingsSnapshot = {
   }
   version: {
     package?: string
+    release_tag?: string | null
     build_timestamp?: string | null
   }
   forward_auth: {
@@ -395,6 +396,7 @@ function buildSettings(now: number, profile: MockProfile): SettingsSnapshot {
     },
     version: {
       package: '0.9.1',
+      release_tag: 'v0.9.1',
       build_timestamp: new Date(now * 1000).toISOString(),
     },
     forward_auth: {

@@ -37,8 +37,30 @@ test.describe('Dashboard and navigation', () => {
   test('supports direct deep links for core routes', async ({ page }) => {
     const paths = ['/services', '/manual', '/webhooks', '/events', '/maintenance', '/settings']
 
-    for (const path of paths) {
+    const gotoStable = async (path: string) => {
+      // React router can trigger immediate client-side redirects (e.g. /manual -> /services),
+      // which may occasionally interrupt the navigation Playwright is waiting on.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await page.goto(path)
+          return
+        } catch (error) {
+          const message = String(error)
+          if (
+            message.includes('interrupted by another navigation') ||
+            message.includes('net::ERR_ABORTED') ||
+            message.includes('ERR_ABORTED')
+          ) {
+            continue
+          }
+          throw error
+        }
+      }
       await page.goto(path)
+    }
+
+    for (const path of paths) {
+      await gotoStable(path)
       if (path === '/manual') {
         await expect(page).toHaveURL(/\/services(\?|#|$)/)
       }

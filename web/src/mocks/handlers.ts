@@ -158,6 +158,34 @@ const handlers = [
     return HttpResponse.json(payload, { headers: JSON_HEADERS })
   }),
 
+  http.get('/api/version/check', async ({ request }) => {
+    const url = new URL(request.url)
+    const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
+    if (failure) return failure
+    await withLatency()
+
+    const settings = runtime.cloneData().settings
+    const currentPackage = settings.version?.package ?? null
+    const currentTag = settings.version?.release_tag ?? null
+
+    return HttpResponse.json(
+      {
+        current: {
+          package: currentPackage,
+          release_tag: currentTag,
+        },
+        latest: {
+          release_tag: 'v0.9.2',
+          published_at: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+        },
+        has_update: true,
+        checked_at: Math.floor(Date.now() / 1000),
+        compare_reason: 'mock-forced-update',
+      },
+      { headers: JSON_HEADERS },
+    )
+  }),
+
   http.get('/api/events', async ({ request }) => {
     const url = new URL(request.url)
     const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
@@ -496,6 +524,54 @@ const handlers = [
     })
 
     return HttpResponse.json(response, { headers: JSON_HEADERS })
+  }),
+
+  http.post('/api/self-update/run', async ({ request }) => {
+    const url = new URL(request.url)
+    const failure = degradedGuard(url) || authGuard(url) || maybeFailure()
+    if (failure) return failure
+    await withLatency()
+
+    // dry-run behavior is decided by backend env vars in real deployments; keep mock deterministic.
+    const dryRun = false
+
+    const task = runtime.createAdHocTask({
+      kind: 'maintenance',
+      source: 'maintenance',
+      units: ['pod-upgrade-trigger-http.service'],
+      is_long_running: true,
+      path: '/api/self-update/run',
+    })
+
+    // Optional: mark the task as succeeded after a short delay so the UI can observe progression.
+    setTimeout(() => {
+      const now = Math.floor(Date.now() / 1000)
+      runtime.updateTask(task.task_id, {
+        status: 'succeeded',
+        finished_at: now,
+        summary: 'Self-update task finished (mock)',
+        can_stop: false,
+        can_force_stop: false,
+        can_retry: false,
+      })
+      runtime.appendTaskLog(task.task_id, {
+        ts: now,
+        level: 'info',
+        action: 'self-update',
+        status: 'succeeded',
+        summary: 'Self-update completed (mock)',
+        unit: null,
+        meta: { path: '/api/self-update/run' },
+      })
+    }, 1200)
+
+    return HttpResponse.json(
+      {
+        task_id: task.task_id,
+        dry_run: dryRun,
+      },
+      { status: 202, headers: JSON_HEADERS },
+    )
   }),
 
   http.get('/api/manual/services', async ({ request }) => {

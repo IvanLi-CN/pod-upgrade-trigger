@@ -234,6 +234,9 @@ export default function TasksPage() {
             ? String(err.message)
             : '加载任务详情失败'
         setDrawerError(message)
+        // When the drawer is open (urlTaskId is present), keep retrying even if
+        // the backend is temporarily unavailable (e.g. service restart during update).
+        timeoutId = window.setTimeout(loadDetail, DETAIL_POLL_INTERVAL_MS)
       } finally {
         if (!cancelled) {
           setDrawerLoading(false)

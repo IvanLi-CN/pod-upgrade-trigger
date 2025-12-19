@@ -72,6 +72,8 @@ const SELF_UPDATE_UNIT: &str = "pod-upgrade-trigger-http.service";
 const ENV_SELF_UPDATE_COMMAND: &str = "PODUP_SELF_UPDATE_COMMAND";
 const ENV_SELF_UPDATE_CRON: &str = "PODUP_SELF_UPDATE_CRON";
 const ENV_SELF_UPDATE_DRY_RUN: &str = "PODUP_SELF_UPDATE_DRY_RUN";
+const ENV_TARGET_BIN: &str = "TARGET_BIN";
+const ENV_RELEASE_BASE_URL: &str = "PODUP_RELEASE_BASE_URL";
 
 // Environment variable names (external interface). All variables use the
 // PODUP_ prefix to avoid ambiguity with legacy naming.
@@ -1678,6 +1680,8 @@ fn handle_connection() -> Result<(), String> {
         handle_webhooks_status(&ctx)?;
     } else if ctx.path == "/api/image-locks" || ctx.path.starts_with("/api/image-locks/") {
         handle_image_locks_api(&ctx)?;
+    } else if ctx.path == "/api/self-update/run" {
+        handle_self_update_run_api(&ctx)?;
     } else if ctx.path == "/api/prune-state" {
         handle_prune_state_api(&ctx)?;
     } else if ctx.path == "/last_payload.bin" {
@@ -5600,6 +5604,9 @@ struct ManualAutoUpdateRunRequest {
     reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct SelfUpdateRunRequest {}
+
 #[derive(Debug, Clone)]
 struct DiscoveredUnit {
     unit: String,
@@ -7078,6 +7085,118 @@ fn create_maintenance_prune_task_for_api(
     }
 }
 
+fn create_self_update_run_task_for_api(
+    dry_run: bool,
+    ctx: &RequestContext,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = next_task_id("tsk");
+    let trigger_source = "maintenance".to_string();
+
+    let meta = TaskMeta::SelfUpdateRun { dry_run };
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let request_id_owned = ctx.request_id.clone();
+    let path_owned = ctx.path.clone();
+    let task_id_clone = task_id.clone();
+
+    let unit_name = SELF_UPDATE_UNIT.to_string();
+    let unit_slug = unit_name
+        .trim_end_matches(".service")
+        .trim_matches('/')
+        .to_string();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("maintenance")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("Self-update task created from API".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(Some(request_id_owned))
+        .bind(Some(path_owned.clone()))
+        .bind(Option::<String>::None) // caller
+        .bind(Option::<String>::None) // reason
+        .bind(Option::<i64>::None) // scheduler_iteration
+        .bind(0_i64) // can_stop
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64)) // is_long_running
+        .bind(Option::<String>::None) // retry_of
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_name)
+        .bind(Some(unit_slug))
+        .bind(&unit_name)
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(format!(
+            "Self-update scheduled from API (dry_run={})",
+            dry_run
+        )))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        let meta_log = json!({
+            "unit": unit_name,
+            "dry_run": dry_run,
+            "source": trigger_source,
+            "path": path_owned,
+        });
+        let meta_log_str = serde_json::to_string(&meta_log).unwrap_or_else(|_| "{}".to_string());
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Self-update task created from API")
+        .bind(Some(SELF_UPDATE_UNIT.to_string()))
+        .bind(meta_log_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
 fn create_cli_maintenance_prune_task(max_age_hours: u64, dry_run: bool) -> Result<String, String> {
     let now = current_unix_secs() as i64;
     let task_id = next_task_id("tsk");
@@ -7196,6 +7315,11 @@ fn collect_run_task_env() -> Vec<String> {
         ENV_AUTO_UPDATE_LOG_DIR,
         ENV_MANUAL_UNITS,
         ENV_MANUAL_AUTO_UPDATE_UNIT,
+        ENV_SELF_UPDATE_COMMAND,
+        ENV_SELF_UPDATE_DRY_RUN,
+        ENV_SELF_UPDATE_REPORT_DIR,
+        ENV_TARGET_BIN,
+        ENV_RELEASE_BASE_URL,
     ];
 
     let mut envs = Vec::new();
@@ -7395,6 +7519,9 @@ fn run_task_by_id(task_id: &str) -> Result<(), String> {
             let retention_secs = max_age_hours.saturating_mul(3600).max(1);
             let _ = run_maintenance_prune_task(task_id, retention_secs, dry_run)?;
             Ok(())
+        }
+        ("maintenance", TaskMeta::SelfUpdateRun { dry_run }) => {
+            run_self_update_task(task_id, dry_run)
         }
         _ => {
             log_message(&format!(
@@ -8578,6 +8705,167 @@ fn handle_image_locks_api(ctx: &RequestContext) -> Result<(), String> {
         Some(json!({ "reason": "method" })),
     )?;
     Ok(())
+}
+
+fn handle_self_update_run_api(ctx: &RequestContext) -> Result<(), String> {
+    if ctx.method != "POST" {
+        respond_text(
+            ctx,
+            405,
+            "MethodNotAllowed",
+            "method not allowed",
+            "self-update-run-api",
+            Some(json!({ "reason": "method" })),
+        )?;
+        return Ok(());
+    }
+
+    if !ensure_admin(ctx, "self-update-run-api")? {
+        return Ok(());
+    }
+
+    if !ensure_csrf(ctx, "self-update-run-api")? {
+        return Ok(());
+    }
+
+    let _request: SelfUpdateRunRequest = if ctx.body.is_empty() {
+        SelfUpdateRunRequest {}
+    } else {
+        match parse_json_body(ctx) {
+            Ok(body) => body,
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    400,
+                    "BadRequest",
+                    "invalid request",
+                    "self-update-run-api",
+                    Some(json!({ "error": err })),
+                )?;
+                return Ok(());
+            }
+        }
+    };
+
+    let dry_run = parse_env_bool(ENV_SELF_UPDATE_DRY_RUN);
+
+    let command_raw = env::var(ENV_SELF_UPDATE_COMMAND).ok().unwrap_or_default();
+    let command = command_raw.trim().to_string();
+    if command.is_empty() {
+        respond_json(
+            ctx,
+            503,
+            "ServiceUnavailable",
+            &json!({
+                "error": "self-update-command-missing",
+                "message": "Self-update command is not configured",
+                "required": [ENV_SELF_UPDATE_COMMAND],
+            }),
+            "self-update-run-api",
+            None,
+        )?;
+        return Ok(());
+    }
+
+    match fs::metadata(Path::new(&command)) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                respond_json(
+                    ctx,
+                    503,
+                    "ServiceUnavailable",
+                    &json!({
+                        "error": "self-update-command-invalid",
+                        "message": "Self-update command path is not a file",
+                        "path": command,
+                        "reason": "not-file",
+                    }),
+                    "self-update-run-api",
+                    None,
+                )?;
+                return Ok(());
+            }
+        }
+        Err(_) => {
+            respond_json(
+                ctx,
+                503,
+                "ServiceUnavailable",
+                &json!({
+                    "error": "self-update-command-invalid",
+                    "message": "Self-update command path does not exist",
+                    "path": command,
+                    "reason": "not-found",
+                }),
+                "self-update-run-api",
+                None,
+            )?;
+            return Ok(());
+        }
+    }
+
+    let task_id = match create_self_update_run_task_for_api(dry_run, ctx) {
+        Ok(id) => id,
+        Err(err) => {
+            respond_text(
+                ctx,
+                500,
+                "InternalServerError",
+                "failed to create task",
+                "self-update-run-api",
+                Some(json!({
+                    "error": err,
+                })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if let Err(err) = spawn_manual_task(&task_id, "self-update-run") {
+        mark_task_dispatch_failed(
+            &task_id,
+            Some(SELF_UPDATE_UNIT),
+            "maintenance",
+            "self-update-run",
+            &err,
+            json!({
+                "unit": SELF_UPDATE_UNIT,
+                "dry_run": dry_run,
+                "path": ctx.path.clone(),
+                "request_id": ctx.request_id.clone(),
+            }),
+        );
+        respond_json(
+            ctx,
+            500,
+            "InternalServerError",
+            &json!({
+                "status": "error",
+                "message": "failed to dispatch self-update",
+                "task_id": task_id,
+                "dry_run": dry_run,
+                "error": err,
+            }),
+            "self-update-run-api",
+            None,
+        )?;
+        return Ok(());
+    }
+
+    respond_json(
+        ctx,
+        202,
+        "Accepted",
+        &json!({
+            "status": "pending",
+            "message": "scheduled via task",
+            "task_id": task_id,
+            "dry_run": dry_run,
+            "request_id": ctx.request_id,
+        }),
+        "self-update-run-api",
+        None,
+    )
 }
 
 fn handle_prune_state_api(ctx: &RequestContext) -> Result<(), String> {
@@ -12926,6 +13214,152 @@ fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<
         ingest_auto_update_warnings(task_id, unit);
     }
 
+    Ok(())
+}
+
+fn run_self_update_task(task_id: &str, dry_run: bool) -> Result<(), String> {
+    let unit = SELF_UPDATE_UNIT;
+
+    let command_raw = env::var(ENV_SELF_UPDATE_COMMAND).ok().unwrap_or_default();
+    let command = command_raw.trim().to_string();
+    if command.is_empty() {
+        update_task_state_with_unit(
+            task_id,
+            "failed",
+            unit,
+            "failed",
+            "Self-update command missing",
+            "self-update-run",
+            "error",
+            json!({
+                "unit": unit,
+                "dry_run": dry_run,
+                "error": "self-update-command-missing",
+                "required": [ENV_SELF_UPDATE_COMMAND],
+            }),
+        );
+        return Ok(());
+    }
+
+    match fs::metadata(Path::new(&command)) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                update_task_state_with_unit(
+                    task_id,
+                    "failed",
+                    unit,
+                    "failed",
+                    "Self-update command path is not a file",
+                    "self-update-run",
+                    "error",
+                    json!({
+                        "unit": unit,
+                        "dry_run": dry_run,
+                        "error": "self-update-command-invalid",
+                        "path": command,
+                        "reason": "not-file",
+                    }),
+                );
+                return Ok(());
+            }
+        }
+        Err(_) => {
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Self-update command path does not exist",
+                "self-update-run",
+                "error",
+                json!({
+                    "unit": unit,
+                    "dry_run": dry_run,
+                    "error": "self-update-command-invalid",
+                    "path": command,
+                    "reason": "not-found",
+                }),
+            );
+            return Ok(());
+        }
+    }
+
+    let mut cmd = Command::new(&command);
+    let mut argv: Vec<&str> = vec![command.as_str()];
+    let command_display = if dry_run {
+        cmd.arg("--dry-run");
+        cmd.env(ENV_SELF_UPDATE_DRY_RUN, "1");
+        argv.push("--dry-run");
+        format!("{command} --dry-run")
+    } else {
+        command.clone()
+    };
+
+    let result = match run_quiet_command(cmd) {
+        Ok(result) => result,
+        Err(err) => {
+            update_task_state_with_unit(
+                task_id,
+                "failed",
+                unit,
+                "failed",
+                "Self-update run error",
+                "self-update-run",
+                "error",
+                json!({
+                    "unit": unit,
+                    "dry_run": dry_run,
+                    "error": err,
+                }),
+            );
+            return Ok(());
+        }
+    };
+
+    let extra_meta = json!({
+        "unit": unit,
+        "dry_run": dry_run,
+    });
+    let meta = build_command_meta(&command_display, &argv, &result, Some(extra_meta));
+
+    if result.success() {
+        let summary = if dry_run {
+            "Self-update dry-run succeeded"
+        } else {
+            "Self-update succeeded"
+        };
+        update_task_state_with_unit(
+            task_id,
+            "succeeded",
+            unit,
+            "succeeded",
+            summary,
+            "self-update-run",
+            "info",
+            meta,
+        );
+        return Ok(());
+    }
+
+    let exit = exit_code_string(&result.status);
+    let summary = if dry_run {
+        format!("Self-update dry-run failed ({exit})")
+    } else {
+        format!("Self-update failed ({exit})")
+    };
+    let unit_error = (!result.stderr.is_empty()).then_some(result.stderr.as_str());
+
+    update_task_state_with_unit_error(
+        task_id,
+        "failed",
+        unit,
+        "failed",
+        &summary,
+        unit_error,
+        "self-update-run",
+        "error",
+        meta,
+    );
     Ok(())
 }
 
