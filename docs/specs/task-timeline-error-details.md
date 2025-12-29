@@ -106,7 +106,7 @@ type TaskLogMetaHints = {
 
 #### 1) 统一外部命令采集规范（task_logs.meta）
 
-对所有“外部命令型步骤”（podman/systemctl/busctl/journalctl 等）统一使用 command meta，并保持与前端 `isCommandMeta` 的识别兼容：
+对所有“外部命令型步骤”（podman/systemctl/journalctl 等）统一使用 command meta，并保持与前端 `isCommandMeta` 的识别兼容：
 
 ```json
 {
@@ -121,14 +121,14 @@ type TaskLogMetaHints = {
 
   "unit": "xxx.service",
   "image": "ghcr.io/…",
-  "runner": "busctl|systemctl",
+  "runner": "systemctl",
   "purpose": "restart|start|diagnose-status|diagnose-journal"
 }
 ```
 
 规范说明：
 - `command/argv` 建议记录“用户可复现/可理解”的命令（优先使用 `systemctl --user …` 的形式），与现有任务日志展示习惯保持一致。
-- 当底层实现并非直接通过 `systemctl`（例如使用 `busctl` 走 D-Bus），通过 `runner` 标注实际路径；如需保留真实调用细节，可附加 `runner_command`（不要求 UI 默认展示）。
+- 通过 `runner` 标注实际执行路径；如需保留真实调用细节，可附加 `runner_command`（不要求 UI 默认展示）。
 - 输出长度继续受后端的 `COMMAND_OUTPUT_MAX_LEN` 截断保护（避免 UI/DB 被大输出拖垮）。
 - 对同一阶段的高层摘要仍保留 `summary`（人类可读，列表/时间线概览继续使用）。
 
@@ -143,7 +143,7 @@ type TaskLogMetaHints = {
 建议落地：
 - 将 `manual-service-run` 这条日志的 `meta` 升级为 command meta，并在 meta 中附带：
   - `unit` / `image`（若有）
-  - `runner`（busctl 或 systemctl）
+  - `runner`（systemctl）
   - `purpose`（start/restart）
 - `result_message` 可继续作为额外字段保留（兼容历史 UI 展示与导出 JSON）。
 

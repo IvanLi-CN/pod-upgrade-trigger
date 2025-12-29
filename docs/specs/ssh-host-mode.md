@@ -8,7 +8,7 @@
 
 本工作项的目标是：
 
-1. 引入 **SSH Host Mode**：开发机运行 `pod-upgrade-trigger` 与所有测试；当后端需要执行 host 侧动作（`podman`/`systemctl --user`/`busctl --user`/读取 Quadlet 目录/读取 auto-update 日志）时，通过 SSH 在远端 **SSH target** 上执行。
+1. 引入 **SSH Host Mode**：开发机运行 `pod-upgrade-trigger` 与所有测试；当后端需要执行 host 侧动作（`podman`/`systemctl --user`/读取 Quadlet 目录/读取 auto-update 日志）时，通过 SSH 在远端 **SSH target** 上执行。
    - 当前约定：SSH target 是“测试服务器上的 Docker 测试容器”，通过 **端口映射**暴露 SSH（无需手工维护 `ssh -L/-R` 转发会话）。
 2. 对上层保持透明：API/CLI 不因 SSH 模式而变化；差异仅体现在“执行后端如何与宿主交互”。
 3. **自我更新永远是本地的**：自更新触发入口不与其它触发混用；由 Web UI 顶栏更新图标打开 daisyUI 对话框，完成“查看新版本/执行更新/取消”。
@@ -173,7 +173,7 @@ docker run -d --name podup-test \
 - 远端（即 SSH target；当前为 Docker 测试容器）以“具备权限的同一运维账号”登录，能完成日常运维：
   - `podman` rootless 可用；
   - `systemctl --user` 可用（需要 user systemd 实例与 user bus；在非容器化主机上通常需要 linger：`loginctl enable-linger <user>`）；
-  - `busctl --user` / `journalctl --user` 可用（若缺失可降级，但会影响诊断能力）。
+  - `journalctl --user` 可用（若缺失可降级，但会影响诊断能力）。
 
 ## SSH Host backend 设计
 
@@ -186,7 +186,7 @@ SSH 实现策略：
 - 使用 OpenSSH CLI（`ssh`）作为唯一依赖；不在本次实现 SSH 协议。
 - 默认启用非交互模式：`BatchMode=yes`（避免卡住测试与服务进程）。
 - Host key 策略：默认采用 `StrictHostKeyChecking=accept-new`（符合本次约定）；后续可通过 `PODUP_SSH_ARGS` 覆盖为更严格策略。
-- **命令白名单**：只允许执行本项目需要的固定命令集（例如 `podman`、`systemctl`、`busctl`、`journalctl`、`cat`、`ls`、`stat`、`rm`、`mkdir`、`tee`、`sh`），其余拒绝并记录审计日志。
+- **命令白名单**：只允许执行本项目需要的固定命令集（例如 `podman`、`systemctl`、`journalctl`、`cat`、`ls`、`stat`、`rm`、`mkdir`、`tee`、`sh`），其余拒绝并记录审计日志。
 - **参数安全**：
   - 远端路径与 unit 名称均做严格校验（例如：路径必须绝对路径且只含 `[A-Za-z0-9._/:-]` 等安全字符；unit 必须匹配 systemd unit 命名规则的子集）。
   - 所有对外输入（HTTP body/query/env）在进入远端执行前完成校验与规范化，避免注入。
@@ -210,7 +210,7 @@ SSH 模式下，这两个目录属于远端，Host backend 需要提供最少集
 在 HTTP server 启动（或第一次执行 host 动作）时执行一次 preflight：
 
 - `ssh` 连通性：`ssh <target> true`（使用与实际执行一致的 SSH 选项，如 `BatchMode`、`StrictHostKeyChecking`）
-- 关键命令可用性：`podman --version`、`systemctl --user --version`、（可选）`busctl --user --version`、`journalctl --version`
+  - 关键命令可用性：`podman --version`、`systemctl --user --version`、`journalctl --version`
 - `systemctl --user` 可用性检查：
   - 若无法连接 user bus / 用户实例，返回明确错误并提示修复建议（主机场景优先提示 `loginctl enable-linger <user>`；容器场景提示检查 systemd/user bus 是否按预期启动）。
 - 远端目录存在性：
