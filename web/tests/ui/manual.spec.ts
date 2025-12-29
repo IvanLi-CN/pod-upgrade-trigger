@@ -192,9 +192,11 @@ test.describe('Services deploy console', () => {
     }
 
     const getDrawerTaskId = async (page: import('@playwright/test').Page) => {
-      const id = ((await page.locator('span.font-mono').first().textContent()) ?? '').trim()
+      await expect(page).toHaveURL(/task_id=tsk_/)
+      const url = new URL(page.url())
+      const id = url.searchParams.get('task_id')
       expect(id).toMatch(/^tsk_/)
-      return id
+      return id ?? ''
     }
 
     test('opens list deeplink, closes via overlay, and preserves mock params', async ({ page }) => {
