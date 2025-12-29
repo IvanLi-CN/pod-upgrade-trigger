@@ -8190,7 +8190,9 @@ fn resolve_running_image_id_for_unit_fresh(unit: &str) -> Result<String, String>
         }
     }
 
-    let chosen = best_running.or(best_any).ok_or_else(|| "container-not-found".to_string())?;
+    let chosen = best_running
+        .or(best_any)
+        .ok_or_else(|| "container-not-found".to_string())?;
     chosen
         .image_id
         .clone()
@@ -8285,7 +8287,8 @@ fn run_image_verify_step(task_id: &str, unit: &str, image: &str) -> ImageVerifyR
                             }
                         }
 
-                        if running_digest.is_none() && id.as_deref() == Some(running_image_id.as_str())
+                        if running_digest.is_none()
+                            && id.as_deref() == Some(running_image_id.as_str())
                         {
                             running_digest = digest;
                         }
@@ -10727,18 +10730,18 @@ impl UnitHealthVerdict {
     fn task_status(self) -> &'static str {
         match self {
             UnitHealthVerdict::Healthy => "succeeded",
-            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown | UnitHealthVerdict::Failed => {
-                "failed"
-            }
+            UnitHealthVerdict::Degraded
+            | UnitHealthVerdict::Unknown
+            | UnitHealthVerdict::Failed => "failed",
         }
     }
 
     fn log_level(self) -> &'static str {
         match self {
             UnitHealthVerdict::Healthy => "info",
-            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown | UnitHealthVerdict::Failed => {
-                "error"
-            }
+            UnitHealthVerdict::Degraded
+            | UnitHealthVerdict::Unknown
+            | UnitHealthVerdict::Failed => "error",
         }
     }
 }
@@ -11340,7 +11343,9 @@ fn run_background_task(
                 json!({ "unit": unit, "image": image, "event": event, "delivery": delivery, "path": path }),
             );
 
-            for entry in capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env()) {
+            for entry in
+                capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env())
+            {
                 append_task_log(
                     task_id,
                     entry.level,
@@ -11399,7 +11404,9 @@ fn run_background_task(
             json!({ "unit": unit, "image": image, "event": event, "delivery": delivery, "path": path }),
         );
 
-        for entry in capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env()) {
+        for entry in
+            capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env())
+        {
             append_task_log(
                 task_id,
                 entry.level,
@@ -11463,7 +11470,11 @@ fn run_background_task(
     );
     append_task_log(
         task_id,
-        if unit_status == "failed" { "error" } else { "info" },
+        if unit_status == "failed" {
+            "error"
+        } else {
+            "info"
+        },
         "restart-unit",
         unit_status,
         if unit_status == "failed" {
@@ -11503,9 +11514,8 @@ fn run_background_task(
                 unit_status = "unknown";
                 task_status = "unknown";
                 unit_error = verify.unit_error;
-                summary =
-                    "Github webhook task completed with warnings (image verify unavailable)"
-                        .to_string();
+                summary = "Github webhook task completed with warnings (image verify unavailable)"
+                    .to_string();
             }
             _ => {
                 unit_status = "failed";
@@ -11541,7 +11551,9 @@ fn run_background_task(
     );
 
     if task_status == "failed" {
-        for entry in capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env()) {
+        for entry in
+            capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env())
+        {
             append_task_log(
                 task_id,
                 entry.level,
@@ -12326,7 +12338,11 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
 
         append_task_log(
             task_id,
-            if unit_status == "failed" { "error" } else { "info" },
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
             match purpose {
                 UnitOperationPurpose::Start => "start-unit",
                 UnitOperationPurpose::Restart => "restart-unit",
@@ -13047,7 +13063,11 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
     );
     append_task_log(
         task_id,
-        if unit_status == "failed" { "error" } else { "info" },
+        if unit_status == "failed" {
+            "error"
+        } else {
+            "info"
+        },
         match purpose {
             UnitOperationPurpose::Start => "start-unit",
             UnitOperationPurpose::Restart => "restart-unit",
@@ -15041,10 +15061,7 @@ mod tests {
 
         assert_eq!(task_status, "failed");
         assert_eq!(alpha_status, "failed");
-        assert!(
-            diag_count > 0,
-            "expected diagnostics logs for failing unit"
-        );
+        assert!(diag_count > 0, "expected diagnostics logs for failing unit");
 
         remove_env("MOCK_SYSTEMCTL_FAIL");
         remove_env("MOCK_PODMAN_PS_JSON");

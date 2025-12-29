@@ -450,9 +450,9 @@ async fn scenario_github_webhook() -> AnyResult<()> {
         "podman pull recorded"
     );
     assert!(
-        log_lines.iter().any(|line| {
-            line.contains("systemctl --user restart svc-alpha.service")
-        }),
+        log_lines
+            .iter()
+            .any(|line| { line.contains("systemctl --user restart svc-alpha.service") }),
         "expected systemctl restart for svc-alpha.service"
     );
     let pool = env.connect_db().await?;
@@ -1045,9 +1045,9 @@ async fn scenario_manual_api() -> AnyResult<()> {
             .any(|line| line.contains("podman pull ghcr.io/koha/runner:main"))
     );
     assert!(
-        log_lines.iter().any(|line| {
-            line.contains("systemctl --user restart svc-beta.service")
-        }),
+        log_lines
+            .iter()
+            .any(|line| { line.contains("systemctl --user restart svc-beta.service") }),
         "expected systemctl restart for svc-beta.service"
     );
 
@@ -1386,9 +1386,9 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
     // The underlying systemctl failure should be visible in logs for debugging.
     let log_lines = env.read_mock_log()?;
     assert!(
-        log_lines.iter().any(|line| {
-            line.contains("systemctl --user start podman-auto-update.service")
-        }),
+        log_lines
+            .iter()
+            .any(|line| { line.contains("systemctl --user start podman-auto-update.service") }),
         "expected systemctl start invocation for failing manual auto-update unit"
     );
 
@@ -1435,11 +1435,13 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
     let logs = body["logs"].as_array().cloned().unwrap_or_default();
 
     assert!(
-        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
+        logs.iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
         "failed tasks must append unit-diagnose-status"
     );
     assert!(
-        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
+        logs.iter()
+            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
         "failed tasks must append unit-diagnose-journal"
     );
 
@@ -1970,9 +1972,7 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
     assert!(
         log_lines
             .iter()
-            .filter(|line| {
-                line.contains("systemctl --user start podman-auto-update.service")
-            })
+            .filter(|line| { line.contains("systemctl --user start podman-auto-update.service") })
             .count()
             >= 2,
         "expected at least two systemctl start calls for podman-auto-update.service"

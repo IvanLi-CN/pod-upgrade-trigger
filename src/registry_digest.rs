@@ -755,11 +755,12 @@ async fn refresh_remote_index_and_platform_digest(
         image.scheme, image.registry, image.repo, image.tag
     );
 
-    let head = manifest_request_with_auth(&client, image, reqwest::Method::HEAD, &manifest_url)
-        .await?;
+    let head =
+        manifest_request_with_auth(&client, image, reqwest::Method::HEAD, &manifest_url).await?;
     let remote_index_digest = read_digest_header(head.headers())?;
 
-    let get = manifest_request_with_auth(&client, image, reqwest::Method::GET, &manifest_url).await?;
+    let get =
+        manifest_request_with_auth(&client, image, reqwest::Method::GET, &manifest_url).await?;
     if !get.status().is_success() {
         return Err(map_status_to_error(get.status()));
     }
@@ -767,8 +768,13 @@ async fn refresh_remote_index_and_platform_digest(
     let body: Value = get.json().await.map_err(|_| RegistryDigestError::Json)?;
     let is_manifest_list = body.get("manifests").and_then(|v| v.as_array()).is_some();
     let remote_platform_digest = if is_manifest_list {
-        select_platform_digest_from_manifest_list(&body, platform_os, platform_arch, platform_variant_key)?
-            .ok_or(RegistryDigestError::PlatformNotFound)?
+        select_platform_digest_from_manifest_list(
+            &body,
+            platform_os,
+            platform_arch,
+            platform_variant_key,
+        )?
+        .ok_or(RegistryDigestError::PlatformNotFound)?
     } else {
         remote_index_digest.clone()
     };
