@@ -12606,6 +12606,17 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
                     Some("image-pull failed"),
                     Some(&error_summary),
                 );
+                for entry in capture_unit_failure_diagnostics(&unit, diagnostics_journal_lines) {
+                    append_task_log(
+                        task_id,
+                        entry.level,
+                        entry.action,
+                        entry.status,
+                        &entry.summary,
+                        Some(&entry.unit),
+                        entry.meta,
+                    );
+                }
                 failed = failed.saturating_add(1);
                 unit_results.push(json!({
                     "unit": unit,
@@ -12646,6 +12657,17 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
                 Some("image-pull failed"),
                 Some(&error_summary),
             );
+            for entry in capture_unit_failure_diagnostics(&unit, diagnostics_journal_lines) {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
             failed = failed.saturating_add(1);
             unit_results.push(json!({
                 "unit": unit,
