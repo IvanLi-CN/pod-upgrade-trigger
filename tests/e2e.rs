@@ -18,39 +18,46 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_full_suite() -> AnyResult<()> {
-    scenario_auto_discovery().await?;
-    scenario_auto_discovery_podman_ps_skips_missing_unit_label().await?;
-    scenario_webhook_auto_discovery_toggle().await?;
-    scenario_health_db_error().await?;
-    scenario_github_webhook().await?;
-    scenario_webhook_image_prune_success().await?;
-    scenario_webhook_image_prune_failure().await?;
-    scenario_github_dispatch_failure().await?;
-    scenario_rate_limit_and_prune().await?;
-    scenario_task_prune_retention().await?;
-    scenario_settings_tasks_retention().await?;
-    scenario_manual_api().await?;
-    scenario_csrf_guard().await?;
-    scenario_self_update_api().await?;
-    scenario_forwardauth_and_csrf_strict_mode().await?;
-    scenario_manual_services_update_tag_update_available().await?;
-    scenario_manual_services_update_latest_ahead().await?;
-    scenario_manual_services_update_up_to_date_tag_latest().await?;
-    scenario_manual_services_update_up_to_date_tag_latest_podman_systemd_unit_label().await?;
-    scenario_manual_services_update_unknown_container_not_found().await?;
-    scenario_manual_auto_update_failure().await?;
-    scenario_manual_task_command_meta_and_unit_errors().await?;
-    scenario_manual_task_unit_failure_diagnostics().await?;
-    scenario_manual_dispatch_failure().await?;
-    scenario_scheduler_loop().await?;
-    scenario_scheduler_dispatch_failure().await?;
-    scenario_events_task_filter().await?;
-    scenario_task_command_logs().await?;
-    scenario_task_logs_sse().await?;
-    scenario_error_paths().await?;
-    scenario_static_assets().await?;
-    scenario_cli_maintenance().await?;
-    scenario_http_server().await?;
+    macro_rules! run_scenario {
+        ($name:ident) => {{
+            eprintln!("e2e: {}", stringify!($name));
+            $name().await?;
+        }};
+    }
+
+    run_scenario!(scenario_auto_discovery);
+    run_scenario!(scenario_auto_discovery_podman_ps_skips_missing_unit_label);
+    run_scenario!(scenario_webhook_auto_discovery_toggle);
+    run_scenario!(scenario_health_db_error);
+    run_scenario!(scenario_github_webhook);
+    run_scenario!(scenario_webhook_image_prune_success);
+    run_scenario!(scenario_webhook_image_prune_failure);
+    run_scenario!(scenario_github_dispatch_failure);
+    run_scenario!(scenario_rate_limit_and_prune);
+    run_scenario!(scenario_task_prune_retention);
+    run_scenario!(scenario_settings_tasks_retention);
+    run_scenario!(scenario_manual_api);
+    run_scenario!(scenario_csrf_guard);
+    run_scenario!(scenario_self_update_api);
+    run_scenario!(scenario_forwardauth_and_csrf_strict_mode);
+    run_scenario!(scenario_manual_services_update_tag_update_available);
+    run_scenario!(scenario_manual_services_update_latest_ahead);
+    run_scenario!(scenario_manual_services_update_up_to_date_tag_latest);
+    run_scenario!(scenario_manual_services_update_up_to_date_tag_latest_podman_systemd_unit_label);
+    run_scenario!(scenario_manual_services_update_unknown_container_not_found);
+    run_scenario!(scenario_manual_auto_update_failure);
+    run_scenario!(scenario_manual_task_command_meta_and_unit_errors);
+    run_scenario!(scenario_manual_task_unit_failure_diagnostics);
+    run_scenario!(scenario_manual_dispatch_failure);
+    run_scenario!(scenario_scheduler_loop);
+    run_scenario!(scenario_scheduler_dispatch_failure);
+    run_scenario!(scenario_events_task_filter);
+    run_scenario!(scenario_task_command_logs);
+    run_scenario!(scenario_task_logs_sse);
+    run_scenario!(scenario_error_paths);
+    run_scenario!(scenario_static_assets);
+    run_scenario!(scenario_cli_maintenance);
+    run_scenario!(scenario_http_server);
     Ok(())
 }
 
@@ -413,12 +420,15 @@ async fn scenario_github_webhook() -> AnyResult<()> {
 
     let payload = github_registry_payload("koha", "svc-alpha", "main");
     let signature = env.github_signature(&payload);
-    let response = env.send_request(
+    let response = env.send_request_with_env(
         HttpRequest::post("/github-package-update/svc-alpha")
             .header("x-github-event", "registry_package")
             .header("x-github-delivery", "delivery-42")
             .header("x-hub-signature-256", &signature)
             .body(payload.clone()),
+        |cmd| {
+            configure_image_verify_mocks(cmd);
+        },
     )?;
     assert_eq!(
         response.status,
@@ -441,12 +451,9 @@ async fn scenario_github_webhook() -> AnyResult<()> {
     );
     assert!(
         log_lines.iter().any(|line| {
-            line.contains("busctl --user call")
-                && line.contains("org.freedesktop.systemd1.Manager")
-                && line.contains("RestartUnit")
-                && line.contains("svc-alpha.service")
+            line.contains("systemctl --user restart svc-alpha.service")
         }),
-        "expected D-Bus RestartUnit call for svc-alpha.service"
+        "expected systemctl restart for svc-alpha.service"
     );
     let pool = env.connect_db().await?;
     let webhook_event = env
@@ -481,12 +488,15 @@ async fn scenario_webhook_image_prune_success() -> AnyResult<()> {
 
     let payload = github_registry_payload("koha", "svc-alpha", "main");
     let signature = env.github_signature(&payload);
-    let response = env.send_request(
+    let response = env.send_request_with_env(
         HttpRequest::post("/github-package-update/svc-alpha")
             .header("x-github-event", "registry_package")
             .header("x-github-delivery", "prune-ok")
             .header("x-hub-signature-256", &signature)
             .body(payload.clone()),
+        |cmd| {
+            configure_image_verify_mocks(cmd);
+        },
     )?;
     assert_eq!(
         response.status,
@@ -561,6 +571,7 @@ async fn scenario_webhook_image_prune_failure() -> AnyResult<()> {
         .body(payload.clone());
 
     let response = env.send_request_with_env(request, |cmd| {
+        configure_image_verify_mocks(cmd);
         cmd.env("MOCK_PODMAN_PRUNE_FAIL", "1");
     })?;
     assert_eq!(
@@ -750,13 +761,10 @@ async fn scenario_rate_limit_and_prune() -> AnyResult<()> {
 
     let log_lines = env.read_mock_log()?;
     assert!(
-        log_lines.iter().any(|line| {
-            line.contains("busctl --user call")
-                && line.contains("org.freedesktop.systemd1.Manager")
-                && line.contains("StartUnit")
-                && line.contains("podman-auto-update.service")
-        }),
-        "expected D-Bus StartUnit call for podman-auto-update.service"
+        log_lines
+            .iter()
+            .any(|line| line.contains("systemctl --user start podman-auto-update.service")),
+        "expected systemctl start for podman-auto-update.service"
     );
 
     let events = env.fetch_events(&pool).await?;
@@ -1008,11 +1016,14 @@ async fn scenario_manual_api() -> AnyResult<()> {
         "caller": "user",
         "reason": "rollout"
     });
-    let service = env.send_request(
+    let service = env.send_request_with_env(
         HttpRequest::post("/api/manual/services/svc-beta")
             .header("content-type", "application/json")
             .header("x-podup-csrf", "1")
             .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            configure_image_verify_mocks(cmd);
+        },
     )?;
     assert_eq!(service.status, 202);
     let service_json = service.json_body()?;
@@ -1035,12 +1046,9 @@ async fn scenario_manual_api() -> AnyResult<()> {
     );
     assert!(
         log_lines.iter().any(|line| {
-            line.contains("busctl --user call")
-                && line.contains("org.freedesktop.systemd1.Manager")
-                && line.contains("RestartUnit")
-                && line.contains("svc-beta.service")
+            line.contains("systemctl --user restart svc-beta.service")
         }),
-        "expected D-Bus RestartUnit call for svc-beta.service"
+        "expected systemctl restart for svc-beta.service"
     );
 
     let pool = env.connect_db().await?;
@@ -1336,7 +1344,7 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
     env.ensure_db_initialized().await?;
     env.clear_mock_log()?;
 
-    // Simulate a failure when starting the manual auto-update unit via D-Bus.
+    // Simulate a failure when starting the manual auto-update unit.
     let body = json!({
         "dry_run": false,
         "caller": "ops",
@@ -1348,7 +1356,7 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
             .header("x-podup-csrf", "1")
             .body(body.to_string().into_bytes()),
         |cmd| {
-            cmd.env("MOCK_BUSCTL_FAIL", "podman-auto-update.service");
+            cmd.env("MOCK_SYSTEMCTL_FAIL", "podman-auto-update.service");
         },
     )?;
     assert_eq!(
@@ -1375,15 +1383,13 @@ async fn scenario_manual_auto_update_failure() -> AnyResult<()> {
         "unexpected manual auto-update failure summary: {summary}"
     );
 
-    // The underlying busctl failure should be visible in logs for debugging.
+    // The underlying systemctl failure should be visible in logs for debugging.
     let log_lines = env.read_mock_log()?;
     assert!(
         log_lines.iter().any(|line| {
-            line.contains("busctl --user call")
-                && line.contains("StartUnit")
-                && line.contains("podman-auto-update.service")
+            line.contains("systemctl --user start podman-auto-update.service")
         }),
-        "expected busctl StartUnit invocation for failing manual auto-update unit"
+        "expected systemctl start invocation for failing manual auto-update unit"
     );
 
     Ok(())
@@ -1406,7 +1412,7 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
             .header("x-podup-csrf", "1")
             .body(service_body.to_string().into_bytes()),
         |cmd| {
-            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
+            cmd.env("MOCK_SYSTEMCTL_FAIL", "svc-beta.service");
         },
     )?;
     assert_eq!(service.status, 202, "manual service should accept request");
@@ -1427,26 +1433,24 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
     assert_eq!(body["status"], Value::from("failed"));
 
     let logs = body["logs"].as_array().cloned().unwrap_or_default();
-    let service_run_log = logs
+
+    assert!(
+        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
+        "failed tasks must append unit-diagnose-status"
+    );
+    assert!(
+        logs.iter().any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
+        "failed tasks must append unit-diagnose-journal"
+    );
+
+    let op_log = logs
         .iter()
-        .find(|entry| entry.get("action") == Some(&Value::from("manual-service-run")))
-        .expect("manual-service-run log entry exists");
-    assert!(
-        !logs
-            .iter()
-            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
-        "diagnostics must be disabled by default (unit-diagnose-status should be absent)"
-    );
-    assert!(
-        !logs
-            .iter()
-            .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
-        "diagnostics must be disabled by default (unit-diagnose-journal should be absent)"
-    );
-    let meta = service_run_log
-        .get("meta")
-        .cloned()
-        .unwrap_or_else(|| Value::Null);
+        .find(|entry| {
+            entry.get("action") == Some(&Value::from("restart-unit"))
+                && entry.get("unit") == Some(&Value::from("svc-beta.service"))
+        })
+        .expect("restart-unit log entry exists for svc-beta.service");
+    let meta = op_log.get("meta").cloned().unwrap_or_else(|| Value::Null);
     assert_eq!(meta.get("type"), Some(&Value::from("command")));
     let exit = meta
         .get("exit")
@@ -1455,7 +1459,7 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .to_string();
     assert!(
         !exit.is_empty(),
-        "manual-service-run meta.exit should be non-empty"
+        "restart-unit meta.exit should be non-empty"
     );
     let stderr = meta
         .get("stderr")
@@ -1463,11 +1467,31 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .unwrap_or_default()
         .to_string();
     assert!(
-        stderr.contains("simulated busctl fail for svc-beta.service"),
-        "expected simulated busctl failure in manual-service-run meta.stderr, got: {stderr}"
+        stderr.contains("simulated systemctl fail for svc-beta.service"),
+        "expected simulated systemctl failure in restart-unit meta.stderr, got: {stderr}"
     );
-    assert_eq!(meta.get("runner"), Some(&Value::from("busctl")));
+    assert_eq!(meta.get("runner"), Some(&Value::from("systemctl")));
     assert_eq!(meta.get("purpose"), Some(&Value::from("restart")));
+
+    let service_run_log = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("manual-service-run")))
+        .expect("manual-service-run log entry exists");
+    let service_run_meta = service_run_log
+        .get("meta")
+        .cloned()
+        .unwrap_or_else(|| Value::Null);
+    assert_ne!(
+        service_run_meta.get("type"),
+        Some(&Value::from("command")),
+        "manual-service-run summary must not be command meta"
+    );
+    assert!(
+        service_run_meta.get("command").is_none()
+            && service_run_meta.get("stdout").is_none()
+            && service_run_meta.get("stderr").is_none(),
+        "manual-service-run summary must not contain command/stdout/stderr"
+    );
 
     let units = body["units"].as_array().cloned().unwrap_or_default();
     let svc_beta = units
@@ -1480,7 +1504,7 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .unwrap_or_default()
         .to_string();
     assert!(
-        unit_error.contains("exit=") && unit_error.contains("simulated busctl fail"),
+        unit_error.contains("exit=") && unit_error.contains("simulated systemctl fail"),
         "expected concise unit error summary, got: {unit_error}"
     );
 
@@ -1498,7 +1522,7 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
             .header("x-podup-csrf", "1")
             .body(trigger_body.to_string().into_bytes()),
         |cmd| {
-            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
+            cmd.env("MOCK_SYSTEMCTL_FAIL", "svc-beta.service");
         },
     )?;
     assert_eq!(trigger.status, 202, "manual trigger should accept request");
@@ -1525,24 +1549,22 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         "manual trigger task should include manual-trigger-run summary log"
     );
     assert!(
-        !logs
-            .iter()
+        logs.iter()
             .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-status"))),
-        "diagnostics must be disabled by default (unit-diagnose-status should be absent)"
+        "manual trigger failing unit should include unit-diagnose-status"
     );
     assert!(
-        !logs
-            .iter()
+        logs.iter()
             .any(|entry| entry.get("action") == Some(&Value::from("unit-diagnose-journal"))),
-        "diagnostics must be disabled by default (unit-diagnose-journal should be absent)"
+        "manual trigger failing unit should include unit-diagnose-journal"
     );
     let unit_log = logs
         .iter()
         .find(|entry| {
-            entry.get("action") == Some(&Value::from("manual-trigger-unit-run"))
+            entry.get("action") == Some(&Value::from("restart-unit"))
                 && entry.get("unit") == Some(&Value::from("svc-beta.service"))
         })
-        .expect("manual-trigger-unit-run log entry for failing svc-beta.service exists");
+        .expect("restart-unit log entry for failing svc-beta.service exists");
     let meta = unit_log.get("meta").cloned().unwrap_or(Value::Null);
     assert_eq!(meta.get("type"), Some(&Value::from("command")));
     let exit = meta
@@ -1552,7 +1574,7 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .to_string();
     assert!(
         !exit.is_empty(),
-        "manual-trigger-unit-run meta.exit should be non-empty"
+        "restart-unit meta.exit should be non-empty"
     );
     let stderr = meta
         .get("stderr")
@@ -1560,8 +1582,8 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .unwrap_or_default()
         .to_string();
     assert!(
-        stderr.contains("simulated busctl fail for svc-beta.service"),
-        "expected simulated busctl failure in manual-trigger-unit-run meta.stderr, got: {stderr}"
+        stderr.contains("simulated systemctl fail for svc-beta.service"),
+        "expected simulated systemctl failure in restart-unit meta.stderr, got: {stderr}"
     );
 
     let units = body["units"].as_array().cloned().unwrap_or_default();
@@ -1580,11 +1602,11 @@ async fn scenario_manual_task_command_meta_and_unit_errors() -> AnyResult<()> {
         .unwrap_or_default()
         .to_string();
     assert!(
-        !unit_error.is_empty() && unit_error.contains("simulated busctl fail"),
+        !unit_error.is_empty() && unit_error.contains("simulated systemctl fail"),
         "manual trigger failed unit should populate error summary, got: {unit_error}"
     );
     assert!(
-        !unit_message.contains("simulated busctl fail") && !unit_message.contains("stderr="),
+        !unit_message.contains("simulated systemctl fail") && !unit_message.contains("stderr="),
         "manual trigger unit message should stay high-level and not duplicate stderr, got: {unit_message}"
     );
 
@@ -1608,8 +1630,7 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
             .header("x-podup-csrf", "1")
             .body(service_body.to_string().into_bytes()),
         |cmd| {
-            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
-            cmd.env("PODUP_TASK_DIAGNOSTICS", "1");
+            cmd.env("MOCK_SYSTEMCTL_FAIL", "svc-beta.service");
             cmd.env("PODUP_TASK_DIAGNOSTICS_JOURNAL_LINES", "123");
         },
     )?;
@@ -1731,8 +1752,7 @@ async fn scenario_manual_task_unit_failure_diagnostics() -> AnyResult<()> {
             .header("x-podup-csrf", "1")
             .body(trigger_body.to_string().into_bytes()),
         |cmd| {
-            cmd.env("MOCK_BUSCTL_FAIL", "svc-beta.service");
-            cmd.env("PODUP_TASK_DIAGNOSTICS", "1");
+            cmd.env("MOCK_SYSTEMCTL_FAIL", "svc-beta.service");
             cmd.env("PODUP_TASK_DIAGNOSTICS_JOURNAL_LINES", "123");
         },
     )?;
@@ -1951,14 +1971,11 @@ async fn scenario_scheduler_loop() -> AnyResult<()> {
         log_lines
             .iter()
             .filter(|line| {
-                line.contains("busctl --user call")
-                    && line.contains("org.freedesktop.systemd1.Manager")
-                    && line.contains("StartUnit")
-                    && line.contains("podman-auto-update.service")
+                line.contains("systemctl --user start podman-auto-update.service")
             })
             .count()
             >= 2,
-        "expected at least two D-Bus StartUnit calls for podman-auto-update.service"
+        "expected at least two systemctl start calls for podman-auto-update.service"
     );
 
     let pool = env.connect_db().await?;
@@ -2383,22 +2400,16 @@ async fn scenario_cli_maintenance() -> AnyResult<()> {
 
     let log_lines = env.read_mock_log()?;
     assert!(
-        log_lines.iter().any(|line| {
-            line.contains("busctl --user call")
-                && line.contains("org.freedesktop.systemd1.Manager")
-                && line.contains("RestartUnit")
-                && line.contains("svc-alpha.service")
-        }),
-        "expected D-Bus RestartUnit call for svc-alpha.service"
+        log_lines
+            .iter()
+            .any(|line| line.contains("systemctl --user restart svc-alpha.service")),
+        "expected systemctl restart for svc-alpha.service"
     );
     assert!(
-        log_lines.iter().any(|line| {
-            line.contains("busctl --user call")
-                && line.contains("org.freedesktop.systemd1.Manager")
-                && line.contains("StartUnit")
-                && line.contains("podman-auto-update.service")
-        }),
-        "expected D-Bus StartUnit call for podman-auto-update.service"
+        log_lines
+            .iter()
+            .any(|line| line.contains("systemctl --user start podman-auto-update.service")),
+        "expected systemctl start for podman-auto-update.service"
     );
 
     env.clear_mock_log()?;
@@ -2461,11 +2472,16 @@ async fn scenario_http_server() -> AnyResult<()> {
     let env = TestEnv::new()?;
     env.ensure_db_initialized().await?;
 
-    let addr = "127.0.0.1:25111";
+    let addr = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        addr.to_string()
+    };
 
     let mut cmd = env.command();
     cmd.arg("http-server");
-    cmd.env("PODUP_HTTP_ADDR", addr);
+    cmd.env("PODUP_HTTP_ADDR", &addr);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     let mut child = cmd.spawn()?;
@@ -2473,7 +2489,7 @@ async fn scenario_http_server() -> AnyResult<()> {
     // Give the server a short window to start listening.
     let mut last_err: Option<io::Error> = None;
     for _ in 0..20 {
-        match TcpStream::connect(addr) {
+        match TcpStream::connect(&addr) {
             Ok(mut stream) => {
                 let request = HttpRequest::get("/health").into_bytes();
                 stream.write_all(&request)?;
@@ -2537,6 +2553,53 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
+}
+
+fn configure_image_verify_mocks(cmd: &mut Command) {
+    let ps_json = json!([
+        {
+            "Id": "cid-alpha",
+            "Created": 1000,
+            "State": "running",
+            "ImageID": "img-alpha",
+            "Labels": { "io.podman.systemd.unit": "svc-alpha.service" }
+        },
+        {
+            "Id": "cid-beta",
+            "Created": 1001,
+            "State": "running",
+            "ImageID": "img-beta",
+            "Labels": { "io.podman.systemd.unit": "svc-beta.service" }
+        }
+    ]);
+    let inspect_json = json!([
+        {
+            "Id": "img-alpha",
+            "RepoTags": [
+                "ghcr.io/koha/svc-alpha:main",
+                "ghcr.io/koha/svc-alpha:stable",
+                "ghcr.io/koha/svc-alpha:latest"
+            ],
+            "RepoDigests": ["ghcr.io/koha/svc-alpha@sha256:bbbbbbbb"],
+            "Digest": "sha256:bbbbbbbb"
+        },
+        {
+            "Id": "img-beta",
+            "RepoTags": ["ghcr.io/koha/runner:main"],
+            "RepoDigests": ["ghcr.io/koha/runner@sha256:bbbbbbbb"],
+            "Digest": "sha256:bbbbbbbb"
+        }
+    ]);
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:main": "sha256:bbbbbbbb",
+        "ghcr.io/koha/svc-alpha:stable": "sha256:bbbbbbbb",
+        "ghcr.io/koha/svc-alpha:latest": "sha256:bbbbbbbb",
+        "ghcr.io/koha/runner:main": "sha256:bbbbbbbb"
+    });
+
+    cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+    cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+    cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
 }
 
 struct TestEnv {
