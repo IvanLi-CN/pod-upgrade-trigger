@@ -61,6 +61,7 @@ pub(crate) enum RegistryDigestError {
     ChallengeParse,
     BadResponse,
     DigestMissing,
+    PlatformNotFound,
     Io,
     Json,
 }
@@ -76,6 +77,7 @@ impl RegistryDigestError {
             RegistryDigestError::ChallengeParse => "challenge-parse",
             RegistryDigestError::BadResponse => "bad-response",
             RegistryDigestError::DigestMissing => "digest-missing",
+            RegistryDigestError::PlatformNotFound => "platform-not-found",
             RegistryDigestError::Io => "io-error",
             RegistryDigestError::Json => "json-error",
         }
@@ -233,6 +235,191 @@ pub(crate) async fn resolve_remote_manifest_digest(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegistryPlatformDigestRecord {
+    pub image: String,
+    pub platform_os: String,
+    pub platform_arch: String,
+    pub platform_variant: Option<String>,
+    pub remote_index_digest: Option<String>,
+    pub remote_platform_digest: Option<String>,
+    pub checked_at: i64,
+    pub status: RegistryDigestStatus,
+    pub error: Option<String>,
+    pub stale: bool,
+    pub from_cache: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PlatformCacheRow {
+    image: String,
+    platform_os: String,
+    platform_arch: String,
+    platform_variant: String,
+    remote_index_digest: Option<String>,
+    remote_platform_digest: Option<String>,
+    checked_at: i64,
+    status: RegistryDigestStatus,
+    error: Option<String>,
+}
+
+pub(crate) async fn resolve_remote_index_and_platform_digest(
+    pool: &SqlitePool,
+    image: &str,
+    platform_os: &str,
+    platform_arch: &str,
+    platform_variant: Option<&str>,
+    ttl_secs: u64,
+    force_refresh: bool,
+) -> RegistryPlatformDigestRecord {
+    let parsed = match parse_image_ref(image) {
+        Ok(value) => value,
+        Err(err) => {
+            return RegistryPlatformDigestRecord {
+                image: image.trim().to_string(),
+                platform_os: platform_os.trim().to_string(),
+                platform_arch: platform_arch.trim().to_string(),
+                platform_variant: platform_variant
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+                remote_index_digest: None,
+                remote_platform_digest: None,
+                checked_at: crate::current_unix_secs() as i64,
+                status: RegistryDigestStatus::Error,
+                error: Some(err.code().to_string()),
+                stale: true,
+                from_cache: false,
+            };
+        }
+    };
+
+    let platform_os = platform_os.trim();
+    let platform_arch = platform_arch.trim();
+    let platform_variant_key = platform_variant.unwrap_or("").trim();
+
+    let cached = match get_cached_platform_row(
+        pool,
+        &parsed.normalized_image,
+        platform_os,
+        platform_arch,
+        platform_variant_key,
+    )
+    .await
+    {
+        Ok(row) => row,
+        Err(_) => None,
+    };
+
+    if let Some(row) = cached.as_ref() {
+        let stale = compute_stale(row.checked_at, ttl_secs, row.status);
+        if !force_refresh {
+            return RegistryPlatformDigestRecord {
+                image: row.image.clone(),
+                platform_os: row.platform_os.clone(),
+                platform_arch: row.platform_arch.clone(),
+                platform_variant: if row.platform_variant.is_empty() {
+                    None
+                } else {
+                    Some(row.platform_variant.clone())
+                },
+                remote_index_digest: row.remote_index_digest.clone(),
+                remote_platform_digest: row.remote_platform_digest.clone(),
+                checked_at: row.checked_at,
+                status: row.status,
+                error: row.error.clone(),
+                stale,
+                from_cache: true,
+            };
+        }
+    }
+
+    let previous_index = cached.as_ref().and_then(|r| r.remote_index_digest.clone());
+    let previous_platform = cached
+        .as_ref()
+        .and_then(|r| r.remote_platform_digest.clone());
+
+    match refresh_remote_index_and_platform_digest(
+        &parsed,
+        platform_os,
+        platform_arch,
+        platform_variant_key,
+    )
+    .await
+    {
+        Ok((remote_index_digest, remote_platform_digest)) => {
+            let record = upsert_platform_cache_row(
+                pool,
+                &parsed.normalized_image,
+                platform_os,
+                platform_arch,
+                platform_variant_key,
+                Some(&remote_index_digest),
+                Some(&remote_platform_digest),
+                RegistryDigestStatus::Ok,
+                None,
+            )
+            .await;
+
+            match record {
+                Ok(record) => RegistryPlatformDigestRecord {
+                    from_cache: false,
+                    ..record
+                },
+                Err(_) => RegistryPlatformDigestRecord {
+                    image: parsed.normalized_image.clone(),
+                    platform_os: platform_os.to_string(),
+                    platform_arch: platform_arch.to_string(),
+                    platform_variant: if platform_variant_key.is_empty() {
+                        None
+                    } else {
+                        Some(platform_variant_key.to_string())
+                    },
+                    remote_index_digest: Some(remote_index_digest),
+                    remote_platform_digest: Some(remote_platform_digest),
+                    checked_at: crate::current_unix_secs() as i64,
+                    status: RegistryDigestStatus::Ok,
+                    error: None,
+                    stale: false,
+                    from_cache: false,
+                },
+            }
+        }
+        Err(err) => {
+            let err_code = err.code();
+            let _ = upsert_platform_cache_row(
+                pool,
+                &parsed.normalized_image,
+                platform_os,
+                platform_arch,
+                platform_variant_key,
+                previous_index.as_deref(),
+                previous_platform.as_deref(),
+                RegistryDigestStatus::Error,
+                Some(err_code),
+            )
+            .await;
+
+            RegistryPlatformDigestRecord {
+                image: parsed.normalized_image.clone(),
+                platform_os: platform_os.to_string(),
+                platform_arch: platform_arch.to_string(),
+                platform_variant: if platform_variant_key.is_empty() {
+                    None
+                } else {
+                    Some(platform_variant_key.to_string())
+                },
+                remote_index_digest: previous_index,
+                remote_platform_digest: previous_platform,
+                checked_at: crate::current_unix_secs() as i64,
+                status: RegistryDigestStatus::Error,
+                error: Some(err_code.to_string()),
+                stale: true,
+                from_cache: false,
+            }
+        }
+    }
+}
+
 async fn refresh_remote_manifest_digest(
     image: &ParsedImageRef,
 ) -> Result<String, RegistryDigestError> {
@@ -266,6 +453,7 @@ async fn refresh_remote_manifest_digest(
                                     "challenge-parse" => RegistryDigestError::ChallengeParse,
                                     "bad-response" => RegistryDigestError::BadResponse,
                                     "digest-missing" => RegistryDigestError::DigestMissing,
+                                    "platform-not-found" => RegistryDigestError::PlatformNotFound,
                                     "io-error" => RegistryDigestError::Io,
                                     "json-error" => RegistryDigestError::Json,
                                     _ => RegistryDigestError::BadResponse,
@@ -348,6 +536,244 @@ async fn refresh_remote_manifest_digest(
     }
 
     Err(RegistryDigestError::Unauthorized)
+}
+
+async fn manifest_request_with_auth(
+    client: &Client,
+    image: &ParsedImageRef,
+    method: reqwest::Method,
+    manifest_url: &str,
+) -> Result<reqwest::Response, RegistryDigestError> {
+    let response = client
+        .request(method.clone(), manifest_url)
+        .headers(manifest_accept_headers())
+        .send()
+        .await
+        .map_err(map_reqwest_error)?;
+
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    if response.status() != StatusCode::UNAUTHORIZED {
+        return Err(map_status_to_error(response.status()));
+    }
+
+    let challenge_headers = response
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>();
+
+    if let Some(challenge) = challenge_headers
+        .iter()
+        .find(|h| h.trim_start().to_ascii_lowercase().starts_with("bearer "))
+    {
+        let bearer = parse_www_authenticate_bearer(challenge)?;
+        let creds = load_basic_credentials_for_registry(&image.registry)?;
+        let token = fetch_bearer_token(client, &bearer, &creds).await?;
+
+        let retry = client
+            .request(method, manifest_url)
+            .headers(manifest_accept_headers())
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        if retry.status().is_success() {
+            return Ok(retry);
+        }
+        return Err(map_status_to_error(retry.status()));
+    }
+
+    if challenge_headers
+        .iter()
+        .any(|h| h.trim_start().to_ascii_lowercase().starts_with("basic "))
+    {
+        let creds = load_basic_credentials_for_registry(&image.registry)?;
+        let retry = client
+            .request(method, manifest_url)
+            .headers(manifest_accept_headers())
+            .basic_auth(creds.username, Some(creds.password))
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+
+        if retry.status().is_success() {
+            return Ok(retry);
+        }
+        return Err(map_status_to_error(retry.status()));
+    }
+
+    Err(RegistryDigestError::Unauthorized)
+}
+
+fn select_platform_digest_from_manifest_list(
+    manifest: &Value,
+    platform_os: &str,
+    platform_arch: &str,
+    platform_variant_key: &str,
+) -> Result<Option<String>, RegistryDigestError> {
+    let Some(manifests) = manifest.get("manifests").and_then(|v| v.as_array()) else {
+        return Ok(None);
+    };
+
+    let want_os = platform_os.trim();
+    let want_arch = platform_arch.trim();
+    let want_variant = platform_variant_key.trim();
+
+    let mut candidate_any: Option<String> = None;
+    let mut candidate_no_variant: Option<String> = None;
+
+    for desc in manifests {
+        let Some(platform) = desc.get("platform").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        let os = platform
+            .get("os")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let arch = platform
+            .get("architecture")
+            .or_else(|| platform.get("arch"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .unwrap_or("");
+        if os != want_os || arch != want_arch {
+            continue;
+        }
+
+        let digest = desc
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with("sha256:"));
+        let Some(digest) = digest else {
+            continue;
+        };
+
+        let variant = platform
+            .get("variant")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .unwrap_or("");
+
+        if !want_variant.is_empty() && variant == want_variant {
+            return Ok(Some(digest));
+        }
+
+        if want_variant.is_empty() && variant.is_empty() && candidate_no_variant.is_none() {
+            candidate_no_variant = Some(digest.clone());
+        }
+
+        if candidate_any.is_none() {
+            candidate_any = Some(digest);
+        }
+    }
+
+    Ok(candidate_no_variant.or(candidate_any))
+}
+
+async fn refresh_remote_index_and_platform_digest(
+    image: &ParsedImageRef,
+    platform_os: &str,
+    platform_arch: &str,
+    platform_variant_key: &str,
+) -> Result<(String, String), RegistryDigestError> {
+    if env::var("PODUP_ENV")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+        .is_some_and(|v| v == "test" || v == "testing")
+    {
+        if let Ok(raw) = env::var(ENV_REGISTRY_DIGEST_MOCK) {
+            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                if let Some(obj) = value.as_object() {
+                    if let Some(entry) = obj.get(&image.normalized_image) {
+                        if let Some(digest) = entry.as_str() {
+                            let trimmed = digest.trim();
+                            if trimmed.starts_with("sha256:") {
+                                return Ok((trimmed.to_string(), trimmed.to_string()));
+                            }
+                            return Err(RegistryDigestError::DigestMissing);
+                        }
+                        if entry.is_null() {
+                            return Err(RegistryDigestError::DigestMissing);
+                        }
+                        if let Some(err_obj) = entry.as_object() {
+                            if let Some(code) = err_obj.get("error").and_then(|v| v.as_str()) {
+                                return Err(match code.trim() {
+                                    "timeout" => RegistryDigestError::Timeout,
+                                    "unauthorized" => RegistryDigestError::Unauthorized,
+                                    "auth-missing" => RegistryDigestError::AuthMissing,
+                                    "auth-parse" => RegistryDigestError::AuthParse,
+                                    "challenge-parse" => RegistryDigestError::ChallengeParse,
+                                    "bad-response" => RegistryDigestError::BadResponse,
+                                    "digest-missing" => RegistryDigestError::DigestMissing,
+                                    "platform-not-found" => RegistryDigestError::PlatformNotFound,
+                                    "io-error" => RegistryDigestError::Io,
+                                    "json-error" => RegistryDigestError::Json,
+                                    _ => RegistryDigestError::BadResponse,
+                                });
+                            }
+
+                            let index = err_obj
+                                .get("remote_index_digest")
+                                .or_else(|| err_obj.get("index_digest"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim())
+                                .filter(|s| s.starts_with("sha256:"));
+                            let platform = err_obj
+                                .get("remote_platform_digest")
+                                .or_else(|| err_obj.get("platform_digest"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim())
+                                .filter(|s| s.starts_with("sha256:"));
+
+                            if let (Some(i), Some(p)) = (index, platform) {
+                                return Ok((i.to_string(), p.to_string()));
+                            }
+                            if let Some(i) = index {
+                                return Ok((i.to_string(), i.to_string()));
+                            }
+                            if let Some(p) = platform {
+                                return Ok((p.to_string(), p.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let client = registry_http_client().map_err(|_| RegistryDigestError::BadResponse)?;
+    let manifest_url = format!(
+        "{}://{}/v2/{}/manifests/{}",
+        image.scheme, image.registry, image.repo, image.tag
+    );
+
+    let head = manifest_request_with_auth(&client, image, reqwest::Method::HEAD, &manifest_url)
+        .await?;
+    let remote_index_digest = read_digest_header(head.headers())?;
+
+    let get = manifest_request_with_auth(&client, image, reqwest::Method::GET, &manifest_url).await?;
+    if !get.status().is_success() {
+        return Err(map_status_to_error(get.status()));
+    }
+
+    let body: Value = get.json().await.map_err(|_| RegistryDigestError::Json)?;
+    let is_manifest_list = body.get("manifests").and_then(|v| v.as_array()).is_some();
+    let remote_platform_digest = if is_manifest_list {
+        select_platform_digest_from_manifest_list(&body, platform_os, platform_arch, platform_variant_key)?
+            .ok_or(RegistryDigestError::PlatformNotFound)?
+    } else {
+        remote_index_digest.clone()
+    };
+
+    Ok((remote_index_digest, remote_platform_digest))
 }
 
 fn map_reqwest_error(err: reqwest::Error) -> RegistryDigestError {
@@ -696,6 +1122,50 @@ async fn get_cached_row(pool: &SqlitePool, image: &str) -> Result<Option<CacheRo
     }))
 }
 
+async fn get_cached_platform_row(
+    pool: &SqlitePool,
+    image: &str,
+    platform_os: &str,
+    platform_arch: &str,
+    platform_variant_key: &str,
+) -> Result<Option<PlatformCacheRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT image, platform_os, platform_arch, platform_variant, remote_index_digest, remote_platform_digest, checked_at, status, error \
+         FROM registry_platform_digest_cache \
+         WHERE image = ? AND platform_os = ? AND platform_arch = ? AND platform_variant = ?",
+    )
+    .bind(image)
+    .bind(platform_os)
+    .bind(platform_arch)
+    .bind(platform_variant_key)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+
+    let image: String = row.get("image");
+    let platform_os: String = row.get("platform_os");
+    let platform_arch: String = row.get("platform_arch");
+    let platform_variant: String = row.get("platform_variant");
+    let remote_index_digest: Option<String> = row.get("remote_index_digest");
+    let remote_platform_digest: Option<String> = row.get("remote_platform_digest");
+    let checked_at: i64 = row.get("checked_at");
+    let status_raw: String = row.get("status");
+    let status = RegistryDigestStatus::from_db(&status_raw);
+    let error: Option<String> = row.get("error");
+
+    Ok(Some(PlatformCacheRow {
+        image,
+        platform_os,
+        platform_arch,
+        platform_variant,
+        remote_index_digest,
+        remote_platform_digest,
+        checked_at,
+        status,
+        error,
+    }))
+}
+
 async fn upsert_cache_row(
     pool: &SqlitePool,
     image: &str,
@@ -733,6 +1203,61 @@ async fn upsert_cache_row(
     })
 }
 
+async fn upsert_platform_cache_row(
+    pool: &SqlitePool,
+    image: &str,
+    platform_os: &str,
+    platform_arch: &str,
+    platform_variant_key: &str,
+    remote_index_digest: Option<&str>,
+    remote_platform_digest: Option<&str>,
+    status: RegistryDigestStatus,
+    error: Option<&str>,
+) -> Result<RegistryPlatformDigestRecord, sqlx::Error> {
+    let now = crate::current_unix_secs() as i64;
+
+    sqlx::query(
+        "INSERT INTO registry_platform_digest_cache \
+         (image, platform_os, platform_arch, platform_variant, remote_index_digest, remote_platform_digest, checked_at, status, error) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(image, platform_os, platform_arch, platform_variant) DO UPDATE SET \
+           remote_index_digest = excluded.remote_index_digest, \
+           remote_platform_digest = excluded.remote_platform_digest, \
+           checked_at = excluded.checked_at, \
+           status = excluded.status, \
+           error = excluded.error",
+    )
+    .bind(image)
+    .bind(platform_os)
+    .bind(platform_arch)
+    .bind(platform_variant_key)
+    .bind(remote_index_digest)
+    .bind(remote_platform_digest)
+    .bind(now)
+    .bind(status.as_str())
+    .bind(error)
+    .execute(pool)
+    .await?;
+
+    Ok(RegistryPlatformDigestRecord {
+        image: image.to_string(),
+        platform_os: platform_os.to_string(),
+        platform_arch: platform_arch.to_string(),
+        platform_variant: if platform_variant_key.is_empty() {
+            None
+        } else {
+            Some(platform_variant_key.to_string())
+        },
+        remote_index_digest: remote_index_digest.map(|s| s.to_string()),
+        remote_platform_digest: remote_platform_digest.map(|s| s.to_string()),
+        checked_at: now,
+        status,
+        error: error.map(|s| s.to_string()),
+        stale: status != RegistryDigestStatus::Ok,
+        from_cache: false,
+    })
+}
+
 fn is_expired(checked_at: i64, ttl_secs: u64) -> bool {
     let now = crate::current_unix_secs() as i64;
     let age = now.saturating_sub(checked_at).max(0) as u64;
@@ -757,6 +1282,63 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_MUTEX.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn select_platform_digest_picks_matching_arch_and_os() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:aaaaaaaa",
+                    "platform": { "os": "linux", "architecture": "amd64" }
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:bbbbbbbb",
+                    "platform": { "os": "linux", "architecture": "arm64", "variant": "v8" }
+                }
+            ]
+        });
+
+        let digest =
+            select_platform_digest_from_manifest_list(&manifest, "linux", "amd64", "").unwrap();
+        assert_eq!(digest, Some("sha256:aaaaaaaa".to_string()));
+    }
+
+    #[test]
+    fn select_platform_digest_prefers_no_variant_when_unspecified() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "digest": "sha256:cccccccc",
+                    "platform": { "os": "linux", "architecture": "arm64", "variant": "v8" }
+                },
+                {
+                    "digest": "sha256:dddddddd",
+                    "platform": { "os": "linux", "architecture": "arm64" }
+                }
+            ]
+        });
+
+        let digest =
+            select_platform_digest_from_manifest_list(&manifest, "linux", "arm64", "").unwrap();
+        assert_eq!(digest, Some("sha256:dddddddd".to_string()));
+    }
+
+    #[test]
+    fn select_platform_digest_returns_none_for_single_manifest() {
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json"
+        });
+        let digest =
+            select_platform_digest_from_manifest_list(&manifest, "linux", "amd64", "").unwrap();
+        assert_eq!(digest, None);
     }
 
     struct HomeGuard {
