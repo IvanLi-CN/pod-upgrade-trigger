@@ -1,4 +1,5 @@
 import { Icon } from "@iconify/react";
+import { useRef, useState } from "react";
 import {
 	BrowserRouter,
 	Link,
@@ -8,19 +9,18 @@ import {
 	useLocation,
 	useNavigate,
 } from "react-router-dom";
+import { ToastProvider, ToastViewport, useToast } from "./components/Toast";
+import { ApiProvider, useApi } from "./hooks/useApi";
+import { useVersionCheck } from "./hooks/useVersionCheck";
+import MockConsole from "./mocks/MockConsole";
 import DashboardPage from "./pages/DashboardPage";
 import EventsPage from "./pages/EventsPage";
-import ManualPage from "./pages/ManualPage";
 import MaintenancePage from "./pages/MaintenancePage";
+import ManualPage from "./pages/ManualPage";
 import SettingsPage from "./pages/SettingsPage";
-import WebhooksPage from "./pages/WebhooksPage";
 import TasksPage from "./pages/TasksPage";
 import UnauthorizedPage from "./pages/UnauthorizedPage";
-import { ApiProvider, useApi } from "./hooks/useApi";
-import { ToastProvider, ToastViewport, useToast } from "./components/Toast";
-import MockConsole from "./mocks/MockConsole";
-import { useVersionCheck } from "./hooks/useVersionCheck";
-import { useRef, useState } from "react";
+import WebhooksPage from "./pages/WebhooksPage";
 
 function ensureLeadingV(value: string | null | undefined): string | null {
 	if (!value) return null;
@@ -72,10 +72,16 @@ export function TopStatusBar() {
 	const handleSelfUpdate = async () => {
 		if (!latestTag) return;
 
-		type SelfUpdateResponse = { task_id?: string | null; dry_run?: boolean | null };
+		type SelfUpdateResponse = {
+			task_id?: string | null;
+			dry_run?: boolean | null;
+		};
 		try {
 			setSelfUpdateRunning(true);
-			const data = await postJson<SelfUpdateResponse>("/api/self-update/run", {});
+			const data = await postJson<SelfUpdateResponse>(
+				"/api/self-update/run",
+				{},
+			);
 			const taskId = data.task_id ? String(data.task_id) : "";
 			if (!taskId) {
 				closeSelfUpdateDialog();
@@ -97,7 +103,9 @@ export function TopStatusBar() {
 			navigate(`/tasks?task_id=${encodeURIComponent(taskId)}`);
 		} catch (err) {
 			const statusCode =
-				err && typeof err === "object" && "status" in err ? String(err.status) : "";
+				err && typeof err === "object" && "status" in err
+					? String(err.status)
+					: "";
 			const message =
 				err && typeof err === "object" && "message" in err && err.message
 					? String(err.message)
@@ -136,9 +144,7 @@ export function TopStatusBar() {
 							/>
 							{latestTag}
 						</button>
-						<ul
-							className="dropdown-content menu menu-sm z-[60] mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow"
-						>
+						<ul className="dropdown-content menu menu-sm z-[60] mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow">
 							<li>
 								<button type="button" onClick={openSelfUpdateDialog}>
 									立即更新

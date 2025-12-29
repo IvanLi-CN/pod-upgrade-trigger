@@ -5,7 +5,7 @@
 当前 `/manual`（UI 标签：**Services**）页面主要提供两类能力：
 
 - 列出可触发的 systemd unit（来自 `GET /api/manual/services`），并展示其默认镜像（来自 Quadlet / unit 定义中的 `Image=`）。
-- 对单个服务或全部可部署服务发起部署（`POST /api/manual/services/<slug>` / `POST /api/manual/deploy`），后端执行 `podman pull <image>` + `systemctl/busctl restart|start <unit>`（auto-update excluded；批量 deploy 会跳过缺少默认镜像的服务；按服务 deploy 由 UI 保证传入 `image`，避免退化为 restart-only）。
+- 对单个服务或全部可部署服务发起部署（`POST /api/manual/services/<slug>` / `POST /api/manual/deploy`），后端执行 `podman pull <image>` + `systemctl --user restart|start <unit>`（auto-update excluded；批量 deploy 会跳过缺少默认镜像的服务；按服务 deploy 由 UI 保证传入 `image`，避免退化为 restart-only）。
 
 但 UI 缺少“是否有可更新内容”的提示。主人希望在服务列表项上看到两种不同语义的更新标记：
 
@@ -209,7 +209,7 @@
 ## 风险点与待确认问题
 
 1. **registry 鉴权策略（已确认）**：复用 rootless 用户的 `~/.config/containers/auth.json`。需要确认运维在生产主机上为运行用户正确配置该文件，并具备拉取/查询 manifest 的权限。
-2. **digest 口径一致性**：本地运行容器能否稳定拿到“与 registry 对齐的 manifest digest”？多架构镜像可能出现 index digest 与 platform digest 不一致，需要明确比较口径。
+2. **digest 口径一致性**：多架构镜像可能出现 index digest 与 platform digest 不一致；比较口径以 *platform manifest digest* 为准，并保留 index digest 作为诊断信息。
 3. **unit->container 映射可靠性（已确认方向）**：依赖标准 Quadlet + rootless 部署，优先通过 `io.podman.systemd.unit` / `PODMAN_SYSTEMD_UNIT` label 映射；若 label 缺失则降级为 `unknown` 并提示运维修正。
 4. **性能**：服务数量较多时，首次 refresh 可能触发较多外网 HEAD；需要并发控制与总超时。
 

@@ -102,7 +102,6 @@ const ENV_AUTO_DISCOVER: &str = "PODUP_AUTO_DISCOVER";
 const ENV_TASK_RETENTION_SECS: &str = "PODUP_TASK_RETENTION_SECS";
 const ENV_AUTO_UPDATE_LOG_DIR: &str = "PODUP_AUTO_UPDATE_LOG_DIR";
 const ENV_SELF_UPDATE_REPORT_DIR: &str = "PODUP_SELF_UPDATE_REPORT_DIR";
-const ENV_TASK_DIAGNOSTICS: &str = "PODUP_TASK_DIAGNOSTICS";
 const ENV_TASK_DIAGNOSTICS_JOURNAL_LINES: &str = "PODUP_TASK_DIAGNOSTICS_JOURNAL_LINES";
 const TASK_DIAGNOSTICS_JOURNAL_LINES_DEFAULT: i64 = 100;
 const TASK_DIAGNOSTICS_JOURNAL_LINES_MAX: i64 = 1000;
@@ -990,10 +989,6 @@ fn parse_env_bool(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn task_diagnostics_enabled() -> bool {
-    parse_env_bool(ENV_TASK_DIAGNOSTICS)
 }
 
 fn task_diagnostics_journal_lines_from_env() -> i64 {
@@ -7768,6 +7763,27 @@ fn podman_ps_all_json() -> Result<Value, String> {
         .clone()
 }
 
+fn podman_ps_all_json_fresh() -> Result<Value, String> {
+    let args = vec![
+        "ps".to_string(),
+        "-a".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ];
+    let result = host_backend()
+        .podman(&args)
+        .map_err(|_| "exec-failed".to_string())?;
+    if !result.status.success() {
+        return Err("non-zero-exit".to_string());
+    }
+
+    let trimmed = result.stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    serde_json::from_str(trimmed).map_err(|_| "invalid-json".to_string())
+}
+
 fn podman_image_inspect_json(image_ids: &[String]) -> Result<Value, String> {
     if image_ids.is_empty() {
         return Ok(Value::Array(Vec::new()));
@@ -7793,6 +7809,39 @@ fn podman_image_inspect_json(image_ids: &[String]) -> Result<Value, String> {
         return Ok(Value::Array(Vec::new()));
     }
     serde_json::from_str(trimmed).map_err(|_| "invalid-json".to_string())
+}
+
+fn podman_inspect_digest(item: &Value) -> Option<String> {
+    let mut digest: Option<String> = None;
+    if let Some(repo_digests) = item.get("RepoDigests").and_then(|v| v.as_array()) {
+        for entry in repo_digests {
+            let Some(raw) = entry.as_str() else { continue };
+            let Some((_repo, d)) = raw.split_once('@') else {
+                continue;
+            };
+            let d = d.trim();
+            if d.starts_with("sha256:") {
+                digest = Some(d.to_string());
+                break;
+            }
+        }
+    }
+    if digest.is_none() {
+        digest = item
+            .get("Digest")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with("sha256:"));
+    }
+    digest
+}
+
+fn image_inspect_id(item: &Value) -> Option<String> {
+    item.get("Id")
+        .or_else(|| item.get("ID"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Clone, Debug)]
@@ -8065,6 +8114,268 @@ fn resolve_running_digests_by_unit(units: &[String]) -> HashMap<String, RunningD
     }
 
     out
+}
+
+#[derive(Clone, Debug)]
+struct OciPlatform {
+    os: String,
+    arch: String,
+    variant: Option<String>,
+}
+
+fn current_oci_platform() -> OciPlatform {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    // OCI uses amd64/arm64, while Rust uses x86_64/aarch64.
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    OciPlatform {
+        os: os.to_string(),
+        arch: arch.to_string(),
+        variant: None,
+    }
+}
+
+struct ImageVerifyResult {
+    status: &'static str,
+    unit_status: &'static str,
+    unit_error: Option<String>,
+}
+
+fn resolve_running_image_id_for_unit_fresh(unit: &str) -> Result<String, String> {
+    let ps = podman_ps_all_json_fresh()?;
+    let items = ps.as_array().ok_or_else(|| "invalid-json".to_string())?;
+
+    let mut candidates: Vec<PodmanContainerCandidate> = Vec::new();
+    for item in items {
+        let Some(label) = container_unit_label(item) else {
+            continue;
+        };
+        if label != unit {
+            continue;
+        }
+        candidates.push(PodmanContainerCandidate {
+            image_id: container_image_id(item),
+            is_running: container_is_running(item),
+            created: container_created_ts(item),
+        });
+    }
+
+    if candidates.is_empty() {
+        return Err("container-not-found".to_string());
+    }
+
+    let mut best_running: Option<&PodmanContainerCandidate> = None;
+    let mut best_any: Option<&PodmanContainerCandidate> = None;
+    for cand in &candidates {
+        if best_any
+            .as_ref()
+            .map(|b| cand.created > b.created)
+            .unwrap_or(true)
+        {
+            best_any = Some(cand);
+        }
+        if cand.is_running
+            && best_running
+                .as_ref()
+                .map(|b| cand.created > b.created)
+                .unwrap_or(true)
+        {
+            best_running = Some(cand);
+        }
+    }
+
+    let chosen = best_running
+        .or(best_any)
+        .ok_or_else(|| "container-not-found".to_string())?;
+    chosen
+        .image_id
+        .clone()
+        .ok_or_else(|| "image-id-missing".to_string())
+}
+
+fn run_image_verify_step(task_id: &str, unit: &str, image: &str) -> ImageVerifyResult {
+    let platform = current_oci_platform();
+    let image_owned = image.to_string();
+    let platform_os = platform.os.clone();
+    let platform_arch = platform.arch.clone();
+    let platform_variant = platform.variant.clone();
+
+    let ttl_secs = registry_digest::registry_digest_cache_ttl_secs();
+
+    let remote_record_result: Result<registry_digest::RegistryPlatformDigestRecord, String> =
+        with_db(|pool| async move {
+            Ok::<registry_digest::RegistryPlatformDigestRecord, sqlx::Error>(
+                registry_digest::resolve_remote_index_and_platform_digest(
+                    &pool,
+                    &image_owned,
+                    &platform_os,
+                    &platform_arch,
+                    platform_variant.as_deref(),
+                    ttl_secs,
+                    true,
+                )
+                .await,
+            )
+        });
+
+    let mut remote_index_digest: Option<String> = None;
+    let mut remote_platform_digest: Option<String> = None;
+    let mut remote_error: Option<String> = None;
+    let mut remote_checked_at: Option<i64> = None;
+    let mut remote_stale: Option<bool> = None;
+    let mut remote_from_cache: Option<bool> = None;
+
+    match remote_record_result {
+        Ok(record) => {
+            remote_index_digest = record.remote_index_digest.clone();
+            remote_platform_digest = record.remote_platform_digest.clone();
+            remote_checked_at = Some(record.checked_at);
+            remote_stale = Some(record.stale);
+            remote_from_cache = Some(record.from_cache);
+            if record.status != registry_digest::RegistryDigestStatus::Ok
+                || record.remote_platform_digest.is_none()
+            {
+                remote_error = Some(record.error.unwrap_or_else(|| "remote-error".to_string()));
+            }
+        }
+        Err(err) => {
+            remote_error = Some(format!("db-error: {err}"));
+        }
+    }
+
+    let mut pulled_digest: Option<String> = None;
+    let mut running_digest: Option<String> = None;
+    let mut local_error: Option<String> = None;
+
+    let running_image_id = match resolve_running_image_id_for_unit_fresh(unit) {
+        Ok(id) => id,
+        Err(err) => {
+            local_error = Some(err);
+            String::new()
+        }
+    };
+
+    if local_error.is_none() {
+        let inspect_args = vec![image.to_string(), running_image_id.clone()];
+        match podman_image_inspect_json(&inspect_args) {
+            Ok(inspect) => {
+                if let Some(images) = inspect.as_array() {
+                    for entry in images {
+                        let digest = podman_inspect_digest(entry);
+                        let id = image_inspect_id(entry);
+
+                        if pulled_digest.is_none() {
+                            let tags = entry
+                                .get("RepoTags")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| {
+                                    Some(
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .any(|t| t.trim() == image),
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if tags {
+                                pulled_digest = digest.clone();
+                            }
+                        }
+
+                        if running_digest.is_none()
+                            && id.as_deref() == Some(running_image_id.as_str())
+                        {
+                            running_digest = digest;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                local_error = Some(format!("podman-image-inspect-failed: {err}"));
+            }
+        }
+
+        if pulled_digest.is_none() {
+            local_error.get_or_insert("pulled-digest-missing".to_string());
+        }
+        if running_digest.is_none() {
+            local_error.get_or_insert("running-digest-missing".to_string());
+        }
+    }
+
+    let (status, unit_status, result_status) = if remote_error.is_some() {
+        ("unknown", "unknown", "unknown")
+    } else if local_error.is_some() {
+        ("failed", "failed", "failed")
+    } else {
+        let remote = remote_platform_digest.clone().unwrap_or_default();
+        let pulled = pulled_digest.clone().unwrap_or_default();
+        let running = running_digest.clone().unwrap_or_default();
+        if remote != pulled || remote != running || pulled != running {
+            ("failed", "failed", "failed")
+        } else {
+            ("succeeded", "succeeded", "ok")
+        }
+    };
+
+    let result_message = format!(
+        "remote_platform={} pulled={} running={}",
+        remote_platform_digest.as_deref().unwrap_or("-"),
+        pulled_digest.as_deref().unwrap_or("-"),
+        running_digest.as_deref().unwrap_or("-"),
+    );
+
+    let summary = match status {
+        "succeeded" => "Image verify: OK".to_string(),
+        "failed" => "Image verify: FAILED".to_string(),
+        _ => "Image verify: unavailable".to_string(),
+    };
+
+    let level = match status {
+        "succeeded" => "info",
+        "failed" => "error",
+        _ => "warning",
+    };
+
+    append_task_log(
+        task_id,
+        level,
+        "image-verify",
+        status,
+        &summary,
+        Some(unit),
+        json!({
+            "unit": unit,
+            "image": image,
+            "platform": { "os": platform.os, "arch": platform.arch, "variant": platform.variant },
+            "remote_index_digest": remote_index_digest,
+            "remote_platform_digest": remote_platform_digest,
+            "pulled_digest": pulled_digest,
+            "running_digest": running_digest,
+            "remote_error": remote_error,
+            "local_error": local_error,
+            "checked_at": remote_checked_at,
+            "stale": remote_stale,
+            "from_cache": remote_from_cache,
+            "result_status": result_status,
+            "result_message": result_message,
+        }),
+    );
+
+    ImageVerifyResult {
+        status,
+        unit_status,
+        unit_error: if status == "succeeded" {
+            None
+        } else {
+            Some(result_message)
+        },
+    }
 }
 
 fn discover_podman_units() -> Result<Vec<DiscoveredUnit>, String> {
@@ -10234,10 +10545,6 @@ fn build_unit_diagnostics_command_meta(
 }
 
 fn capture_unit_failure_diagnostics(unit: &str, journal_lines: i64) -> Vec<PreparedTaskLog> {
-    if !task_diagnostics_enabled() {
-        return Vec::new();
-    }
-
     let mut entries = Vec::with_capacity(2);
 
     // A) systemctl --user status <unit> --no-pager --full
@@ -10352,30 +10659,6 @@ fn podman_health() -> Result<(), String> {
 }
 
 fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
-    // Prefer talking to the user scope systemd instance via D-Bus so that we
-    // work in containerised environments where `systemctl --user` cannot reach
-    // the user bus directly but busctl can (for example when /run/user/$UID is
-    // bind-mounted into the container).
-    //
-    // If busctl is not available at all (e.g. on non-systemd dev hosts), fall
-    // back to the previous `systemctl --user start` behaviour.
-    let busctl_args = vec![
-        "call".to_string(),
-        "org.freedesktop.systemd1".to_string(),
-        "/org/freedesktop/systemd1".to_string(),
-        "org.freedesktop.systemd1.Manager".to_string(),
-        "StartUnit".to_string(),
-        "ss".to_string(),
-        unit.to_string(),
-        "replace".to_string(),
-    ];
-    if let Ok(result) = host_backend().busctl_user(&busctl_args) {
-        // Always return the busctl result to the caller; non-zero exit codes
-        // are treated as failures by the higher-level logic which will keep
-        // returning 500s and surfacing stderr in task logs.
-        return Ok(result);
-    }
-
     let systemctl_args = vec!["start".to_string(), unit.to_string()];
     host_backend()
         .systemctl_user(&systemctl_args)
@@ -10383,22 +10666,6 @@ fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
 }
 
 fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
-    // See start_auto_update_unit for rationale; use the same D-Bus path for
-    // restart operations, with a systemctl fallback when busctl is missing.
-    let busctl_args = vec![
-        "call".to_string(),
-        "org.freedesktop.systemd1".to_string(),
-        "/org/freedesktop/systemd1".to_string(),
-        "org.freedesktop.systemd1.Manager".to_string(),
-        "RestartUnit".to_string(),
-        "ss".to_string(),
-        unit.to_string(),
-        "replace".to_string(),
-    ];
-    if let Ok(result) = host_backend().busctl_user(&busctl_args) {
-        return Ok(result);
-    }
-
     let systemctl_args = vec!["restart".to_string(), unit.to_string()];
     host_backend()
         .systemctl_user(&systemctl_args)
@@ -10418,13 +10685,6 @@ impl UnitOperationPurpose {
             Self::Restart => "restart",
         }
     }
-
-    fn busctl_method(self) -> &'static str {
-        match self {
-            Self::Start => "StartUnit",
-            Self::Restart => "RestartUnit",
-        }
-    }
 }
 
 struct UnitOperationRun {
@@ -10432,7 +10692,6 @@ struct UnitOperationRun {
     purpose: UnitOperationPurpose,
     command: String,
     argv: Vec<String>,
-    runner_command: Option<String>,
     result: Result<CommandExecResult, String>,
 }
 
@@ -10445,32 +10704,6 @@ fn run_unit_operation(unit: &str, purpose: UnitOperationPurpose) -> UnitOperatio
         unit.to_string(),
     ];
 
-    let busctl_runner_command = format!(
-        "busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager {} ss {unit} replace",
-        purpose.busctl_method()
-    );
-
-    let busctl_args = vec![
-        "call".to_string(),
-        "org.freedesktop.systemd1".to_string(),
-        "/org/freedesktop/systemd1".to_string(),
-        "org.freedesktop.systemd1.Manager".to_string(),
-        purpose.busctl_method().to_string(),
-        "ss".to_string(),
-        unit.to_string(),
-        "replace".to_string(),
-    ];
-    if let Ok(result) = host_backend().busctl_user(&busctl_args) {
-        return UnitOperationRun {
-            runner: "busctl",
-            purpose,
-            command,
-            argv,
-            runner_command: Some(busctl_runner_command),
-            result: Ok(result),
-        };
-    }
-
     let systemctl_args = vec![purpose.as_str().to_string(), unit.to_string()];
     let result = host_backend()
         .systemctl_user(&systemctl_args)
@@ -10481,7 +10714,6 @@ fn run_unit_operation(unit: &str, purpose: UnitOperationPurpose) -> UnitOperatio
         purpose,
         command,
         argv,
-        runner_command: None,
         result,
     }
 }
@@ -10498,16 +10730,18 @@ impl UnitHealthVerdict {
     fn task_status(self) -> &'static str {
         match self {
             UnitHealthVerdict::Healthy => "succeeded",
-            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => "unknown",
-            UnitHealthVerdict::Failed => "failed",
+            UnitHealthVerdict::Degraded
+            | UnitHealthVerdict::Unknown
+            | UnitHealthVerdict::Failed => "failed",
         }
     }
 
     fn log_level(self) -> &'static str {
         match self {
             UnitHealthVerdict::Healthy => "info",
-            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => "warning",
-            UnitHealthVerdict::Failed => "error",
+            UnitHealthVerdict::Degraded
+            | UnitHealthVerdict::Unknown
+            | UnitHealthVerdict::Failed => "error",
         }
     }
 }
@@ -10577,7 +10811,7 @@ fn evaluate_unit_health(props: &HashMap<String, String>) -> UnitHealthVerdict {
     UnitHealthVerdict::Healthy
 }
 
-fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict, String) {
+fn unit_health_check_outcome(unit: &str) -> (UnitHealthVerdict, String, Value) {
     // Quadlet/podman container units can legitimately take >5s to settle after a
     // restart because the stop+start cycle is async (especially when the unit
     // is still in ActiveState=deactivating/activating). Give it a larger
@@ -10650,7 +10884,7 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
         break outcome;
     };
 
-    let (verdict, summary, meta) = match outcome {
+    match outcome {
         Ok(result) => {
             let props = if result.success() {
                 last_props
@@ -10707,7 +10941,7 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
             });
 
             let meta = build_command_meta(&command, &argv, &result, Some(extra_meta));
-            (verdict, summary.clone(), meta)
+            (verdict, summary, meta)
         }
         Err(err) => {
             let verdict = UnitHealthVerdict::Unknown;
@@ -10723,7 +10957,11 @@ fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict
             });
             (verdict, summary.clone(), meta)
         }
-    };
+    }
+}
+
+fn append_unit_health_check_log(task_id: &str, unit: &str) -> (UnitHealthVerdict, String) {
+    let (verdict, summary, meta) = unit_health_check_outcome(unit);
 
     append_task_log(
         task_id,
@@ -10810,7 +11048,6 @@ fn build_unit_operation_command_meta(
     purpose: UnitOperationPurpose,
     command: &str,
     argv: &[String],
-    runner_command: Option<&str>,
     outcome: &Result<CommandExecResult, String>,
     result_status: &str,
     result_message: &Option<String>,
@@ -10825,10 +11062,6 @@ fn build_unit_operation_command_meta(
         "result_status": result_status,
         "result_message": result_message,
     });
-
-    if let Some(rc) = runner_command {
-        extra["runner_command"] = Value::String(rc.to_string());
-    }
 
     match outcome {
         Ok(result) => build_command_meta(command, &argv_refs, result, Some(extra)),
@@ -11077,16 +11310,52 @@ fn run_background_task(
             log_message(&format!(
                 "500 github-image-pull-failed unit={unit} image={image} event={event} delivery={delivery} path={path} err={err}"
             ));
-            update_task_state_with_unit(
+            let pull_command = format!("podman pull {image}");
+            let pull_argv = ["podman", "pull", image];
+            let meta = merge_task_meta(
+                json!({
+                    "type": "command",
+                    "command": pull_command,
+                    "argv": pull_argv,
+                    "error": err,
+                }),
+                json!({ "unit": unit, "image": image, "event": event, "delivery": delivery, "path": path }),
+            );
+            append_task_log(
+                task_id,
+                "error",
+                "image-pull",
+                "failed",
+                "Image pull failed",
+                Some(unit),
+                meta,
+            );
+
+            update_task_state_with_unit_error(
                 task_id,
                 "failed",
                 unit,
                 "failed",
-                "Image pull failed for github webhook task",
-                "image-pull",
+                "Github webhook task failed (image pull error)",
+                Some(&truncate_unit_error_summary(&err)),
+                "github-webhook-run",
                 "error",
-                json!({ "error": err, "image": image, "event": event, "delivery": delivery, "path": path }),
+                json!({ "unit": unit, "image": image, "event": event, "delivery": delivery, "path": path }),
             );
+
+            for entry in
+                capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env())
+            {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
             return Ok(());
         }
     };
@@ -11113,16 +11382,41 @@ fn run_background_task(
         });
         let meta = build_command_meta(&command, &argv, &pull_result, Some(extra_meta));
 
-        update_task_state_with_unit(
+        append_task_log(
+            task_id,
+            "error",
+            "image-pull",
+            "failed",
+            "Image pull failed",
+            Some(unit),
+            meta,
+        );
+
+        update_task_state_with_unit_error(
             task_id,
             "failed",
             unit,
             "failed",
-            "Image pull failed for github webhook task",
-            "image-pull",
+            "Github webhook task failed (image pull failed)",
+            Some(&truncate_unit_error_summary(&error_message)),
+            "github-webhook-run",
             "error",
-            meta,
+            json!({ "unit": unit, "image": image, "event": event, "delivery": delivery, "path": path }),
         );
+
+        for entry in
+            capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env())
+        {
+            append_task_log(
+                task_id,
+                entry.level,
+                entry.action,
+                entry.status,
+                &entry.summary,
+                Some(&entry.unit),
+                entry.meta,
+            );
+        }
         return Ok(());
     }
 
@@ -11151,109 +11445,130 @@ fn run_background_task(
     );
 
     update_task_unit_phase(task_id, unit, "restarting");
-    let restart_command = format!("systemctl --user restart {unit}");
-    let restart_argv = ["systemctl", "--user", "restart", unit];
+    let run = run_unit_operation(unit, UnitOperationPurpose::Restart);
+    let op_result = unit_action_result_from_operation(unit, &run.result);
+    let mut unit_status = match op_result.status.as_str() {
+        "triggered" => "succeeded",
+        _ => "failed",
+    };
+    let mut task_status = unit_status;
+    let mut unit_error = match &run.result {
+        Ok(res) => unit_error_summary_from_command_result(res),
+        Err(err) => unit_error_summary_from_exec_error(err),
+    };
 
-    match restart_unit(unit) {
-        Ok(result) if result.success() => {
-            log_message(&format!(
-                "202 github-triggered unit={unit} image={image} event={event} delivery={delivery} path={path}"
-            ));
-            let extra_meta = json!({
-                "status": "ok",
-                "image": image,
-                "event": event,
-                "delivery": delivery,
-                "path": path,
-            });
-            let meta =
-                build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
+    let restart_meta = build_unit_operation_command_meta(
+        unit,
+        Some(image),
+        run.runner,
+        run.purpose,
+        &run.command,
+        &run.argv,
+        &run.result,
+        &op_result.status,
+        &op_result.message,
+    );
+    append_task_log(
+        task_id,
+        if unit_status == "failed" {
+            "error"
+        } else {
+            "info"
+        },
+        "restart-unit",
+        unit_status,
+        if unit_status == "failed" {
+            "Restart unit failed"
+        } else {
+            "Restart unit succeeded"
+        },
+        Some(unit),
+        restart_meta,
+    );
 
-            update_task_unit_phase(task_id, unit, "verifying");
-            let (verdict, health_summary) = append_unit_health_check_log(task_id, unit);
-            match verdict {
-                UnitHealthVerdict::Healthy => update_task_state_with_unit(
-                    task_id,
-                    "succeeded",
-                    unit,
-                    "succeeded",
-                    "Github webhook task completed successfully",
-                    "restart-unit",
-                    "info",
-                    meta,
-                ),
-                UnitHealthVerdict::Failed => update_task_state_with_unit_error(
-                    task_id,
-                    "failed",
-                    unit,
-                    "failed",
-                    "Github webhook task failed (unit unhealthy after restart)",
-                    Some(&health_summary),
-                    "restart-unit",
-                    "error",
-                    meta,
-                ),
-                UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
-                    update_task_state_with_unit_error(
-                        task_id,
-                        "unknown",
-                        unit,
-                        "unknown",
-                        "Github webhook task completed with warnings (unit state uncertain)",
-                        Some(&health_summary),
-                        "restart-unit",
-                        "warning",
-                        meta,
-                    )
-                }
-            };
-            prune_images_for_task(task_id, unit);
+    let mut summary = if unit_status == "failed" {
+        "Github webhook task failed (restart unit failed)".to_string()
+    } else {
+        "Github webhook task completed successfully".to_string()
+    };
+
+    if unit_status != "failed" {
+        update_task_unit_phase(task_id, unit, "verifying");
+        let (verdict, health_summary) = append_unit_health_check_log(task_id, unit);
+        if verdict != UnitHealthVerdict::Healthy {
+            unit_status = "failed";
+            task_status = "failed";
+            unit_error = Some(health_summary.clone());
+            summary = "Github webhook task failed (unit unhealthy after restart)".to_string();
         }
-        Ok(result) => {
-            let mut message = format!(
-                "500 github-restart-failed unit={unit} image={image} event={event} delivery={delivery} path={path} exit={}",
-                exit_code_string(&result.status)
-            );
-            if !result.stderr.is_empty() {
-                message.push_str(" stderr=");
-                message.push_str(&result.stderr);
+    }
+
+    let mut image_verify_status: Option<&'static str> = None;
+    if unit_status != "failed" {
+        update_task_unit_phase(task_id, unit, "image-verify");
+        let verify = run_image_verify_step(task_id, unit, image);
+        image_verify_status = Some(verify.status);
+        match verify.status {
+            "succeeded" => {}
+            "unknown" => {
+                unit_status = "unknown";
+                task_status = "unknown";
+                unit_error = verify.unit_error;
+                summary = "Github webhook task completed with warnings (image verify unavailable)"
+                    .to_string();
             }
-            log_message(&message);
-            let extra_meta = json!({
-                "image": image,
-                "event": event,
-                "delivery": delivery,
-                "path": path,
-            });
-            let meta =
-                build_command_meta(&restart_command, &restart_argv, &result, Some(extra_meta));
-            update_task_state_with_unit(
+            _ => {
+                unit_status = "failed";
+                task_status = "failed";
+                unit_error = verify.unit_error;
+                summary = "Github webhook task failed (image verify failed)".to_string();
+            }
+        }
+    }
+
+    update_task_state_with_unit_error(
+        task_id,
+        task_status,
+        unit,
+        unit_status,
+        &summary,
+        unit_error.as_deref(),
+        "github-webhook-run",
+        match task_status {
+            "failed" => "error",
+            "unknown" => "warning",
+            _ => "info",
+        },
+        json!({
+            "unit": unit,
+            "image": image,
+            "event": event,
+            "delivery": delivery,
+            "path": path,
+            "did_pull": true,
+            "image_verify_status": image_verify_status,
+        }),
+    );
+
+    if task_status == "failed" {
+        for entry in
+            capture_unit_failure_diagnostics(unit, task_diagnostics_journal_lines_from_env())
+        {
+            append_task_log(
                 task_id,
-                "failed",
-                unit,
-                "failed",
-                "Restart unit failed for github webhook task",
-                "restart-unit",
-                "error",
-                meta,
+                entry.level,
+                entry.action,
+                entry.status,
+                &entry.summary,
+                Some(&entry.unit),
+                entry.meta,
             );
         }
-        Err(err) => {
-            log_message(&format!(
-                "500 github-restart-error unit={unit} image={image} event={event} delivery={delivery} path={path} err={err}"
-            ));
-            // For unexpected errors, fall back to a non-command meta payload.
-            update_task_state_with_unit(
-                task_id,
-                "failed",
-                unit,
-                "failed",
-                "Restart unit error for github webhook task",
-                "restart-unit",
-                "error",
-                json!({ "error": err, "image": image, "event": event, "delivery": delivery, "path": path }),
-            );
-        }
+    } else if task_status == "succeeded" {
+        log_message(&format!(
+            "202 github-triggered unit={unit} image={image} event={event} delivery={delivery} path={path}"
+        ));
+        prune_images_for_task(task_id, unit);
     }
 
     Ok(())
@@ -11974,72 +12289,135 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
     }
 
     let manual_auto_update = manual_auto_update_unit();
-    let mut results = Vec::with_capacity(units.len());
-    let mut unit_operation_metas: Vec<Value> = Vec::with_capacity(units.len());
-    let mut unit_operation_purposes: Vec<UnitOperationPurpose> = Vec::with_capacity(units.len());
-    let mut unit_error_summaries: Vec<Option<String>> = Vec::with_capacity(units.len());
-    let diagnostics_enabled = task_diagnostics_enabled();
-    let diagnostics_journal_lines = if diagnostics_enabled {
-        task_diagnostics_journal_lines_from_env()
-    } else {
-        TASK_DIAGNOSTICS_JOURNAL_LINES_DEFAULT
-    };
-    let mut diagnostics_logs: Vec<Vec<PreparedTaskLog>> = Vec::with_capacity(units.len());
+    let diagnostics_journal_lines = task_diagnostics_journal_lines_from_env();
 
-    for unit in &units {
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut unit_results: Vec<Value> = Vec::with_capacity(units.len());
+
+    for unit in units.iter() {
         let purpose = if unit == &manual_auto_update {
             UnitOperationPurpose::Start
         } else {
             UnitOperationPurpose::Restart
         };
-        let run = run_unit_operation(unit, purpose);
-        let unit_result = unit_action_result_from_operation(unit, &run.result);
-        let needs_diagnostics =
-            diagnostics_enabled && matches!(unit_result.status.as_str(), "failed" | "error");
 
-        let meta = build_unit_operation_command_meta(
+        update_task_unit_phase(
+            task_id,
+            unit,
+            match purpose {
+                UnitOperationPurpose::Start => "starting",
+                UnitOperationPurpose::Restart => "restarting",
+            },
+        );
+
+        let run = run_unit_operation(unit, purpose);
+        let op_result = unit_action_result_from_operation(unit, &run.result);
+        let mut unit_status = match op_result.status.as_str() {
+            "triggered" => "succeeded",
+            "failed" | "error" => "failed",
+            other => other,
+        };
+
+        let mut unit_error = match &run.result {
+            Ok(res) => unit_error_summary_from_command_result(res),
+            Err(err) => unit_error_summary_from_exec_error(err),
+        };
+
+        let op_meta = build_unit_operation_command_meta(
             unit,
             None,
             run.runner,
             run.purpose,
             &run.command,
             &run.argv,
-            run.runner_command.as_deref(),
             &run.result,
-            &unit_result.status,
-            &unit_result.message,
+            &op_result.status,
+            &op_result.message,
         );
 
-        let unit_error = match &run.result {
-            Ok(res) => unit_error_summary_from_command_result(res),
-            Err(err) => unit_error_summary_from_exec_error(err),
+        append_task_log(
+            task_id,
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
+            match purpose {
+                UnitOperationPurpose::Start => "start-unit",
+                UnitOperationPurpose::Restart => "restart-unit",
+            },
+            unit_status,
+            if unit_status == "failed" {
+                "Unit operation failed"
+            } else {
+                "Unit operation succeeded"
+            },
+            Some(unit),
+            op_meta,
+        );
+
+        if unit_status != "failed" {
+            update_task_unit_phase(task_id, unit, "verifying");
+            let (verdict, health_summary, health_meta) = unit_health_check_outcome(unit);
+            append_task_log(
+                task_id,
+                verdict.log_level(),
+                "unit-health-check",
+                verdict.task_status(),
+                &health_summary,
+                Some(unit),
+                health_meta,
+            );
+            if verdict != UnitHealthVerdict::Healthy {
+                unit_status = "failed";
+                unit_error = Some(health_summary);
+            }
+        }
+
+        if unit_status == "failed" {
+            for entry in capture_unit_failure_diagnostics(unit, diagnostics_journal_lines) {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
+        }
+
+        let unit_message = if unit_status == "failed" {
+            format!("{} failed", purpose.as_str())
+        } else {
+            format!("{} succeeded", purpose.as_str())
         };
 
-        results.push(unit_result);
-        unit_operation_metas.push(meta);
-        unit_operation_purposes.push(run.purpose);
-        unit_error_summaries.push(unit_error);
-        if needs_diagnostics {
-            diagnostics_logs.push(capture_unit_failure_diagnostics(
-                unit,
-                diagnostics_journal_lines,
-            ));
+        update_task_unit_done(
+            task_id,
+            unit,
+            unit_status,
+            Some(&unit_message),
+            unit_error.as_deref(),
+        );
+
+        if unit_status == "failed" {
+            failed = failed.saturating_add(1);
         } else {
-            diagnostics_logs.push(Vec::new());
+            succeeded = succeeded.saturating_add(1);
         }
+
+        unit_results.push(json!({
+            "unit": unit,
+            "purpose": purpose.as_str(),
+            "status": unit_status,
+            "error": unit_error,
+        }));
     }
 
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    for res in &results {
-        match res.status.as_str() {
-            "triggered" => succeeded = succeeded.saturating_add(1),
-            "dry-run" => {}
-            _ => failed = failed.saturating_add(1),
-        }
-    }
-
-    let total = results.len();
+    let total = succeeded.saturating_add(failed);
     let status = if failed > 0 { "failed" } else { "succeeded" };
     let summary = if failed > 0 {
         format!("{succeeded}/{total} units triggered, {failed} failed")
@@ -12047,166 +12425,21 @@ fn run_manual_trigger_task(task_id: &str) -> Result<(), String> {
         format!("{succeeded}/{total} units triggered")
     };
 
-    let task_id_upd = task_id.to_string();
-    let units_upd = units.clone();
-    let metas_upd = unit_operation_metas;
-    let purposes_upd = unit_operation_purposes;
-    let errors_upd = unit_error_summaries;
-    let diagnostics_upd = diagnostics_logs;
-
-    let _ = with_db(|pool| async move {
-        let mut tx = pool.begin().await?;
-        let now = current_unix_secs() as i64;
-
-        sqlx::query(
-            "UPDATE tasks \
-             SET status = ?, finished_at = COALESCE(finished_at, ?), updated_at = ?, summary = ? \
-             WHERE task_id = ?",
-        )
-        .bind(status)
-        .bind(now)
-        .bind(now)
-        .bind(&summary)
-        .bind(&task_id_upd)
-        .execute(&mut *tx)
-        .await?;
-
-        // Normalise the initial "task-created" log entry so that its status
-        // matches the final task status instead of staying "running"/"pending".
-        sqlx::query(
-            "UPDATE task_logs \
-             SET status = ? \
-             WHERE task_id = ? AND action = 'task-created' AND status IN ('running', 'pending')",
-        )
-        .bind(status)
-        .bind(&task_id_upd)
-        .execute(&mut *tx)
-        .await?;
-
-        for idx in 0..units_upd.len() {
-            let Some(unit) = units_upd.get(idx) else {
-                continue;
-            };
-            let Some(res) = results.get(idx) else {
-                continue;
-            };
-            let Some(meta) = metas_upd.get(idx) else {
-                continue;
-            };
-            let Some(purpose) = purposes_upd.get(idx) else {
-                continue;
-            };
-            let unit_error = errors_upd.get(idx).cloned().unwrap_or(None);
-            let diag_entries = diagnostics_upd.get(idx);
-            let unit_status = match res.status.as_str() {
-                "triggered" => "succeeded",
-                "dry-run" => "skipped",
-                "failed" | "error" => "failed",
-                other => other,
-            };
-
-            sqlx::query(
-                "UPDATE task_units \
-                 SET status = ?, \
-                     phase = 'done', \
-                     finished_at = COALESCE(finished_at, ?), \
-                     duration_ms = COALESCE(duration_ms, (? - COALESCE(started_at, ?)) * 1000), \
-                     message = ?, \
-                     error = ? \
-                 WHERE task_id = ? AND unit = ?",
-            )
-            .bind(unit_status)
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .bind(if unit_status == "failed" {
-                Some(format!("{} failed", purpose.as_str()))
-            } else {
-                None
-            })
-            .bind(if unit_status == "failed" {
-                unit_error
-            } else {
-                None
-            })
-            .bind(&task_id_upd)
-            .bind(unit)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "INSERT INTO task_logs \
-                 (task_id, ts, level, action, status, summary, unit, meta) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&task_id_upd)
-            .bind(now)
-            .bind(if unit_status == "failed" {
-                "error"
-            } else {
-                "info"
-            })
-            .bind("manual-trigger-unit-run")
-            .bind(unit_status)
-            .bind(if unit_status == "failed" {
-                format!("Manual trigger unit {} failed", purpose.as_str())
-            } else {
-                format!("Manual trigger unit {} succeeded", purpose.as_str())
-            })
-            .bind(Some(unit.clone()))
-            .bind(serde_json::to_string(meta).unwrap_or_else(|_| "{}".to_string()))
-            .execute(&mut *tx)
-            .await?;
-
-            if let Some(diag_entries) = diag_entries {
-                for entry in diag_entries {
-                    sqlx::query(
-                        "INSERT INTO task_logs \
-                         (task_id, ts, level, action, status, summary, unit, meta) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(&task_id_upd)
-                    .bind(now)
-                    .bind(entry.level)
-                    .bind(entry.action)
-                    .bind(entry.status)
-                    .bind(&entry.summary)
-                    .bind(Some(unit.clone()))
-                    .bind(serde_json::to_string(&entry.meta).unwrap_or_else(|_| "{}".to_string()))
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-        }
-
-        sqlx::query(
-            "INSERT INTO task_logs \
-             (task_id, ts, level, action, status, summary, unit, meta) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&task_id_upd)
-        .bind(now)
-        .bind(if failed > 0 { "warning" } else { "info" })
-        .bind("manual-trigger-run")
-        .bind(status)
-        .bind(&summary)
-        .bind(Option::<String>::None)
-        .bind(
-            serde_json::to_string(&merge_task_meta(
-                json!({
-                    "units": units_upd,
-                    "results": results,
-                }),
-                host_backend_meta(),
-            ))
-            .unwrap_or_else(|_| "{}".to_string()),
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok::<(), sqlx::Error>(())
-    });
+    finalize_task_status(task_id, status, &summary);
+    append_task_log(
+        task_id,
+        if failed > 0 { "warning" } else { "info" },
+        "manual-trigger-run",
+        status,
+        &summary,
+        None,
+        json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": unit_results,
+        }),
+    );
 
     Ok(())
 }
@@ -12341,12 +12574,7 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let diagnostics_enabled = task_diagnostics_enabled();
-    let diagnostics_journal_lines = if diagnostics_enabled {
-        task_diagnostics_journal_lines_from_env()
-    } else {
-        0
-    };
+    let diagnostics_journal_lines = task_diagnostics_journal_lines_from_env();
 
     let mut succeeded = 0usize;
     let mut failed = 0usize;
@@ -12394,6 +12622,17 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
                     Some("image-pull failed"),
                     Some(&error_summary),
                 );
+                for entry in capture_unit_failure_diagnostics(&unit, diagnostics_journal_lines) {
+                    append_task_log(
+                        task_id,
+                        entry.level,
+                        entry.action,
+                        entry.status,
+                        &entry.summary,
+                        Some(&entry.unit),
+                        entry.meta,
+                    );
+                }
                 failed = failed.saturating_add(1);
                 unit_results.push(json!({
                     "unit": unit,
@@ -12434,6 +12673,17 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
                 Some("image-pull failed"),
                 Some(&error_summary),
             );
+            for entry in capture_unit_failure_diagnostics(&unit, diagnostics_journal_lines) {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
             failed = failed.saturating_add(1);
             unit_results.push(json!({
                 "unit": unit,
@@ -12485,7 +12735,6 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
             run.purpose,
             &run.command,
             &run.argv,
-            run.runner_command.as_deref(),
             &run.result,
             &op_result.status,
             &op_result.message,
@@ -12518,13 +12767,29 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
                     unit_error = Some(health_summary);
                 }
                 UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
-                    unit_status = "unknown";
+                    unit_status = "failed";
                     unit_error = Some(health_summary);
                 }
             }
         }
 
-        if unit_status == "failed" && diagnostics_enabled {
+        if unit_status != "failed" {
+            update_task_unit_phase(task_id, &unit, "image-verify");
+            let verify = run_image_verify_step(task_id, &unit, &image);
+            match verify.status {
+                "succeeded" => {}
+                "unknown" => {
+                    unit_status = "unknown";
+                    unit_error = verify.unit_error;
+                }
+                _ => {
+                    unit_status = "failed";
+                    unit_error = verify.unit_error;
+                }
+            }
+        }
+
+        if unit_status == "failed" {
             for entry in capture_unit_failure_diagnostics(&unit, diagnostics_journal_lines) {
                 append_task_log(
                     task_id,
@@ -12611,25 +12876,63 @@ fn run_manual_deploy_task(task_id: &str) -> Result<(), String> {
 
 fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Result<(), String> {
     let unit_owned = unit.to_string();
+    let mut did_pull = false;
+
     if let Some(image) = image {
         update_task_unit_phase(task_id, &unit_owned, "pulling-image");
+        let command = format!("podman pull {image}");
+        let argv = ["podman", "pull", image];
         let pull_result = match pull_container_image(image) {
             Ok(res) => res,
             Err(err) => {
                 log_message(&format!(
                     "500 manual-service-image-pull-failed unit={unit_owned} image={image} err={err}"
                 ));
-                let meta = json!({ "unit": unit_owned, "image": image, "error": err });
-                update_task_state_with_unit(
+                let meta = merge_task_meta(
+                    json!({
+                        "type": "command",
+                        "command": command,
+                        "argv": argv,
+                        "error": err,
+                    }),
+                    json!({ "unit": unit_owned, "image": image }),
+                );
+                append_task_log(
+                    task_id,
+                    "error",
+                    "image-pull",
+                    "failed",
+                    "Image pull failed",
+                    Some(&unit_owned),
+                    meta,
+                );
+
+                update_task_state_with_unit_error(
                     task_id,
                     "failed",
                     &unit_owned,
                     "failed",
-                    "Manual service image pull failed",
-                    "image-pull",
+                    "Manual service task failed (image pull error)",
+                    Some(&truncate_unit_error_summary(&err)),
+                    "manual-service-run",
                     "error",
-                    meta,
+                    json!({ "unit": unit_owned, "image": image }),
                 );
+
+                for entry in capture_unit_failure_diagnostics(
+                    &unit_owned,
+                    task_diagnostics_journal_lines_from_env(),
+                ) {
+                    append_task_log(
+                        task_id,
+                        entry.level,
+                        entry.action,
+                        entry.status,
+                        &entry.summary,
+                        Some(&entry.unit),
+                        entry.meta,
+                    );
+                }
                 return Ok(());
             }
         };
@@ -12645,30 +12948,51 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
                 "500 manual-service-image-pull-failed unit={unit_owned} image={image} err={error_message}"
             ));
 
-            let command = format!("podman pull {image}");
-            let argv = ["podman", "pull", image];
             let extra_meta = json!({
                 "unit": unit_owned,
                 "image": image,
                 "error": error_message,
             });
             let meta = build_command_meta(&command, &argv, &pull_result, Some(extra_meta));
+            append_task_log(
+                task_id,
+                "error",
+                "image-pull",
+                "failed",
+                "Image pull failed",
+                Some(&unit_owned),
+                meta,
+            );
 
-            update_task_state_with_unit(
+            update_task_state_with_unit_error(
                 task_id,
                 "failed",
                 &unit_owned,
                 "failed",
-                "Manual service image pull failed",
-                "image-pull",
+                "Manual service task failed (image pull failed)",
+                Some(&truncate_unit_error_summary(&error_message)),
+                "manual-service-run",
                 "error",
-                meta,
+                json!({ "unit": unit_owned, "image": image }),
             );
+
+            for entry in capture_unit_failure_diagnostics(
+                &unit_owned,
+                task_diagnostics_journal_lines_from_env(),
+            ) {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
             return Ok(());
         }
 
-        let command = format!("podman pull {image}");
-        let argv = ["podman", "pull", image];
         let extra_meta = json!({
             "unit": unit_owned.clone(),
             "image": image,
@@ -12683,6 +13007,7 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
             Some(&unit_owned),
             meta,
         );
+        did_pull = true;
     } else {
         append_task_log(
             task_id,
@@ -12698,7 +13023,15 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         );
     }
 
-    update_task_unit_phase(task_id, &unit_owned, "restarting");
+    update_task_unit_phase(
+        task_id,
+        &unit_owned,
+        if unit_owned == manual_auto_update_unit() {
+            "starting"
+        } else {
+            "restarting"
+        },
+    );
     let purpose = if unit_owned == manual_auto_update_unit() {
         UnitOperationPurpose::Start
     } else {
@@ -12717,23 +13050,36 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
     } else {
         "succeeded"
     };
-    let mut summary = if unit_status == "failed" {
-        "Manual service task failed".to_string()
-    } else {
-        "Manual service task succeeded".to_string()
-    };
-
-    let meta = build_unit_operation_command_meta(
+    let op_meta = build_unit_operation_command_meta(
         &unit_owned,
         image,
         run.runner,
         run.purpose,
         &run.command,
         &run.argv,
-        run.runner_command.as_deref(),
         &run.result,
         &result.status,
         &result.message,
+    );
+    append_task_log(
+        task_id,
+        if unit_status == "failed" {
+            "error"
+        } else {
+            "info"
+        },
+        match purpose {
+            UnitOperationPurpose::Start => "start-unit",
+            UnitOperationPurpose::Restart => "restart-unit",
+        },
+        unit_status,
+        if unit_status == "failed" {
+            "Unit operation failed"
+        } else {
+            "Unit operation succeeded"
+        },
+        Some(&unit_owned),
+        op_meta,
     );
 
     let mut unit_error = if unit_status == "failed" {
@@ -12748,23 +13094,40 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
     if unit_status != "failed" {
         update_task_unit_phase(task_id, &unit_owned, "verifying");
         let (verdict, health_summary) = append_unit_health_check_log(task_id, &unit_owned);
-        match verdict {
-            UnitHealthVerdict::Healthy => {}
-            UnitHealthVerdict::Failed => {
-                unit_status = "failed";
-                task_status = "failed";
-                summary = "Manual service task failed (unit unhealthy after restart)".to_string();
-                unit_error = Some(health_summary);
-            }
-            UnitHealthVerdict::Degraded | UnitHealthVerdict::Unknown => {
-                unit_status = "unknown";
-                task_status = "unknown";
-                summary = "Manual service task completed with warnings (unit state uncertain)"
-                    .to_string();
-                unit_error = Some(health_summary);
+        if verdict != UnitHealthVerdict::Healthy {
+            unit_status = "failed";
+            task_status = "failed";
+            unit_error = Some(health_summary);
+        }
+    }
+
+    let mut image_verify_status: Option<&'static str> = None;
+    if unit_status != "failed" && did_pull {
+        if let Some(image_ref) = image {
+            update_task_unit_phase(task_id, &unit_owned, "image-verify");
+            let verify = run_image_verify_step(task_id, &unit_owned, image_ref);
+            image_verify_status = Some(verify.status);
+            match verify.status {
+                "succeeded" => {}
+                "unknown" => {
+                    unit_status = "unknown";
+                    task_status = "unknown";
+                    unit_error = verify.unit_error;
+                }
+                _ => {
+                    unit_status = "failed";
+                    task_status = "failed";
+                    unit_error = verify.unit_error;
+                }
             }
         }
     }
+
+    let summary = match task_status {
+        "succeeded" => "Manual service task succeeded".to_string(),
+        "failed" => "Manual service task failed".to_string(),
+        _ => "Manual service task completed with warnings (image verify unavailable)".to_string(),
+    };
 
     update_task_state_with_unit_error(
         task_id,
@@ -12774,12 +13137,17 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
         &summary,
         unit_error.as_deref(),
         "manual-service-run",
-        match unit_status {
+        match task_status {
             "failed" => "error",
             "unknown" => "warning",
             _ => "info",
         },
-        meta,
+        json!({
+            "unit": unit_owned,
+            "image": image,
+            "did_pull": did_pull,
+            "image_verify_status": image_verify_status,
+        }),
     );
 
     if unit_status == "failed" {
@@ -14414,6 +14782,54 @@ mod tests {
         let _lock = env_test_lock();
         init_test_db_with_systemctl_mock();
 
+        set_env("PODUP_ENV", "test");
+        set_env(
+            "PODUP_REGISTRY_DIGEST_MOCK",
+            &json!({
+                "ghcr.io/example/svc-alpha:latest": "sha256:bbbbbbbb",
+                "ghcr.io/example/svc-beta:latest": "sha256:bbbbbbbb"
+            })
+            .to_string(),
+        );
+        set_env(
+            "MOCK_PODMAN_PS_JSON",
+            &json!([
+                {
+                    "Id": "cid-alpha",
+                    "Created": 1000,
+                    "State": "running",
+                    "ImageID": "img-alpha",
+                    "Labels": { "io.podman.systemd.unit": "svc-alpha.service" }
+                },
+                {
+                    "Id": "cid-beta",
+                    "Created": 1001,
+                    "State": "running",
+                    "ImageID": "img-beta",
+                    "Labels": { "io.podman.systemd.unit": "svc-beta.service" }
+                }
+            ])
+            .to_string(),
+        );
+        set_env(
+            "MOCK_PODMAN_IMAGE_INSPECT_JSON",
+            &json!([
+                {
+                    "Id": "img-alpha",
+                    "RepoTags": ["ghcr.io/example/svc-alpha:latest"],
+                    "RepoDigests": ["ghcr.io/example/svc-alpha@sha256:bbbbbbbb"],
+                    "Digest": "sha256:bbbbbbbb"
+                },
+                {
+                    "Id": "img-beta",
+                    "RepoTags": ["ghcr.io/example/svc-beta:latest"],
+                    "RepoDigests": ["ghcr.io/example/svc-beta@sha256:bbbbbbbb"],
+                    "Digest": "sha256:bbbbbbbb"
+                }
+            ])
+            .to_string(),
+        );
+
         let units = vec![
             ManualDeployUnitSpec {
                 unit: "svc-alpha.service".to_string(),
@@ -14459,26 +14875,19 @@ mod tests {
             "expected podman pull for svc-beta, log:\n{log_contents}"
         );
 
-        // Restart is performed via busctl when available, with systemctl as a fallback.
-        let alpha_restart = log_contents.contains("busctl --user call")
-            && log_contents.contains("RestartUnit")
-            && log_contents.contains("svc-alpha.service");
-        let beta_restart = log_contents.contains("busctl --user call")
-            && log_contents.contains("RestartUnit")
-            && log_contents.contains("svc-beta.service");
-        let alpha_restart_systemctl =
-            log_contents.contains("systemctl --user restart svc-alpha.service");
-        let beta_restart_systemctl =
-            log_contents.contains("systemctl --user restart svc-beta.service");
+        assert!(
+            log_contents.contains("systemctl --user restart svc-alpha.service"),
+            "expected systemctl restart for svc-alpha.service, log:\n{log_contents}"
+        );
+        assert!(
+            log_contents.contains("systemctl --user restart svc-beta.service"),
+            "expected systemctl restart for svc-beta.service, log:\n{log_contents}"
+        );
 
-        assert!(
-            alpha_restart || alpha_restart_systemctl,
-            "expected restart for svc-alpha via busctl or systemctl, log:\n{log_contents}"
-        );
-        assert!(
-            beta_restart || beta_restart_systemctl,
-            "expected restart for svc-beta via busctl or systemctl, log:\n{log_contents}"
-        );
+        remove_env("MOCK_PODMAN_PS_JSON");
+        remove_env("MOCK_PODMAN_IMAGE_INSPECT_JSON");
+        remove_env("PODUP_REGISTRY_DIGEST_MOCK");
+        remove_env("PODUP_ENV");
     }
 
     #[test]
@@ -14540,50 +14949,55 @@ mod tests {
         let _lock = env_test_lock();
         init_test_db_with_systemctl_mock();
 
-        // Force systemctl runner by hiding busctl from PATH so MOCK_SYSTEMCTL_FAIL applies.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let mock_src = Path::new(manifest_dir).join("tests").join("mock-bin");
-        let isolated = tempfile::tempdir().unwrap();
-        for name in ["podman", "systemctl", "journalctl"] {
-            let src = mock_src.join(name);
-            let dst = isolated.path().join(name);
-            fs::copy(&src, &dst).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&dst).unwrap().permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&dst, perms).unwrap();
-            }
-        }
-        // The mock-bin scripts use `dirname` and `mkdir`. When we constrain PATH
-        // to hide `busctl`, provide a minimal `dirname` shim in the isolated
-        // PATH so the scripts still run.
-        let dirname_path = isolated.path().join("dirname");
-        fs::write(
-            &dirname_path,
-            r#"#!/bin/sh
-path="${1:-}"
-case "$path" in
-  */*) echo "${path%/*}" ;;
-  *) echo "." ;;
-esac
-"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&dirname_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&dirname_path, perms).unwrap();
-        }
-        let old_path = env::var("PATH").unwrap_or_default();
-        let isolated_path = format!("{}:/bin", isolated.path().to_string_lossy());
-        set_env("PATH", &isolated_path);
+        set_env("PODUP_ENV", "test");
+        set_env(
+            "PODUP_REGISTRY_DIGEST_MOCK",
+            &json!({
+                "ghcr.io/example/svc-alpha:latest": "sha256:bbbbbbbb",
+                "ghcr.io/example/svc-beta:latest": "sha256:bbbbbbbb"
+            })
+            .to_string(),
+        );
+        set_env(
+            "MOCK_PODMAN_PS_JSON",
+            &json!([
+                {
+                    "Id": "cid-alpha",
+                    "Created": 1000,
+                    "State": "running",
+                    "ImageID": "img-alpha",
+                    "Labels": { "io.podman.systemd.unit": "svc-alpha.service" }
+                },
+                {
+                    "Id": "cid-beta",
+                    "Created": 1001,
+                    "State": "running",
+                    "ImageID": "img-beta",
+                    "Labels": { "io.podman.systemd.unit": "svc-beta.service" }
+                }
+            ])
+            .to_string(),
+        );
+        set_env(
+            "MOCK_PODMAN_IMAGE_INSPECT_JSON",
+            &json!([
+                {
+                    "Id": "img-alpha",
+                    "RepoTags": ["ghcr.io/example/svc-alpha:latest"],
+                    "RepoDigests": ["ghcr.io/example/svc-alpha@sha256:bbbbbbbb"],
+                    "Digest": "sha256:bbbbbbbb"
+                },
+                {
+                    "Id": "img-beta",
+                    "RepoTags": ["ghcr.io/example/svc-beta:latest"],
+                    "RepoDigests": ["ghcr.io/example/svc-beta@sha256:bbbbbbbb"],
+                    "Digest": "sha256:bbbbbbbb"
+                }
+            ])
+            .to_string(),
+        );
 
         set_env("MOCK_SYSTEMCTL_FAIL", "svc-alpha.service");
-        set_env(super::ENV_TASK_DIAGNOSTICS, "1");
 
         let units = vec![
             ManualDeployUnitSpec {
@@ -14647,15 +15061,13 @@ esac
 
         assert_eq!(task_status, "failed");
         assert_eq!(alpha_status, "failed");
-        assert!(
-            diag_count > 0,
-            "expected diagnostics logs for failing unit when diagnostics enabled"
-        );
+        assert!(diag_count > 0, "expected diagnostics logs for failing unit");
 
-        // Restore environment.
-        set_env("PATH", &old_path);
         remove_env("MOCK_SYSTEMCTL_FAIL");
-        remove_env(super::ENV_TASK_DIAGNOSTICS);
+        remove_env("MOCK_PODMAN_PS_JSON");
+        remove_env("MOCK_PODMAN_IMAGE_INSPECT_JSON");
+        remove_env("PODUP_REGISTRY_DIGEST_MOCK");
+        remove_env("PODUP_ENV");
     }
 
     #[test]
