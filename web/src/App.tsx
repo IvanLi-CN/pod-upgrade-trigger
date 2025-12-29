@@ -131,7 +131,7 @@ export function TopStatusBar() {
 					{currentVersionLabel}
 				</span>
 				{showNewVersion ? (
-					<div className="dropdown">
+					<div className="dropdown flex items-center">
 						<button
 							type="button"
 							className="badge badge-warning badge-sm gap-1"
