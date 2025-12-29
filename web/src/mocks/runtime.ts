@@ -645,6 +645,231 @@ function buildTasks(
 		],
 	);
 
+	// Image verify demo: remote digest unavailable => UI should show "unknown" and error details.
+	addTask(
+		{
+			kind: "manual",
+			status: "succeeded",
+			created_at: baseTs + 660,
+			started_at: baseTs + 662,
+			finished_at: baseTs + 680,
+			updated_at: baseTs + 680,
+			summary: "Image verify demo · remote digest unavailable (svc-alpha)",
+			trigger: {
+				source: "manual",
+				path: "/api/manual/deploy",
+				caller: "ui-e2e",
+				reason: "image-verify remote_error demo",
+			},
+			can_stop: false,
+			can_force_stop: false,
+			can_retry: true,
+			is_long_running: false,
+			retry_of: null,
+			units: [
+				{
+					unit: "svc-alpha.service",
+					slug: "svc-alpha",
+					display_name: "Alpha Deploy",
+					status: "succeeded",
+					phase: "done",
+					started_at: baseTs + 662,
+					finished_at: baseTs + 680,
+					duration_ms: 18_000,
+					message: "deployed successfully (remote digest unavailable)",
+				},
+			],
+		},
+		[
+			{
+				ts: baseTs + 662,
+				level: "info",
+				action: "task-created",
+				status: "succeeded",
+				summary: "Manual task accepted from UI",
+				unit: null,
+				meta: { caller: "ui-e2e", reason: "image-verify remote_error demo" },
+			},
+			{
+				ts: baseTs + 668,
+				level: "info",
+				action: "image-pull",
+				status: "succeeded",
+				summary: "Pulled latest images for svc-alpha",
+				unit: null,
+				meta: {
+					type: "command",
+					command: "podman pull ghcr.io/example/svc-alpha:main",
+					argv: ["podman", "pull", "ghcr.io/example/svc-alpha:main"],
+					stdout: "pulling from registry.example...\ncomplete",
+					stderr: "",
+					exit: "exit=0",
+					units: ["svc-alpha.service"],
+				},
+			},
+			{
+				ts: baseTs + 672,
+				level: "info",
+				action: "restart-unit",
+				status: "succeeded",
+				summary: "Restarted svc-alpha.service",
+				unit: null,
+				meta: {
+					type: "command",
+					command: "systemctl --user restart svc-alpha.service",
+					argv: ["systemctl", "--user", "restart", "svc-alpha.service"],
+					stdout: "restarted svc-alpha.service",
+					stderr: "",
+					exit: "exit=0",
+					ok: ["svc-alpha.service"],
+				},
+			},
+			{
+				ts: baseTs + 674,
+				level: "info",
+				action: "unit-health-check",
+				status: "succeeded",
+				summary: "Unit health check: Healthy",
+				unit: "svc-alpha.service",
+				meta: {
+					type: "command",
+					command:
+						"systemctl --user show svc-alpha.service --property=ActiveState,SubState",
+					argv: [
+						"systemctl",
+						"--user",
+						"show",
+						"svc-alpha.service",
+						"--property=ActiveState,SubState",
+					],
+					stdout: "ActiveState=active\nSubState=running\n",
+					stderr: "",
+					exit: "exit=0",
+					unit: "svc-alpha.service",
+					purpose: "health-check",
+				},
+			},
+			{
+				ts: baseTs + 676,
+				level: "warning",
+				action: "image-verify",
+				status: "succeeded",
+				summary: "Image verify: remote digest unavailable (best-effort)",
+				unit: "svc-alpha.service",
+				meta: {
+					unit: "svc-alpha.service",
+					image: "ghcr.io/example/svc-alpha:main",
+					platform: { os: "linux", arch: "amd64", variant: null },
+					remote_index_digest: null,
+					remote_platform_digest: null,
+					pulled_digest:
+						"sha256:3333333333333333333333333333333333333333333333333333333333333333",
+					running_digest:
+						"sha256:3333333333333333333333333333333333333333333333333333333333333333",
+					remote_error:
+						"registry.example: 503 Service Unavailable (remote digest lookup failed)",
+					local_error: null,
+					result_status: "unknown",
+					result_message:
+						"remote=unavailable pulled=sha256:3333… running=sha256:3333…",
+				},
+			},
+		],
+	);
+
+	// No image-pull => no image-verify step; UI must not render the tri-digest block.
+	addTask(
+		{
+			kind: "manual",
+			status: "succeeded",
+			created_at: baseTs + 690,
+			started_at: baseTs + 692,
+			finished_at: baseTs + 705,
+			updated_at: baseTs + 705,
+			summary: "Restart-only demo · no pull/no verify (svc-alpha)",
+			trigger: {
+				source: "manual",
+				path: "/api/manual/deploy",
+				caller: "ui-e2e",
+				reason: "no image-pull => no image-verify demo",
+			},
+			can_stop: false,
+			can_force_stop: false,
+			can_retry: true,
+			is_long_running: false,
+			retry_of: null,
+			units: [
+				{
+					unit: "svc-alpha.service",
+					slug: "svc-alpha",
+					display_name: "Alpha Deploy",
+					status: "succeeded",
+					phase: "done",
+					started_at: baseTs + 692,
+					finished_at: baseTs + 705,
+					duration_ms: 13_000,
+					message: "restart completed (no image pull performed)",
+				},
+			],
+		},
+		[
+			{
+				ts: baseTs + 692,
+				level: "info",
+				action: "task-created",
+				status: "succeeded",
+				summary: "Manual task accepted from UI",
+				unit: null,
+				meta: {
+					caller: "ui-e2e",
+					reason: "no image-pull => no image-verify demo",
+				},
+			},
+			{
+				ts: baseTs + 698,
+				level: "info",
+				action: "restart-unit",
+				status: "succeeded",
+				summary: "Restarted svc-alpha.service",
+				unit: null,
+				meta: {
+					type: "command",
+					command: "systemctl --user restart svc-alpha.service",
+					argv: ["systemctl", "--user", "restart", "svc-alpha.service"],
+					stdout: "restarted svc-alpha.service",
+					stderr: "",
+					exit: "exit=0",
+					ok: ["svc-alpha.service"],
+				},
+			},
+			{
+				ts: baseTs + 701,
+				level: "info",
+				action: "unit-health-check",
+				status: "succeeded",
+				summary: "Unit health check: Healthy",
+				unit: "svc-alpha.service",
+				meta: {
+					type: "command",
+					command:
+						"systemctl --user show svc-alpha.service --property=ActiveState,SubState",
+					argv: [
+						"systemctl",
+						"--user",
+						"show",
+						"svc-alpha.service",
+						"--property=ActiveState,SubState",
+					],
+					stdout: "ActiveState=active\nSubState=running\n",
+					stderr: "",
+					exit: "exit=0",
+					unit: "svc-alpha.service",
+					purpose: "health-check",
+				},
+			},
+		],
+	);
+
 	// Deterministic failing manual-service task to exercise meta.result_message rendering.
 	if (profile === "happy-path") {
 		addTask(
