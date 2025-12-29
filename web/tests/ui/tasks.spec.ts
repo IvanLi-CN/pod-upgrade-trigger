@@ -20,6 +20,24 @@ async function resetMockData(page: Parameters<typeof test>[0]['page']) {
   await resetButton.click()
 }
 
+async function openHappyPathTasksPageWithFreshRuntime(
+  page: Parameters<typeof test>[0]['page'],
+) {
+  await page.goto('/tasks?mock=enabled&mock=profile=happy-path')
+  await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+  await expect(page.getByText('任务列表')).toBeVisible()
+
+  await resetMockData(page)
+
+  await page.reload()
+  await page.waitForFunction(() => (window as any).__MOCK_ENABLED__ === true)
+  await expect(page.getByText('任务列表')).toBeVisible()
+
+  const rows = page.locator('table tbody tr')
+  await expect(rows.first()).toBeVisible()
+  return rows
+}
+
 test.describe('Tasks page (mock)', () => {
   test('lists tasks and shows details drawer with units and timeline', async ({ page }) => {
     const rows = await openTasksPage(page)
@@ -72,6 +90,108 @@ test.describe('Tasks page (mock)', () => {
     await expect(
       page.getByText('Restarted svc-alpha.service, svc-beta.service'),
     ).toBeVisible()
+  })
+
+  test('renders image-verify tri-digest (match/unknown) and hides it when absent', async ({
+    page,
+  }) => {
+    const rows = await openHappyPathTasksPageWithFreshRuntime(page)
+
+    const timelineSection = page
+      .locator('section')
+      .filter({ hasText: '日志时间线' })
+      .first()
+
+    const nightlyRow = rows
+      .filter({ hasText: 'nightly manual upgrade' })
+      .first()
+    await expect(nightlyRow).toBeVisible()
+    await nightlyRow.click()
+
+    await expect(timelineSection).toBeVisible()
+    await expect(timelineSection.getByText('image-pull').first()).toBeVisible()
+    await expect(timelineSection.getByText('restart-unit').first()).toBeVisible()
+    await expect(
+      timelineSection.getByText('unit-health-check').first(),
+    ).toBeVisible()
+    await expect(
+      timelineSection.getByText('image-verify').first(),
+    ).toBeVisible()
+
+    const okVerifyCard = timelineSection
+      .locator('div')
+      .filter({ hasText: 'image-verify' })
+      .filter({ hasText: '镜像核验' })
+      .first()
+    await okVerifyCard.scrollIntoViewIfNeeded()
+    await expect(okVerifyCard).toBeVisible()
+    await expect(okVerifyCard.getByText('match', { exact: true })).toBeVisible()
+    await expect(
+      okVerifyCard.getByText('sha256:2222').first(),
+    ).toBeVisible()
+    await expect(
+      okVerifyCard.getByText('matches remote', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      okVerifyCard.getByText('matches pulled', { exact: true }),
+    ).toBeVisible()
+
+    const closeDrawer = page.getByRole('button', { name: '关闭任务详情' })
+    await expect(closeDrawer).toBeVisible()
+    await closeDrawer.click()
+    await expect(closeDrawer).toHaveCount(0)
+
+    const remoteErrorRow = rows
+      .filter({ hasText: 'Image verify demo · remote digest unavailable (svc-alpha)' })
+      .first()
+    await expect(remoteErrorRow).toBeVisible()
+    await remoteErrorRow.click()
+
+    const unknownVerifyCard = timelineSection
+      .locator('div')
+      .filter({ hasText: 'image-verify' })
+      .filter({ hasText: '镜像核验' })
+      .first()
+    await unknownVerifyCard.scrollIntoViewIfNeeded()
+    await expect(unknownVerifyCard).toBeVisible()
+    await expect(
+      unknownVerifyCard.getByText('unknown', { exact: true }),
+    ).toBeVisible()
+    await expect(unknownVerifyCard.getByText('Remote error')).toBeVisible()
+    await expect(
+      unknownVerifyCard.getByText('remote digest unavailable', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      unknownVerifyCard.getByText('503 Service Unavailable'),
+    ).toBeVisible()
+    await expect(
+      unknownVerifyCard.getByText('match', { exact: true }),
+    ).toHaveCount(0)
+    await expect(
+      unknownVerifyCard.getByText('mismatch', { exact: true }),
+    ).toHaveCount(0)
+    await expect(
+      unknownVerifyCard.getByText('matches remote', { exact: true }),
+    ).toHaveCount(0)
+
+    const closeDrawer2 = page.getByRole('button', { name: '关闭任务详情' })
+    await expect(closeDrawer2).toBeVisible()
+    await closeDrawer2.click()
+    await expect(closeDrawer2).toHaveCount(0)
+
+    const noVerifyRow = rows
+      .filter({ hasText: 'Restart-only demo · no pull/no verify (svc-alpha)' })
+      .first()
+    await expect(noVerifyRow).toBeVisible()
+    await noVerifyRow.click()
+
+    await expect(timelineSection).toBeVisible()
+    await expect(timelineSection.getByText('restart-unit').first()).toBeVisible()
+    await expect(
+      timelineSection.getByText('unit-health-check').first(),
+    ).toBeVisible()
+    await expect(timelineSection.getByText('image-verify')).toHaveCount(0)
+    await expect(timelineSection.getByText('镜像核验')).toHaveCount(0)
   })
 
   test('shows command output for command-meta logs in the timeline', async ({ page }) => {

@@ -870,6 +870,7 @@ export default function TasksPage() {
 							<button
 								type="button"
 								className="btn btn-ghost btn-xs"
+								aria-label="关闭任务详情"
 								onClick={handleCloseDrawer}
 							>
 								<Icon icon="mdi:close" className="text-lg" />
