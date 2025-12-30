@@ -40,6 +40,7 @@ async fn e2e_full_suite() -> AnyResult<()> {
     run_scenario!(scenario_manual_service_image_verify_multi_arch);
     run_scenario!(scenario_manual_service_upgrade_requires_digest_switch);
     run_scenario!(scenario_manual_service_upgrade_marks_anomaly_when_digest_unchanged);
+    run_scenario!(scenario_manual_service_upgrade_clone_fallback_create_command);
     run_scenario!(scenario_csrf_guard);
     run_scenario!(scenario_self_update_api);
     run_scenario!(scenario_forwardauth_and_csrf_strict_mode);
@@ -1398,6 +1399,175 @@ async fn scenario_manual_service_upgrade_marks_anomaly_when_digest_unchanged() -
         unit.get("error"),
         Some(&Value::from("digest-unchanged")),
         "anomaly should capture the digest-unchanged reason"
+    );
+
+    Ok(())
+}
+
+async fn scenario_manual_service_upgrade_clone_fallback_create_command() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("blog-blog.container"),
+        b"[Container]\nImage=ghcr.io/koha/blog:oldtag\n",
+    )?;
+
+    let unit_dir = env.state_dir.join("mock-systemd-units");
+    fs::create_dir_all(&unit_dir)?;
+    fs::write(
+        unit_dir.join("blog-blog.service"),
+        b"[Service]\nExecStart=/usr/bin/podman start blog-blog\n",
+    )?;
+
+    // Clear per-request mock state markers used by tests/mock-bin/podman.
+    let mock_state_dir = env.state_dir.join("mock-podman");
+    let _ = fs::remove_file(mock_state_dir.join("ps-once"));
+    let _ = fs::remove_file(mock_state_dir.join("image-inspect-once"));
+
+    let ps_before = json!([
+        {
+            "Id": "cid-blog",
+            "Created": 1000,
+            "State": "running",
+            "ImageID": "img-old",
+            "Image": "ghcr.io/koha/blog:oldtag",
+            "Labels": { "io.podman.systemd.unit": "blog-blog.service" }
+        }
+    ]);
+    let ps_after = json!([
+        {
+            "Id": "cid-blog",
+            "Created": 1000,
+            "State": "running",
+            "ImageID": "img-new",
+            "Image": "ghcr.io/koha/blog:newtag",
+            "Labels": { "io.podman.systemd.unit": "blog-blog.service" }
+        }
+    ]);
+
+    let inspect_before = json!([
+        {
+            "Id": "img-old",
+            "RepoTags": ["ghcr.io/koha/blog:oldtag"],
+            "RepoDigests": ["ghcr.io/koha/blog@sha256:aaaaaaaa"],
+            "Digest": "sha256:aaaaaaaa"
+        }
+    ]);
+    let inspect_after = json!([
+        {
+            "Id": "img-tag",
+            "RepoTags": ["ghcr.io/koha/blog:newtag"],
+            "RepoDigests": ["ghcr.io/koha/blog@sha256:bbbbbbbb"],
+            "Digest": "sha256:bbbbbbbb"
+        },
+        {
+            "Id": "img-new",
+            "RepoDigests": ["ghcr.io/koha/blog@sha256:bbbbbbbb"],
+            "Digest": "sha256:bbbbbbbb"
+        }
+    ]);
+
+    let registry_mock = json!({
+        "ghcr.io/koha/blog:newtag": "sha256:bbbbbbbb"
+    });
+
+    let create_cmd = json!([
+        "podman",
+        "create",
+        "--name",
+        "blog-blog",
+        "--env",
+        "OPENAI_API_KEY=sk-test",
+        "--secret",
+        "jwt,type=env,target=JWT_SECRET",
+        "ghcr.io/koha/blog:oldtag"
+    ]);
+
+    let service_body = json!({
+        "dry_run": false,
+        "caller": "user",
+        "reason": "clone-fallback",
+        "image": ":newtag",
+    });
+
+    let service = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/blog-blog/upgrade")
+            .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
+            .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+            cmd.env("MOCK_SYSTEMCTL_SHOW_FRAGMENT_DIR", &unit_dir);
+            cmd.env("MOCK_PODMAN_CONTAINER_CLONE_FAIL", "1");
+            cmd.env(
+                "MOCK_PODMAN_CONTAINER_INSPECT_CREATE_COMMAND_JSON",
+                create_cmd.to_string(),
+            );
+            cmd.env("MOCK_PODMAN_PS_JSON_BEFORE", ps_before.to_string());
+            cmd.env("MOCK_PODMAN_PS_JSON_AFTER", ps_after.to_string());
+            cmd.env(
+                "MOCK_PODMAN_IMAGE_INSPECT_JSON_BEFORE",
+                inspect_before.to_string(),
+            );
+            cmd.env(
+                "MOCK_PODMAN_IMAGE_INSPECT_JSON_AFTER",
+                inspect_after.to_string(),
+            );
+            cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+        },
+    )?;
+    assert_eq!(service.status, 202);
+    let service_json = service.json_body()?;
+    let task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "manual service upgrade must return task_id"
+    );
+
+    let detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{task_id}")))?;
+    assert_eq!(detail.status, 200);
+    let body = detail.json_body()?;
+    assert_eq!(body["status"], Value::from("succeeded"));
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let clone = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("container-clone")))
+        .expect("task must include container-clone log entry");
+    assert_eq!(clone.get("status"), Some(&Value::from("failed")));
+
+    let inspect = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("container-inspect")))
+        .expect("task must include container-inspect log entry");
+    let inspect_meta = inspect.get("meta").cloned().unwrap_or(Value::Null);
+    assert!(
+        inspect_meta.get("stdout").is_none(),
+        "container-inspect must not log stdout"
+    );
+
+    let created = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("container-create")))
+        .expect("task must include container-create log entry");
+    assert_eq!(created.get("status"), Some(&Value::from("succeeded")));
+    let created_meta = created.get("meta").cloned().unwrap_or(Value::Null);
+    let argv = created_meta
+        .get("argv")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        argv.iter()
+            .any(|v| v.as_str() == Some("OPENAI_API_KEY=***REDACTED***")),
+        "podman create argv must redact env values"
     );
 
     Ok(())

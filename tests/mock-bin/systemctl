@@ -53,6 +53,10 @@ if [[ "$*" =~ --user\ show\ ([^[:space:]]+) ]]; then
   echo "Result=${result}"
   echo "Type=${unit_type}"
   echo "ExecMainStatus=${exec_main_status}"
+  if [[ -n "${MOCK_SYSTEMCTL_SHOW_FRAGMENT_DIR:-}" ]]; then
+    echo "FragmentPath=${MOCK_SYSTEMCTL_SHOW_FRAGMENT_DIR}/${unit}"
+    echo "SourcePath=${MOCK_SYSTEMCTL_SHOW_FRAGMENT_DIR}/${unit}"
+  fi
   exit 0
 fi
 
