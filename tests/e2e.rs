@@ -1080,7 +1080,11 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let pool = env.connect_db().await?;
     let events = env.fetch_events(&pool).await?;
     assert!(events.iter().any(|row| row.action == "manual-trigger"));
-    assert!(events.iter().any(|row| row.action == "manual-service-upgrade"));
+    assert!(
+        events
+            .iter()
+            .any(|row| row.action == "manual-service-upgrade")
+    );
 
     Ok(())
 }

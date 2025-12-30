@@ -6891,7 +6891,9 @@ fn create_manual_service_upgrade_task(
         .bind(Some(now))
         .bind(Option::<i64>::None)
         .bind(Option::<i64>::None)
-        .bind(Some("Manual service upgrade task scheduled from API".to_string()))
+        .bind(Some(
+            "Manual service upgrade task scheduled from API".to_string(),
+        ))
         .bind(Option::<String>::None)
         .execute(&mut *tx)
         .await?;
@@ -8528,7 +8530,10 @@ fn split_image_registry_repo_tag(image: &str) -> Result<(String, String), String
     Ok((format!("{registry}/{repo}"), tag.to_string()))
 }
 
-fn resolve_upgrade_target_image(base_image: &str, requested_image: Option<&str>) -> Result<String, String> {
+fn resolve_upgrade_target_image(
+    base_image: &str,
+    requested_image: Option<&str>,
+) -> Result<String, String> {
     let base_trimmed = base_image.trim();
     if base_trimmed.is_empty() {
         return Err("image-missing".to_string());
@@ -8583,7 +8588,11 @@ fn resolve_running_image_ref_for_unit_fresh(unit: &str) -> Result<String, String
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        candidates.push((container_created_ts(item), container_is_running(item), image));
+        candidates.push((
+            container_created_ts(item),
+            container_is_running(item),
+            image,
+        ));
     }
 
     if candidates.is_empty() {
@@ -8623,7 +8632,9 @@ fn resolve_upgrade_base_image(unit: &str) -> Result<String, String> {
 
     let image_id = resolve_running_image_id_for_unit_fresh(unit)?;
     let inspect = podman_image_inspect_json(&[image_id.clone()])?;
-    let images = inspect.as_array().ok_or_else(|| "invalid-json".to_string())?;
+    let images = inspect
+        .as_array()
+        .ok_or_else(|| "invalid-json".to_string())?;
     for entry in images {
         if image_inspect_id(entry).as_deref() != Some(image_id.as_str()) {
             continue;
@@ -8647,7 +8658,9 @@ fn resolve_upgrade_base_image(unit: &str) -> Result<String, String> {
 fn resolve_running_digest_for_unit_fresh(unit: &str) -> Result<Option<String>, String> {
     let image_id = resolve_running_image_id_for_unit_fresh(unit)?;
     let inspect = podman_image_inspect_json(&[image_id.clone()])?;
-    let images = inspect.as_array().ok_or_else(|| "invalid-json".to_string())?;
+    let images = inspect
+        .as_array()
+        .ok_or_else(|| "invalid-json".to_string())?;
     for entry in images {
         if image_inspect_id(entry).as_deref() == Some(image_id.as_str()) {
             return Ok(podman_inspect_digest(entry));
@@ -8846,24 +8859,21 @@ fn run_image_verify_step(task_id: &str, unit: &str, image: &str) -> ImageVerifyR
         _ => "warning",
     };
 
-    let digest_matches_remote_platform = match (
-        remote_platform_digest.as_deref(),
-        running_digest.as_deref(),
-    ) {
-        (Some(expected), Some(running)) => expected == running,
-        _ => false,
-    };
-    let pulled_matches_remote_index = match (remote_index_digest.as_deref(), pulled_digest.as_deref()) {
-        (Some(index), Some(pulled)) => index == pulled,
-        _ => false,
-    };
-    let pulled_matches_remote_platform = match (
-        remote_platform_digest.as_deref(),
-        pulled_digest.as_deref(),
-    ) {
-        (Some(expected), Some(pulled)) => expected == pulled,
-        _ => false,
-    };
+    let digest_matches_remote_platform =
+        match (remote_platform_digest.as_deref(), running_digest.as_deref()) {
+            (Some(expected), Some(running)) => expected == running,
+            _ => false,
+        };
+    let pulled_matches_remote_index =
+        match (remote_index_digest.as_deref(), pulled_digest.as_deref()) {
+            (Some(index), Some(pulled)) => index == pulled,
+            _ => false,
+        };
+    let pulled_matches_remote_platform =
+        match (remote_platform_digest.as_deref(), pulled_digest.as_deref()) {
+            (Some(expected), Some(pulled)) => expected == pulled,
+            _ => false,
+        };
     let is_manifest_list = match (
         remote_index_digest.as_deref(),
         remote_platform_digest.as_deref(),
@@ -13762,7 +13772,9 @@ fn run_manual_service_upgrade_task(
         }
     };
 
-    let before_digest = resolve_running_digest_for_unit_fresh(&unit_owned).ok().flatten();
+    let before_digest = resolve_running_digest_for_unit_fresh(&unit_owned)
+        .ok()
+        .flatten();
     let container_name = unit_execstart_podman_start_container_name(&unit_owned);
 
     // 1) Pull target image (always).
@@ -13873,7 +13885,10 @@ fn run_manual_service_upgrade_task(
             base_image.to_string(),
         ];
 
-        match host_backend().podman(&args).map_err(host_backend_error_to_string) {
+        match host_backend()
+            .podman(&args)
+            .map_err(host_backend_error_to_string)
+        {
             Ok(result) => {
                 let meta = build_command_meta(
                     &command,
@@ -13974,7 +13989,8 @@ fn run_manual_service_upgrade_task(
         }
 
         // Clone existing container config onto the new image.
-        let clone_cmd = format!("podman container clone {container} {tmp_container} {target_image}");
+        let clone_cmd =
+            format!("podman container clone {container} {tmp_container} {target_image}");
         let clone_argv = [
             "podman",
             "container",
@@ -13990,7 +14006,10 @@ fn run_manual_service_upgrade_task(
             tmp_container.clone(),
             target_image.to_string(),
         ];
-        match host_backend().podman(&clone_args).map_err(host_backend_error_to_string) {
+        match host_backend()
+            .podman(&clone_args)
+            .map_err(host_backend_error_to_string)
+        {
             Ok(result) => {
                 let meta = build_command_meta(
                     &clone_cmd,
@@ -14162,7 +14181,10 @@ fn run_manual_service_upgrade_task(
         let rm_cmd = format!("podman rm {container}");
         let rm_argv = ["podman", "rm", container];
         let rm_args = vec!["rm".to_string(), container.to_string()];
-        match host_backend().podman(&rm_args).map_err(host_backend_error_to_string) {
+        match host_backend()
+            .podman(&rm_args)
+            .map_err(host_backend_error_to_string)
+        {
             Ok(result) => {
                 let meta = build_command_meta(
                     &rm_cmd,
@@ -14243,7 +14265,10 @@ fn run_manual_service_upgrade_task(
             tmp_container.clone(),
             container.to_string(),
         ];
-        match host_backend().podman(&rename_args).map_err(host_backend_error_to_string) {
+        match host_backend()
+            .podman(&rename_args)
+            .map_err(host_backend_error_to_string)
+        {
             Ok(result) => {
                 let meta = build_command_meta(
                     &rename_cmd,
@@ -14342,7 +14367,11 @@ fn run_manual_service_upgrade_task(
         );
         append_task_log(
             task_id,
-            if unit_status == "failed" { "error" } else { "info" },
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
             "start-unit",
             unit_status,
             if unit_status == "failed" {
@@ -14408,7 +14437,11 @@ fn run_manual_service_upgrade_task(
         );
         append_task_log(
             task_id,
-            if unit_status == "failed" { "error" } else { "info" },
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
             "restart-unit",
             unit_status,
             if unit_status == "failed" {
@@ -14475,10 +14508,9 @@ fn run_manual_service_upgrade_task(
             }),
         );
 
-        for entry in capture_unit_failure_diagnostics(
-            &unit_owned,
-            task_diagnostics_journal_lines_from_env(),
-        ) {
+        for entry in
+            capture_unit_failure_diagnostics(&unit_owned, task_diagnostics_journal_lines_from_env())
+        {
             append_task_log(
                 task_id,
                 entry.level,
@@ -14634,7 +14666,12 @@ fn run_manual_service_upgrade_task(
             local_error.clone(),
         )
     } else if digest_matches_remote_platform && digest_changed {
-        ("succeeded", "info", "Manual service upgrade succeeded".to_string(), None)
+        (
+            "succeeded",
+            "info",
+            "Manual service upgrade succeeded".to_string(),
+            None,
+        )
     } else {
         let reason = if !digest_changed {
             "digest-unchanged"
