@@ -52,6 +52,20 @@ if [[ "$*" =~ ^image[[:space:]]inspect[[:space:]] ]]; then
   exit 0
 fi
 
+if [[ "$*" =~ ^container[[:space:]]clone[[:space:]] ]] && [[ "${MOCK_PODMAN_CONTAINER_CLONE_FAIL:-0}" == "1" ]]; then
+  echo "Error: json: cannot unmarshal object into Go struct field SpecGenerator.ContainerBasicConfig.secret_env of type string" >&2
+  exit 125
+fi
+
+if [[ "$*" =~ ^container[[:space:]]inspect[[:space:]] ]]; then
+  if [[ "$*" =~ --format ]] && [[ "$*" =~ CreateCommand ]] && [[ -n "${MOCK_PODMAN_CONTAINER_INSPECT_CREATE_COMMAND_JSON:-}" ]]; then
+    echo -n "${MOCK_PODMAN_CONTAINER_INSPECT_CREATE_COMMAND_JSON}"
+    exit 0
+  fi
+  echo -n "${MOCK_PODMAN_CONTAINER_INSPECT_JSON:-[]}"
+  exit 0
+fi
+
 if [[ "$*" =~ ^pull ]] && [[ "${MOCK_PODMAN_FAIL:-0}" == "1" ]]; then
   echo "simulated podman pull failure" >&2
   exit 42

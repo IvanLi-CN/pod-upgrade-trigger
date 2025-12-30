@@ -10976,6 +10976,45 @@ fn truncate_command_output(text: &str) -> (String, bool) {
     (truncated, true)
 }
 
+fn strip_stdout_from_command_meta(meta: &mut Value) {
+    if let Some(obj) = meta.as_object_mut() {
+        obj.remove("stdout");
+        obj.remove("truncated_stdout");
+    }
+}
+
+fn redact_env_assignment(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Some((key, _)) = trimmed.split_once('=') {
+        format!("{key}=***REDACTED***")
+    } else {
+        "***REDACTED***".to_string()
+    }
+}
+
+fn redact_podman_args_for_logs(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "--env" || arg == "-e" {
+            out.push(arg.to_string());
+            if idx + 1 < args.len() {
+                out.push(redact_env_assignment(&args[idx + 1]));
+                idx += 2;
+                continue;
+            }
+        } else if let Some(rest) = arg.strip_prefix("--env=") {
+            out.push(format!("--env={}", redact_env_assignment(rest)));
+            idx += 1;
+            continue;
+        }
+        out.push(args[idx].clone());
+        idx += 1;
+    }
+    out
+}
+
 fn build_command_meta(
     command: &str,
     argv: &[&str],
@@ -11032,6 +11071,113 @@ fn build_command_meta(
     }
 
     meta
+}
+
+fn is_podman_clone_secret_env_schema_error(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("specgenerator.containerbasicconfig.secret_env")
+        && lower.contains("cannot unmarshal object")
+        && lower.contains("type string")
+}
+
+fn find_podman_create_image_index(args: &[String], create_idx: usize) -> Option<usize> {
+    if create_idx >= args.len() {
+        return None;
+    }
+    let mut idx = create_idx + 1;
+    while idx < args.len() {
+        let token = args[idx].as_str();
+        if token == "--" {
+            return if idx + 1 < args.len() {
+                Some(idx + 1)
+            } else {
+                None
+            };
+        }
+        if token.starts_with("--") {
+            if token.contains('=') {
+                idx += 1;
+                continue;
+            }
+            let no_value = matches!(
+                token,
+                "--replace" | "--privileged" | "--read-only" | "--init" | "--tty" | "--interactive"
+            );
+            if no_value {
+                idx += 1;
+                continue;
+            }
+            idx = (idx + 2).min(args.len());
+            continue;
+        }
+        if token.starts_with('-') {
+            // Short option with attached value like -p8080:80.
+            if token.len() > 2 {
+                idx += 1;
+                continue;
+            }
+            let no_value = matches!(token, "-i" | "-t");
+            if no_value {
+                idx += 1;
+                continue;
+            }
+            idx = (idx + 2).min(args.len());
+            continue;
+        }
+        return Some(idx);
+    }
+    None
+}
+
+fn rewrite_create_command_for_upgrade(
+    create_command: Vec<String>,
+    tmp_container: &str,
+    base_image: &str,
+    target_image: &str,
+) -> Result<Vec<String>, String> {
+    if create_command.is_empty() {
+        return Err("create-command-empty".to_string());
+    }
+
+    let mut cmd = create_command;
+    if cmd.first().is_some_and(|v| v == "podman") {
+        cmd.remove(0);
+    }
+
+    let create_idx = cmd
+        .iter()
+        .position(|v| v == "create")
+        .ok_or_else(|| "create-command-missing-create".to_string())?;
+
+    // Rewrite --name=... / --name ... to tmp container.
+    let mut idx = create_idx + 1;
+    while idx < cmd.len() {
+        let arg = cmd[idx].clone();
+        if arg == "--name" {
+            if idx + 1 < cmd.len() {
+                cmd[idx + 1] = tmp_container.to_string();
+                idx += 2;
+                continue;
+            }
+        } else if arg.starts_with("--name=") {
+            cmd[idx] = format!("--name={tmp_container}");
+            idx += 1;
+            continue;
+        }
+        idx += 1;
+    }
+
+    if base_image != target_image {
+        if let Some(pos) = cmd.iter().position(|v| v == base_image) {
+            cmd[pos] = target_image.to_string();
+        } else {
+            let image_idx = find_podman_create_image_index(&cmd, create_idx)
+                .ok_or_else(|| "create-command-missing-image".to_string())?;
+            cmd[image_idx] = target_image.to_string();
+        }
+    }
+
+    Ok(cmd)
 }
 
 fn run_quiet_command(mut command: Command) -> Result<CommandExecResult, String> {
@@ -14006,10 +14152,11 @@ fn run_manual_service_upgrade_task(
             tmp_container.clone(),
             target_image.to_string(),
         ];
-        match host_backend()
+        let clone_attempt = host_backend()
             .podman(&clone_args)
-            .map_err(host_backend_error_to_string)
-        {
+            .map_err(host_backend_error_to_string);
+
+        match clone_attempt {
             Ok(result) => {
                 let meta = build_command_meta(
                     &clone_cmd,
@@ -14022,6 +14169,7 @@ fn run_manual_service_upgrade_task(
                         "target_image": target_image.as_str(),
                     })),
                 );
+
                 if result.success() {
                     append_task_log(
                         task_id,
@@ -14032,6 +14180,277 @@ fn run_manual_service_upgrade_task(
                         Some(&unit_owned),
                         meta,
                     );
+                } else if is_podman_clone_secret_env_schema_error(&result.stderr) {
+                    append_task_log(
+                        task_id,
+                        "warning",
+                        "container-clone",
+                        "failed",
+                        "Container clone failed; falling back to create command",
+                        Some(&unit_owned),
+                        meta,
+                    );
+
+                    // Best-effort fallback: recreate the container from its CreateCommand.
+                    let inspect_format = "{{json .Config.CreateCommand}}";
+                    let inspect_cmd =
+                        format!("podman container inspect {container} --format {inspect_format}");
+                    let inspect_argv = [
+                        "podman",
+                        "container",
+                        "inspect",
+                        container,
+                        "--format",
+                        inspect_format,
+                    ];
+                    let inspect_args = vec![
+                        "container".to_string(),
+                        "inspect".to_string(),
+                        container.to_string(),
+                        "--format".to_string(),
+                        inspect_format.to_string(),
+                    ];
+                    match host_backend()
+                        .podman(&inspect_args)
+                        .map_err(host_backend_error_to_string)
+                    {
+                        Ok(inspect_result) => {
+                            let mut inspect_meta = build_command_meta(
+                                &inspect_cmd,
+                                &inspect_argv,
+                                &inspect_result,
+                                Some(json!({
+                                    "unit": unit_owned.as_str(),
+                                    "container": container,
+                                })),
+                            );
+                            strip_stdout_from_command_meta(&mut inspect_meta);
+                            if inspect_result.success() {
+                                append_task_log(
+                                    task_id,
+                                    "info",
+                                    "container-inspect",
+                                    "succeeded",
+                                    "Container inspected",
+                                    Some(&unit_owned),
+                                    inspect_meta,
+                                );
+                            } else {
+                                append_task_log(
+                                    task_id,
+                                    "error",
+                                    "container-inspect",
+                                    "failed",
+                                    "Container inspect failed",
+                                    Some(&unit_owned),
+                                    inspect_meta,
+                                );
+                                update_task_state_with_unit_error(
+                                    task_id,
+                                    "failed",
+                                    &unit_owned,
+                                    "failed",
+                                    "Manual service upgrade task failed (container inspect failed)",
+                                    Some("container-inspect-failed"),
+                                    "manual-service-upgrade-run",
+                                    "error",
+                                    json!({
+                                        "unit": unit_owned.as_str(),
+                                        "container": container,
+                                    }),
+                                );
+                                return Ok(());
+                            }
+
+                            let create_command: Vec<String> = match serde_json::from_str(
+                                inspect_result.stdout.trim(),
+                            ) {
+                                Ok(cmd) => cmd,
+                                Err(_) => {
+                                    update_task_state_with_unit_error(
+                                        task_id,
+                                        "failed",
+                                        &unit_owned,
+                                        "failed",
+                                        "Manual service upgrade task failed (invalid create command)",
+                                        Some("invalid-create-command"),
+                                        "manual-service-upgrade-run",
+                                        "error",
+                                        json!({
+                                            "unit": unit_owned.as_str(),
+                                            "container": container,
+                                        }),
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                            let create_args = match rewrite_create_command_for_upgrade(
+                                create_command,
+                                tmp_container.as_str(),
+                                base_image.as_str(),
+                                target_image.as_str(),
+                            ) {
+                                Ok(args) => args,
+                                Err(err) => {
+                                    update_task_state_with_unit_error(
+                                        task_id,
+                                        "failed",
+                                        &unit_owned,
+                                        "failed",
+                                        "Manual service upgrade task failed (rewrite create command failed)",
+                                        Some("rewrite-create-command-failed"),
+                                        "manual-service-upgrade-run",
+                                        "error",
+                                        json!({
+                                            "unit": unit_owned.as_str(),
+                                            "container": container,
+                                            "error": err,
+                                        }),
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                            let redacted_args = redact_podman_args_for_logs(&create_args);
+                            let create_cmd = format!("podman {}", redacted_args.join(" "));
+                            let create_argv_vec: Vec<&str> = std::iter::once("podman")
+                                .chain(redacted_args.iter().map(|s| s.as_str()))
+                                .collect();
+
+                            match host_backend()
+                                .podman(&create_args)
+                                .map_err(host_backend_error_to_string)
+                            {
+                                Ok(create_result) => {
+                                    let mut create_meta = build_command_meta(
+                                        &create_cmd,
+                                        &create_argv_vec,
+                                        &create_result,
+                                        Some(json!({
+                                            "unit": unit_owned.as_str(),
+                                            "container": container,
+                                            "tmp_container": tmp_container.as_str(),
+                                            "target_image": target_image.as_str(),
+                                            "redacted": true,
+                                        })),
+                                    );
+                                    strip_stdout_from_command_meta(&mut create_meta);
+                                    if create_result.success() {
+                                        append_task_log(
+                                            task_id,
+                                            "info",
+                                            "container-create",
+                                            "succeeded",
+                                            "Container created from CreateCommand",
+                                            Some(&unit_owned),
+                                            create_meta,
+                                        );
+                                    } else {
+                                        append_task_log(
+                                            task_id,
+                                            "error",
+                                            "container-create",
+                                            "failed",
+                                            "Container create failed",
+                                            Some(&unit_owned),
+                                            create_meta,
+                                        );
+                                        update_task_state_with_unit_error(
+                                            task_id,
+                                            "failed",
+                                            &unit_owned,
+                                            "failed",
+                                            "Manual service upgrade task failed (container create failed)",
+                                            Some("container-create-failed"),
+                                            "manual-service-upgrade-run",
+                                            "error",
+                                            json!({
+                                                "unit": unit_owned.as_str(),
+                                                "container": container,
+                                                "tmp_container": tmp_container.as_str(),
+                                                "target_image": target_image.as_str(),
+                                            }),
+                                        );
+                                        return Ok(());
+                                    }
+                                }
+                                Err(err) => {
+                                    append_task_log(
+                                        task_id,
+                                        "error",
+                                        "container-create",
+                                        "failed",
+                                        "Container create failed",
+                                        Some(&unit_owned),
+                                        json!({
+                                            "type": "command",
+                                            "command": create_cmd,
+                                            "argv": create_argv_vec,
+                                            "error": err,
+                                            "unit": unit_owned.as_str(),
+                                            "container": container,
+                                            "tmp_container": tmp_container.as_str(),
+                                            "target_image": target_image.as_str(),
+                                            "redacted": true,
+                                        }),
+                                    );
+                                    update_task_state_with_unit_error(
+                                        task_id,
+                                        "failed",
+                                        &unit_owned,
+                                        "failed",
+                                        "Manual service upgrade task failed (container create error)",
+                                        Some("container-create-error"),
+                                        "manual-service-upgrade-run",
+                                        "error",
+                                        json!({
+                                            "unit": unit_owned.as_str(),
+                                            "container": container,
+                                            "tmp_container": tmp_container.as_str(),
+                                            "target_image": target_image.as_str(),
+                                            "error": err,
+                                        }),
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            append_task_log(
+                                task_id,
+                                "error",
+                                "container-inspect",
+                                "failed",
+                                "Container inspect failed",
+                                Some(&unit_owned),
+                                json!({
+                                    "type": "command",
+                                    "command": inspect_cmd,
+                                    "argv": inspect_argv,
+                                    "error": err,
+                                    "unit": unit_owned.as_str(),
+                                    "container": container,
+                                }),
+                            );
+                            update_task_state_with_unit_error(
+                                task_id,
+                                "failed",
+                                &unit_owned,
+                                "failed",
+                                "Manual service upgrade task failed (container inspect error)",
+                                Some("container-inspect-error"),
+                                "manual-service-upgrade-run",
+                                "error",
+                                json!({
+                                    "unit": unit_owned.as_str(),
+                                    "container": container,
+                                    "error": err,
+                                }),
+                            );
+                            return Ok(());
+                        }
+                    }
                 } else {
                     append_task_log(
                         task_id,
