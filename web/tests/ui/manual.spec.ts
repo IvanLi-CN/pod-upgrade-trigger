@@ -3,7 +3,7 @@ import { expect, test } from '@playwright/test'
 async function openManualPage(page: import('@playwright/test').Page) {
   await page.goto('/services?mock=enabled&mock=profile=happy-path')
   await expect(page.getByRole('heading', { name: '部署全部服务' })).toBeVisible()
-  await expect(page.getByText('按服务部署')).toBeVisible()
+  await expect(page.getByText('按服务升级')).toBeVisible()
   await expect(page.getByText('历史记录')).toBeVisible()
 }
 
@@ -48,10 +48,10 @@ test.describe('Services deploy console', () => {
 
     await row.getByLabel('Dry').check()
 
-    await row.getByRole('button', { name: '部署' }).click()
+    await row.getByRole('button', { name: '升级' }).click()
 
-    await expect(page.getByText('服务部署成功')).toBeVisible()
-    await expect(page.getByText(/deploy-service svc-alpha\.service/)).toBeVisible()
+    await expect(page.getByText('服务升级已提交')).toBeVisible()
+    await expect(page.getByText(/upgrade-service svc-alpha\.service/)).toBeVisible()
   })
 
   test('shows error toast when deploy-all fails', async ({ page }) => {
@@ -73,7 +73,7 @@ test.describe('Services deploy console', () => {
     await page.getByRole('button', { name: '部署全部服务' }).click()
 
     await expect(page.getByText('部署失败')).toBeVisible()
-    await expect(page.getByText('暂无手动部署记录。')).toBeVisible()
+    await expect(page.getByText('暂无手动操作记录。')).toBeVisible()
   })
 
   test('clicking refresh button triggers refresh request', async ({ page }) => {
@@ -127,7 +127,7 @@ test.describe('Services deploy console', () => {
 
     const svcRow = page.locator('form', { hasText: 'svc-alpha.service' }).first()
     await svcRow.getByLabel('Dry').uncheck()
-    await svcRow.getByRole('button', { name: '部署' }).click()
+    await svcRow.getByRole('button', { name: '升级' }).click()
 
     await expect(page.getByText('任务中心')).toBeVisible()
 
@@ -238,7 +238,7 @@ test.describe('Services deploy console', () => {
 
       await expect(page.getByText('任务中心')).toBeVisible()
       await expect(page.getByRole('button', { name: '任务列表' })).toBeVisible()
-      const firstRow = page.locator('table tbody tr').first()
+      const firstRow = page.locator('table tbody tr').filter({ hasText: 'Manual' }).first()
       await expect(firstRow).toBeVisible()
       await firstRow.click()
       await expect(page.getByRole('button', { name: '任务详情' })).toBeVisible()
@@ -266,7 +266,7 @@ test.describe('Services deploy console', () => {
       expect(page.url()).not.toContain('task_id=')
 
       // Clicking a row opens detail and sets task_id.
-      const row = page.locator('table tbody tr').first()
+      const row = page.locator('table tbody tr').filter({ hasText: 'Manual' }).first()
       await expect(row).toBeVisible()
       await row.click()
       const taskId2 = await getDrawerTaskId(page)
