@@ -5,6 +5,14 @@ mkdir -p "$(dirname "$log")"
 
 echo "podman $*" >> "$log"
 
+state_root=""
+if [[ -n "${PODUP_STATE_DIR:-}" ]]; then
+  state_root="${PODUP_STATE_DIR}/mock-podman"
+else
+  state_root="$(dirname "$0")"
+fi
+mkdir -p "$state_root"
+
 if [[ "$*" =~ auto-update ]]; then
   if [[ -n "${MOCK_PODMAN_DISCOVERY_JSON:-}" ]]; then
     echo -n "${MOCK_PODMAN_DISCOVERY_JSON}"
@@ -13,20 +21,34 @@ if [[ "$*" =~ auto-update ]]; then
 fi
 
 if [[ "$*" =~ ^ps[[:space:]] ]]; then
-  if [[ -n "${MOCK_PODMAN_PS_JSON:-}" ]]; then
-    echo -n "${MOCK_PODMAN_PS_JSON}"
-  else
-    echo "[]"
+  if [[ -n "${MOCK_PODMAN_PS_JSON_AFTER:-}" ]]; then
+    marker="${state_root}/ps-once"
+    if [[ -f "$marker" ]]; then
+      echo -n "${MOCK_PODMAN_PS_JSON_AFTER}"
+    else
+      echo -n "${MOCK_PODMAN_PS_JSON_BEFORE:-${MOCK_PODMAN_PS_JSON:-[]}}"
+      touch "$marker"
+    fi
+    exit 0
   fi
+
+  echo -n "${MOCK_PODMAN_PS_JSON:-[]}"
   exit 0
 fi
 
 if [[ "$*" =~ ^image[[:space:]]inspect[[:space:]] ]]; then
-  if [[ -n "${MOCK_PODMAN_IMAGE_INSPECT_JSON:-}" ]]; then
-    echo -n "${MOCK_PODMAN_IMAGE_INSPECT_JSON}"
-  else
-    echo "[]"
+  if [[ -n "${MOCK_PODMAN_IMAGE_INSPECT_JSON_AFTER:-}" ]]; then
+    marker="${state_root}/image-inspect-once"
+    if [[ -f "$marker" ]]; then
+      echo -n "${MOCK_PODMAN_IMAGE_INSPECT_JSON_AFTER}"
+    else
+      echo -n "${MOCK_PODMAN_IMAGE_INSPECT_JSON_BEFORE:-${MOCK_PODMAN_IMAGE_INSPECT_JSON:-[]}}"
+      touch "$marker"
+    fi
+    exit 0
   fi
+
+  echo -n "${MOCK_PODMAN_IMAGE_INSPECT_JSON:-[]}"
   exit 0
 fi
 

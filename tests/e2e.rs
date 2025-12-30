@@ -37,6 +37,9 @@ async fn e2e_full_suite() -> AnyResult<()> {
     run_scenario!(scenario_task_prune_retention);
     run_scenario!(scenario_settings_tasks_retention);
     run_scenario!(scenario_manual_api);
+    run_scenario!(scenario_manual_service_image_verify_multi_arch);
+    run_scenario!(scenario_manual_service_upgrade_requires_digest_switch);
+    run_scenario!(scenario_manual_service_upgrade_marks_anomaly_when_digest_unchanged);
     run_scenario!(scenario_csrf_guard);
     run_scenario!(scenario_self_update_api);
     run_scenario!(scenario_forwardauth_and_csrf_strict_mode);
@@ -1010,17 +1013,40 @@ async fn scenario_manual_api() -> AnyResult<()> {
     assert!(non_discovery.is_empty());
 
     env.clear_mock_log()?;
-    let service_body = json!({
+    let deprecated_body = json!({
+        "dry_run": true,
+        "image": "ghcr.io/koha/runner:main",
+        "caller": "user",
+        "reason": "rollout"
+    });
+    let deprecated = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/svc-beta")
+            .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
+            .body(deprecated_body.to_string().into_bytes()),
+        |cmd| {
+            configure_image_verify_mocks(cmd);
+        },
+    )?;
+    assert_eq!(deprecated.status, 202);
+    let deprecated_json = deprecated.json_body()?;
+    assert_eq!(deprecated_json["deprecated"], Value::from(true));
+    assert_eq!(
+        deprecated_json["replacement"],
+        Value::from("/api/manual/services/svc-beta/upgrade")
+    );
+
+    let upgrade_body = json!({
         "dry_run": false,
         "image": "ghcr.io/koha/runner:main",
         "caller": "user",
         "reason": "rollout"
     });
     let service = env.send_request_with_env(
-        HttpRequest::post("/api/manual/services/svc-beta")
+        HttpRequest::post("/api/manual/services/svc-beta/upgrade")
             .header("content-type", "application/json")
             .header("x-podup-csrf", "1")
-            .body(service_body.to_string().into_bytes()),
+            .body(upgrade_body.to_string().into_bytes()),
         |cmd| {
             configure_image_verify_mocks(cmd);
         },
@@ -1035,7 +1061,7 @@ async fn scenario_manual_api() -> AnyResult<()> {
         .to_string();
     assert!(
         !service_request_id.is_empty(),
-        "manual service response must include request_id"
+        "manual service upgrade response must include request_id"
     );
 
     let log_lines = env.read_mock_log()?;
@@ -1054,7 +1080,325 @@ async fn scenario_manual_api() -> AnyResult<()> {
     let pool = env.connect_db().await?;
     let events = env.fetch_events(&pool).await?;
     assert!(events.iter().any(|row| row.action == "manual-trigger"));
-    assert!(events.iter().any(|row| row.action == "manual-service"));
+    assert!(
+        events
+            .iter()
+            .any(|row| row.action == "manual-service-upgrade")
+    );
+
+    Ok(())
+}
+
+async fn scenario_manual_service_image_verify_multi_arch() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let service_body = json!({
+        "dry_run": false,
+        "image": "ghcr.io/koha/svc-alpha:latest",
+        "caller": "user",
+        "reason": "multi-arch-verify",
+    });
+
+    let ps_json = json!([
+        {
+            "Id": "cid-alpha",
+            "Created": 1000,
+            "State": "running",
+            "ImageID": "img-alpha",
+            "Labels": { "io.podman.systemd.unit": "svc-alpha.service" }
+        }
+    ]);
+
+    let inspect_json = json!([
+        {
+            "Id": "img-tag",
+            "RepoTags": ["ghcr.io/koha/svc-alpha:latest"],
+            "RepoDigests": ["ghcr.io/koha/svc-alpha@sha256:iiiiiiii"],
+            "Digest": "sha256:iiiiiiii"
+        },
+        {
+            "Id": "img-alpha",
+            "RepoDigests": ["ghcr.io/koha/svc-alpha@sha256:pppppppp"],
+            "Digest": "sha256:pppppppp"
+        }
+    ]);
+
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:latest": {
+            "remote_index_digest": "sha256:iiiiiiii",
+            "remote_platform_digest": "sha256:pppppppp"
+        }
+    });
+
+    let service = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/svc-alpha")
+            .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
+            .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+            cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+            cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+        },
+    )?;
+    assert_eq!(service.status, 202);
+    let service_json = service.json_body()?;
+    let task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!task_id.is_empty(), "manual service must return task_id");
+
+    let detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{task_id}")))?;
+    assert_eq!(detail.status, 200);
+    let body = detail.json_body()?;
+    assert_eq!(
+        body["status"],
+        Value::from("succeeded"),
+        "multi-arch image verify should succeed when running matches remote platform digest"
+    );
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let verify = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("image-verify")))
+        .expect("task must include image-verify log entry");
+    assert_eq!(verify.get("status"), Some(&Value::from("succeeded")));
+    let meta = verify.get("meta").cloned().unwrap_or(Value::Null);
+    assert_eq!(meta.get("is_manifest_list"), Some(&Value::from(true)));
+    assert_eq!(
+        meta.get("digest_matches_remote_platform"),
+        Some(&Value::from(true))
+    );
+    assert_eq!(
+        meta.get("pulled_matches_remote_index"),
+        Some(&Value::from(true))
+    );
+    assert_eq!(
+        meta.get("pulled_matches_remote_platform"),
+        Some(&Value::from(false))
+    );
+
+    Ok(())
+}
+
+async fn scenario_manual_service_upgrade_requires_digest_switch() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-alpha.container"),
+        b"[Container]\nImage=ghcr.io/koha/svc-alpha:latest\n",
+    )?;
+
+    // Clear per-request mock state markers used by tests/mock-bin/podman.
+    let mock_state_dir = env.state_dir.join("mock-podman");
+    let _ = fs::remove_file(mock_state_dir.join("ps-once"));
+    let _ = fs::remove_file(mock_state_dir.join("image-inspect-once"));
+
+    let ps_before = json!([
+        {
+            "Id": "cid-alpha",
+            "Created": 1000,
+            "State": "running",
+            "ImageID": "img-old",
+            "Labels": { "io.podman.systemd.unit": "svc-alpha.service" }
+        }
+    ]);
+    let ps_after = json!([
+        {
+            "Id": "cid-alpha",
+            "Created": 1000,
+            "State": "running",
+            "ImageID": "img-new",
+            "Labels": { "io.podman.systemd.unit": "svc-alpha.service" }
+        }
+    ]);
+
+    let inspect_before = json!([
+        {
+            "Id": "img-old",
+            "RepoTags": ["ghcr.io/koha/svc-alpha:latest"],
+            "RepoDigests": ["ghcr.io/koha/svc-alpha@sha256:aaaaaaaa"],
+            "Digest": "sha256:aaaaaaaa"
+        }
+    ]);
+
+    let inspect_after = json!([
+        {
+            "Id": "img-tag",
+            "RepoTags": ["ghcr.io/koha/svc-alpha:latest"],
+            "RepoDigests": ["ghcr.io/koha/svc-alpha@sha256:bbbbbbbb"],
+            "Digest": "sha256:bbbbbbbb"
+        },
+        {
+            "Id": "img-new",
+            "RepoDigests": ["ghcr.io/koha/svc-alpha@sha256:bbbbbbbb"],
+            "Digest": "sha256:bbbbbbbb"
+        }
+    ]);
+
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:latest": "sha256:bbbbbbbb"
+    });
+
+    let service_body = json!({
+        "dry_run": false,
+        "caller": "user",
+        "reason": "upgrade-success",
+    });
+
+    let service = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/svc-alpha/upgrade")
+            .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
+            .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+            cmd.env("MOCK_PODMAN_PS_JSON_BEFORE", ps_before.to_string());
+            cmd.env("MOCK_PODMAN_PS_JSON_AFTER", ps_after.to_string());
+            cmd.env(
+                "MOCK_PODMAN_IMAGE_INSPECT_JSON_BEFORE",
+                inspect_before.to_string(),
+            );
+            cmd.env(
+                "MOCK_PODMAN_IMAGE_INSPECT_JSON_AFTER",
+                inspect_after.to_string(),
+            );
+            cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+        },
+    )?;
+    assert_eq!(service.status, 202);
+    let service_json = service.json_body()?;
+    let task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "manual service upgrade must return task_id"
+    );
+
+    let detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{task_id}")))?;
+    assert_eq!(detail.status, 200);
+    let body = detail.json_body()?;
+    assert_eq!(
+        body["status"],
+        Value::from("succeeded"),
+        "upgrade should succeed only when the running digest switches and matches remote platform digest"
+    );
+
+    let logs = body["logs"].as_array().cloned().unwrap_or_default();
+    let verify = logs
+        .iter()
+        .find(|entry| entry.get("action") == Some(&Value::from("image-verify")))
+        .expect("task must include image-verify log entry");
+    assert_eq!(verify.get("status"), Some(&Value::from("succeeded")));
+    let meta = verify.get("meta").cloned().unwrap_or(Value::Null);
+    assert_eq!(meta.get("digest_changed"), Some(&Value::from(true)));
+    assert_eq!(
+        meta.get("digest_matches_remote_platform"),
+        Some(&Value::from(true))
+    );
+    assert_eq!(
+        meta.get("running_digest_before"),
+        Some(&Value::from("sha256:aaaaaaaa"))
+    );
+    assert_eq!(
+        meta.get("running_digest_after"),
+        Some(&Value::from("sha256:bbbbbbbb"))
+    );
+
+    Ok(())
+}
+
+async fn scenario_manual_service_upgrade_marks_anomaly_when_digest_unchanged() -> AnyResult<()> {
+    let env = TestEnv::new()?;
+    env.ensure_db_initialized().await?;
+    env.clear_mock_log()?;
+
+    let container_dir = env.state_dir.join("containers/systemd");
+    fs::create_dir_all(&container_dir)?;
+    fs::write(
+        container_dir.join("svc-alpha.container"),
+        b"[Container]\nImage=ghcr.io/koha/svc-alpha:latest\n",
+    )?;
+
+    let ps_json = json!([
+        {
+            "Id": "cid-alpha",
+            "Created": 1000,
+            "State": "running",
+            "ImageID": "img-same",
+            "Labels": { "io.podman.systemd.unit": "svc-alpha.service" }
+        }
+    ]);
+    let inspect_json = json!([
+        {
+            "Id": "img-same",
+            "RepoTags": ["ghcr.io/koha/svc-alpha:latest"],
+            "RepoDigests": ["ghcr.io/koha/svc-alpha@sha256:bbbbbbbb"],
+            "Digest": "sha256:bbbbbbbb"
+        }
+    ]);
+
+    let registry_mock = json!({
+        "ghcr.io/koha/svc-alpha:latest": "sha256:bbbbbbbb"
+    });
+
+    let service_body = json!({
+        "dry_run": false,
+        "caller": "user",
+        "reason": "digest-unchanged",
+    });
+
+    let service = env.send_request_with_env(
+        HttpRequest::post("/api/manual/services/svc-alpha/upgrade")
+            .header("content-type", "application/json")
+            .header("x-podup-csrf", "1")
+            .body(service_body.to_string().into_bytes()),
+        |cmd| {
+            cmd.env("PODUP_CONTAINER_DIR", &container_dir);
+            cmd.env("MOCK_PODMAN_PS_JSON", ps_json.to_string());
+            cmd.env("MOCK_PODMAN_IMAGE_INSPECT_JSON", inspect_json.to_string());
+            cmd.env("PODUP_REGISTRY_DIGEST_MOCK", registry_mock.to_string());
+        },
+    )?;
+    assert_eq!(service.status, 202);
+    let service_json = service.json_body()?;
+    let task_id = service_json["task_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "manual service upgrade must return task_id"
+    );
+
+    let detail = env.send_request(HttpRequest::get(&format!("/api/tasks/{task_id}")))?;
+    assert_eq!(detail.status, 200);
+    let body = detail.json_body()?;
+    assert_eq!(
+        body["status"],
+        Value::from("anomaly"),
+        "healthy-but-no-digest-switch must be reported as anomaly"
+    );
+
+    let units = body["units"].as_array().cloned().unwrap_or_default();
+    let unit = units
+        .iter()
+        .find(|entry| entry.get("unit") == Some(&Value::from("svc-alpha.service")))
+        .expect("task must include svc-alpha.service unit");
+    assert_eq!(
+        unit.get("error"),
+        Some(&Value::from("digest-unchanged")),
+        "anomaly should capture the digest-unchanged reason"
+    );
 
     Ok(())
 }

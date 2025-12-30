@@ -29,12 +29,12 @@ test.describe('Mock profile: empty-state', () => {
   test('shows empty manual and tasks views without errors', async ({ page }) => {
     await gotoProfile(page, '/services', 'empty-state')
 
-    await expect(page.getByText('按服务部署')).toBeVisible()
+    await expect(page.getByText('按服务升级')).toBeVisible()
     await expect(
-      page.getByText('暂无可部署的服务。'),
+      page.getByText('暂无可升级的服务。'),
     ).toBeVisible()
     await expect(
-      page.getByText('暂无手动部署记录。'),
+      page.getByText('暂无手动操作记录。'),
     ).toBeVisible()
 
     await gotoProfile(page, '/tasks', 'empty-state')
@@ -176,7 +176,7 @@ test.describe('Mock console profile switching', () => {
     await gotoWithMock(page, '/services')
 
     await expect(
-      page.getByText('暂无可部署的服务。'),
+      page.getByText('暂无可升级的服务。'),
     ).toHaveCount(0)
 
     const consoleToggle = page.getByRole('button', { name: 'Mock 控制台' })
@@ -195,7 +195,7 @@ test.describe('Mock console profile switching', () => {
     await page.reload()
 
     await expect(
-      page.getByText('暂无可部署的服务。'),
+      page.getByText('暂无可升级的服务。'),
     ).toBeVisible()
 
     await resetProfile(page)

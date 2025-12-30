@@ -6,6 +6,12 @@ export type TaskStatus =
 	| "cancelled"
 	| "skipped"
 	/**
+	 * Terminal-but-not-OK state used when the backend can confirm the unit
+	 * is healthy/running, but image verification indicates the service did
+	 * not switch to the expected digest (e.g. digest unchanged or mismatch).
+	 */
+	| "anomaly"
+	/**
 	 * Terminal-but-ambiguous state used when the backend cannot reliably
 	 * determine success vs failure, e.g. auto-update runs that completed
 	 * without a JSONL summary.

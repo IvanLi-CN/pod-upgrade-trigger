@@ -828,6 +828,82 @@ const handlers = [
 				caller,
 				reason,
 				task_id: taskId,
+				deprecated: true,
+				replacement: `/api/manual/services/${service.slug}/upgrade`,
+			},
+			{ headers: JSON_HEADERS },
+		);
+	}),
+
+	http.post("/api/manual/services/:slug/upgrade", async ({ params, request }) => {
+		const url = new URL(request.url);
+		const failure = degradedGuard(url) || authGuard(url) || maybeFailure();
+		if (failure) return failure;
+		await withLatency();
+
+		const data = runtime.cloneData();
+		const services = data.services;
+		const service = services.find((s) => s.slug === params.slug);
+		const body = (await request.json().catch(() => ({}))) as Record<
+			string,
+			unknown
+		>;
+
+		if (!service) {
+			return HttpResponse.json({ error: "service not found" }, { status: 404 });
+		}
+
+		const dryRun = Boolean(body.dry_run);
+		const status = dryRun ? "dry-run" : "pending";
+
+		const caller =
+			typeof body.caller === "string" && body.caller.trim()
+				? body.caller.trim()
+				: null;
+		const reason =
+			typeof body.reason === "string" && body.reason.trim()
+				? body.reason.trim()
+				: null;
+
+		runtime.addEvent({
+			request_id: makeRequestId(),
+			ts: Math.floor(Date.now() / 1000),
+			method: "POST",
+			path: `/api/manual/services/${service.slug}/upgrade`,
+			status: 202,
+			action: "manual-trigger",
+			duration_ms: 140,
+			meta: { service: service.slug, ...body },
+		});
+
+		let taskId: string | null = null;
+		if (!dryRun) {
+			const task = runtime.createAdHocTask({
+				kind: "manual",
+				source: "manual",
+				units: [service.unit],
+				caller,
+				reason,
+				path: `/api/manual/services/${service.slug}/upgrade`,
+				is_long_running: true,
+			});
+			taskId = task.task_id;
+		}
+
+		const inputImage =
+			typeof body.image === "string" && body.image.trim() ? body.image.trim() : null;
+
+		return HttpResponse.json(
+			{
+				unit: service.unit,
+				status,
+				request_id: makeRequestId(),
+				caller,
+				reason,
+				image: inputImage,
+				task_id: taskId,
+				base_image: service.default_image ?? null,
+				target_image: inputImage ?? service.default_image ?? null,
 			},
 			{ headers: JSON_HEADERS },
 		);

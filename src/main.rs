@@ -4472,7 +4472,11 @@ fn handle_manual_api(ctx: &RequestContext) -> Result<(), String> {
     }
 
     if let Some(rest) = ctx.path.strip_prefix("/api/manual/services/") {
-        return handle_manual_service(ctx, rest);
+        let trimmed = rest.trim_matches('/');
+        if let Some(slug) = trimmed.strip_suffix("/upgrade") {
+            return handle_manual_service_upgrade(ctx, slug);
+        }
+        return handle_manual_service(ctx, trimmed);
     }
 
     respond_text(
@@ -5546,6 +5550,7 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
     };
 
     let events_task_id = task_id.clone();
+    let replacement = format!("/api/manual/services/{trimmed}/upgrade");
     let response = json!({
         "unit": unit,
         "status": result.status,
@@ -5556,6 +5561,8 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
         "image": request.image,
         "task_id": task_id,
         "request_id": ctx.request_id,
+        "deprecated": true,
+        "replacement": replacement,
     });
 
     respond_json(
@@ -5568,6 +5575,205 @@ fn handle_manual_service(ctx: &RequestContext, slug: &str) -> Result<(), String>
             "unit": unit,
             "dry_run": dry_run,
             "task_id": events_task_id,
+        })),
+    )
+}
+
+fn handle_manual_service_upgrade(ctx: &RequestContext, slug: &str) -> Result<(), String> {
+    if !ensure_admin(ctx, "manual-service-upgrade")? {
+        return Ok(());
+    }
+    if !ensure_csrf(ctx, "manual-service-upgrade")? {
+        return Ok(());
+    }
+
+    let trimmed = slug.trim_matches('/');
+    if trimmed.is_empty() {
+        respond_text(
+            ctx,
+            400,
+            "BadRequest",
+            "missing service",
+            "manual-service-upgrade",
+            Some(json!({ "reason": "slug" })),
+        )?;
+        return Ok(());
+    }
+
+    let synthetic = format!("{trimmed}");
+    let Some(unit) = resolve_unit_identifier(&synthetic) else {
+        respond_text(
+            ctx,
+            404,
+            "NotFound",
+            "service not found",
+            "manual-service-upgrade",
+            Some(json!({ "slug": trimmed })),
+        )?;
+        return Ok(());
+    };
+
+    let request: ServiceUpgradeRequest = match parse_json_body(ctx) {
+        Ok(body) => body,
+        Err(err) => {
+            respond_text(
+                ctx,
+                400,
+                "BadRequest",
+                "invalid request",
+                "manual-service-upgrade",
+                Some(json!({ "error": err })),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if request.dry_run {
+        let base_image = match resolve_upgrade_base_image(&unit) {
+            Ok(img) => img,
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    400,
+                    "BadRequest",
+                    "image missing",
+                    "manual-service-upgrade",
+                    Some(json!({ "unit": unit, "error": err })),
+                )?;
+                return Ok(());
+            }
+        };
+
+        let target_image = match resolve_upgrade_target_image(&base_image, request.image.as_deref())
+        {
+            Ok(img) => img,
+            Err(err) => {
+                respond_text(
+                    ctx,
+                    400,
+                    "BadRequest",
+                    "invalid image",
+                    "manual-service-upgrade",
+                    Some(json!({ "unit": unit, "error": err })),
+                )?;
+                return Ok(());
+            }
+        };
+
+        let response = json!({
+            "unit": unit,
+            "status": "dry-run",
+            "message": "skipped by dry run",
+            "dry_run": true,
+            "caller": request.caller,
+            "reason": request.reason,
+            "image": request.image,
+            "base_image": base_image,
+            "target_image": target_image,
+            "task_id": Value::Null,
+            "request_id": ctx.request_id,
+        });
+
+        respond_json(
+            ctx,
+            202,
+            "Accepted",
+            &response,
+            "manual-service-upgrade",
+            Some(json!({
+                "unit": unit,
+                "dry_run": true,
+                "target_image": target_image,
+            })),
+        )?;
+        return Ok(());
+    }
+
+    let meta = TaskMeta::ManualServiceUpgrade {
+        unit: unit.clone(),
+        image: request.image.clone(),
+    };
+    let task = create_manual_service_upgrade_task(
+        &unit,
+        &request.caller,
+        &request.reason,
+        request.image.as_deref(),
+        &ctx.request_id,
+        meta,
+    )?;
+
+    let result = UnitActionResult {
+        unit: unit.clone(),
+        status: "pending".to_string(),
+        message: Some("scheduled via task".to_string()),
+    };
+
+    if let Err(err) = spawn_manual_task(&task, "manual-service-upgrade") {
+        mark_task_dispatch_failed(
+            &task,
+            Some(&unit),
+            "manual",
+            "manual-service-upgrade",
+            &err,
+            json!({
+                "unit": unit,
+                "image": request.image.clone(),
+                "caller": request.caller.clone(),
+                "reason": request.reason.clone(),
+                "path": ctx.path,
+                "request_id": ctx.request_id,
+            }),
+        );
+
+        let response = json!({
+            "unit": unit,
+            "status": "error",
+            "message": "failed to dispatch manual service upgrade task",
+            "dry_run": false,
+            "caller": request.caller.clone(),
+            "reason": request.reason.clone(),
+            "image": request.image.clone(),
+            "task_id": task,
+            "request_id": ctx.request_id,
+        });
+
+        respond_json(
+            ctx,
+            500,
+            "InternalServerError",
+            &response,
+            "manual-service-upgrade",
+            Some(json!({
+                "unit": unit,
+                "task_id": task,
+                "error": err,
+            })),
+        )?;
+        return Ok(());
+    }
+
+    let response = json!({
+        "unit": unit,
+        "status": result.status,
+        "message": result.message,
+        "dry_run": false,
+        "caller": request.caller,
+        "reason": request.reason,
+        "image": request.image,
+        "task_id": task,
+        "request_id": ctx.request_id,
+    });
+
+    respond_json(
+        ctx,
+        202,
+        "Accepted",
+        &response,
+        "manual-service-upgrade",
+        Some(json!({
+            "unit": unit,
+            "dry_run": false,
+            "task_id": response.get("task_id").cloned().unwrap_or(Value::Null),
         })),
     )
 }
@@ -5616,6 +5822,15 @@ struct DiscoveryStats {
 
 #[derive(Debug, Deserialize)]
 struct ServiceTriggerRequest {
+    #[serde(default)]
+    dry_run: bool,
+    caller: Option<String>,
+    reason: Option<String>,
+    image: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceUpgradeRequest {
     #[serde(default)]
     dry_run: bool,
     caller: Option<String>,
@@ -5714,6 +5929,12 @@ enum TaskMeta {
         unit: String,
         #[serde(default)]
         dry_run: bool,
+        #[serde(default)]
+        image: Option<String>,
+    },
+    #[serde(rename = "manual-service-upgrade")]
+    ManualServiceUpgrade {
+        unit: String,
         #[serde(default)]
         image: Option<String>,
     },
@@ -6566,6 +6787,128 @@ fn create_manual_service_task(
         .bind("task-created")
         .bind("running")
         .bind("Manual service task created from API")
+        .bind(Some(unit_owned.clone()))
+        .bind(
+            serde_json::to_string(&merge_task_meta(
+                json!({
+                    "unit": unit_owned,
+                    "image": image_owned,
+                    "caller": caller_owned,
+                    "reason": reason_owned,
+                }),
+                host_backend_meta(),
+            ))
+            .unwrap_or_else(|_| "{}".to_string()),
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    });
+
+    match db_result {
+        Ok(()) => Ok(task_id),
+        Err(err) => Err(err),
+    }
+}
+
+fn create_manual_service_upgrade_task(
+    unit: &str,
+    caller: &Option<String>,
+    reason: &Option<String>,
+    image: Option<&str>,
+    request_id: &str,
+    meta: TaskMeta,
+) -> Result<String, String> {
+    let now = current_unix_secs() as i64;
+    let task_id = next_task_id("tsk");
+    let trigger_source = "manual".to_string();
+
+    let meta_value = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
+    let meta_str = serde_json::to_string(&meta_value).map_err(|e| e.to_string())?;
+
+    let unit_owned = unit.to_string();
+    let caller_owned = caller.clone();
+    let reason_owned = reason.clone();
+    let image_owned = image.map(|s| s.to_string());
+    let request_id_owned = request_id.to_string();
+    let task_id_clone = task_id.clone();
+
+    let db_result = with_db(|pool| async move {
+        let mut tx = pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO tasks (task_id, kind, status, created_at, started_at, finished_at, \
+             updated_at, summary, meta, trigger_source, trigger_request_id, trigger_path, \
+             trigger_caller, trigger_reason, trigger_scheduler_iteration, can_stop, \
+             can_force_stop, can_retry, is_long_running, retry_of) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind("manual")
+        .bind("running")
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Some(now))
+        .bind(Some("Manual service upgrade task created".to_string()))
+        .bind(&meta_str)
+        .bind(&trigger_source)
+        .bind(&request_id_owned)
+        .bind(Some(format!(
+            "/api/manual/services/{unit}/upgrade",
+            unit = unit_owned
+        )))
+        .bind(&caller_owned)
+        .bind(&reason_owned)
+        .bind(Option::<i64>::None)
+        .bind(0_i64) // can_stop (manual upgrade tasks cannot be safely cancelled at system level)
+        .bind(0_i64) // can_force_stop
+        .bind(0_i64) // can_retry
+        .bind(Some(1_i64))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_units \
+             (task_id, unit, slug, display_name, status, phase, started_at, finished_at, \
+              duration_ms, message, error) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(&unit_owned)
+        .bind(Some(
+            unit_owned
+                .trim_end_matches(".service")
+                .trim_matches('/')
+                .to_string(),
+        ))
+        .bind(&unit_owned)
+        .bind("running")
+        .bind(Some("queued"))
+        .bind(Some(now))
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .bind(Some(
+            "Manual service upgrade task scheduled from API".to_string(),
+        ))
+        .bind(Option::<String>::None)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO task_logs \
+             (task_id, ts, level, action, status, summary, unit, meta) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task_id_clone)
+        .bind(now)
+        .bind("info")
+        .bind("task-created")
+        .bind("running")
+        .bind("Manual service upgrade task created from API")
         .bind(Some(unit_owned.clone()))
         .bind(
             serde_json::to_string(&merge_task_meta(
@@ -7499,6 +7842,9 @@ fn run_task_by_id(task_id: &str) -> Result<(), String> {
                 }
             }
         }
+        ("manual", TaskMeta::ManualServiceUpgrade { unit, image }) => {
+            run_manual_service_upgrade_task(task_id, &unit, image.as_deref())
+        }
         ("manual", TaskMeta::AutoUpdate { unit }) => run_auto_update_task(task_id, &unit),
         ("manual", TaskMeta::AutoUpdateRun { unit, dry_run }) => {
             run_auto_update_run_task(task_id, &unit, dry_run)
@@ -8147,6 +8493,182 @@ struct ImageVerifyResult {
     unit_error: Option<String>,
 }
 
+fn split_image_registry_repo_tag(image: &str) -> Result<(String, String), String> {
+    let raw = image.trim();
+    if raw.is_empty() {
+        return Err("invalid-image".to_string());
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Err("invalid-image".to_string());
+    }
+
+    let (registry_raw, rest) = raw
+        .split_once('/')
+        .ok_or_else(|| "invalid-image".to_string())?;
+    let registry = registry_raw.trim();
+    if registry.is_empty() {
+        return Err("invalid-image".to_string());
+    }
+
+    let trimmed = rest.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("invalid-image".to_string());
+    }
+
+    let last_slash = trimmed.rfind('/').unwrap_or(0);
+    let tag_sep = trimmed[last_slash..]
+        .rfind(':')
+        .map(|idx| idx + last_slash)
+        .ok_or_else(|| "invalid-image".to_string())?;
+
+    let repo = trimmed[..tag_sep].trim();
+    let tag = trimmed[tag_sep + 1..].trim();
+    if repo.is_empty() || tag.is_empty() {
+        return Err("invalid-image".to_string());
+    }
+
+    Ok((format!("{registry}/{repo}"), tag.to_string()))
+}
+
+fn resolve_upgrade_target_image(
+    base_image: &str,
+    requested_image: Option<&str>,
+) -> Result<String, String> {
+    let base_trimmed = base_image.trim();
+    if base_trimmed.is_empty() {
+        return Err("image-missing".to_string());
+    }
+
+    let (base_repo, _base_tag) = split_image_registry_repo_tag(base_trimmed)?;
+
+    let Some(requested) = requested_image else {
+        return Ok(base_trimmed.to_string());
+    };
+    let raw = requested.trim();
+    if raw.is_empty() {
+        return Ok(base_trimmed.to_string());
+    }
+
+    if raw.starts_with(':') {
+        let tag = raw.trim_start_matches(':').trim();
+        if tag.is_empty() {
+            return Err("invalid-tag".to_string());
+        }
+        return Ok(format!("{base_repo}:{tag}"));
+    }
+
+    // Treat any value containing '/' as a full image ref.
+    if raw.contains('/') {
+        let _ = split_image_registry_repo_tag(raw)?;
+        return Ok(raw.to_string());
+    }
+
+    let tag = raw;
+    Ok(format!("{base_repo}:{tag}"))
+}
+
+fn resolve_running_image_ref_for_unit_fresh(unit: &str) -> Result<String, String> {
+    let ps = podman_ps_all_json_fresh()?;
+    let items = ps.as_array().ok_or_else(|| "invalid-json".to_string())?;
+
+    let mut candidates: Vec<(i64, bool, Option<String>)> = Vec::new();
+    for item in items {
+        let Some(label) = container_unit_label(item) else {
+            continue;
+        };
+        if label != unit {
+            continue;
+        }
+        let image = item
+            .get("Image")
+            .or_else(|| item.get("ImageName"))
+            .or_else(|| item.get("image"))
+            .or_else(|| item.get("image_name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        candidates.push((
+            container_created_ts(item),
+            container_is_running(item),
+            image,
+        ));
+    }
+
+    if candidates.is_empty() {
+        return Err("container-not-found".to_string());
+    }
+
+    let mut best_running: Option<(i64, Option<String>)> = None;
+    let mut best_any: Option<(i64, Option<String>)> = None;
+    for (created, is_running, image) in candidates {
+        if best_any.as_ref().map(|(c, _)| created > *c).unwrap_or(true) {
+            best_any = Some((created, image.clone()));
+        }
+        if is_running
+            && best_running
+                .as_ref()
+                .map(|(c, _)| created > *c)
+                .unwrap_or(true)
+        {
+            best_running = Some((created, image));
+        }
+    }
+
+    let chosen = best_running.or(best_any).map(|(_, img)| img).flatten();
+    chosen.ok_or_else(|| "image-missing".to_string())
+}
+
+fn resolve_upgrade_base_image(unit: &str) -> Result<String, String> {
+    if let Some(image) = unit_configured_image(unit) {
+        return Ok(image);
+    }
+
+    if let Ok(image) = resolve_running_image_ref_for_unit_fresh(unit) {
+        // Ensure the image has a usable tag format for downstream digest verification.
+        let _ = split_image_registry_repo_tag(&image)?;
+        return Ok(image);
+    }
+
+    let image_id = resolve_running_image_id_for_unit_fresh(unit)?;
+    let inspect = podman_image_inspect_json(&[image_id.clone()])?;
+    let images = inspect
+        .as_array()
+        .ok_or_else(|| "invalid-json".to_string())?;
+    for entry in images {
+        if image_inspect_id(entry).as_deref() != Some(image_id.as_str()) {
+            continue;
+        }
+        if let Some(tags) = entry.get("RepoTags").and_then(|v| v.as_array()) {
+            for tag in tags {
+                let Some(tag) = tag.as_str() else { continue };
+                let trimmed = tag.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let _ = split_image_registry_repo_tag(trimmed)?;
+                return Ok(trimmed.to_string());
+            }
+        }
+    }
+
+    Err("image-missing".to_string())
+}
+
+fn resolve_running_digest_for_unit_fresh(unit: &str) -> Result<Option<String>, String> {
+    let image_id = resolve_running_image_id_for_unit_fresh(unit)?;
+    let inspect = podman_image_inspect_json(&[image_id.clone()])?;
+    let images = inspect
+        .as_array()
+        .ok_or_else(|| "invalid-json".to_string())?;
+    for entry in images {
+        if image_inspect_id(entry).as_deref() == Some(image_id.as_str()) {
+            return Ok(podman_inspect_digest(entry));
+        }
+    }
+    Ok(None)
+}
+
 fn resolve_running_image_id_for_unit_fresh(unit: &str) -> Result<String, String> {
     let ps = podman_ps_all_json_fresh()?;
     let items = ps.as_array().ok_or_else(|| "invalid-json".to_string())?;
@@ -8300,9 +8822,6 @@ fn run_image_verify_step(task_id: &str, unit: &str, image: &str) -> ImageVerifyR
             }
         }
 
-        if pulled_digest.is_none() {
-            local_error.get_or_insert("pulled-digest-missing".to_string());
-        }
         if running_digest.is_none() {
             local_error.get_or_insert("running-digest-missing".to_string());
         }
@@ -8313,20 +8832,18 @@ fn run_image_verify_step(task_id: &str, unit: &str, image: &str) -> ImageVerifyR
     } else if local_error.is_some() {
         ("failed", "failed", "failed")
     } else {
-        let remote = remote_platform_digest.clone().unwrap_or_default();
-        let pulled = pulled_digest.clone().unwrap_or_default();
-        let running = running_digest.clone().unwrap_or_default();
-        if remote != pulled || remote != running || pulled != running {
-            ("failed", "failed", "failed")
-        } else {
+        let expected = remote_platform_digest.as_deref().unwrap_or_default();
+        let running = running_digest.as_deref().unwrap_or_default();
+        if !expected.is_empty() && expected == running {
             ("succeeded", "succeeded", "ok")
+        } else {
+            ("failed", "failed", "failed")
         }
     };
 
     let result_message = format!(
-        "remote_platform={} pulled={} running={}",
+        "expected_remote_platform={} running={}",
         remote_platform_digest.as_deref().unwrap_or("-"),
-        pulled_digest.as_deref().unwrap_or("-"),
         running_digest.as_deref().unwrap_or("-"),
     );
 
@@ -8340,6 +8857,29 @@ fn run_image_verify_step(task_id: &str, unit: &str, image: &str) -> ImageVerifyR
         "succeeded" => "info",
         "failed" => "error",
         _ => "warning",
+    };
+
+    let digest_matches_remote_platform =
+        match (remote_platform_digest.as_deref(), running_digest.as_deref()) {
+            (Some(expected), Some(running)) => expected == running,
+            _ => false,
+        };
+    let pulled_matches_remote_index =
+        match (remote_index_digest.as_deref(), pulled_digest.as_deref()) {
+            (Some(index), Some(pulled)) => index == pulled,
+            _ => false,
+        };
+    let pulled_matches_remote_platform =
+        match (remote_platform_digest.as_deref(), pulled_digest.as_deref()) {
+            (Some(expected), Some(pulled)) => expected == pulled,
+            _ => false,
+        };
+    let is_manifest_list = match (
+        remote_index_digest.as_deref(),
+        remote_platform_digest.as_deref(),
+    ) {
+        (Some(index), Some(platform)) => index != platform,
+        _ => false,
     };
 
     append_task_log(
@@ -8364,6 +8904,10 @@ fn run_image_verify_step(task_id: &str, unit: &str, image: &str) -> ImageVerifyR
             "from_cache": remote_from_cache,
             "result_status": result_status,
             "result_message": result_message,
+            "is_manifest_list": is_manifest_list,
+            "digest_matches_remote_platform": digest_matches_remote_platform,
+            "pulled_matches_remote_index": pulled_matches_remote_index,
+            "pulled_matches_remote_platform": pulled_matches_remote_platform,
         }),
     );
 
@@ -10667,6 +11211,13 @@ fn start_auto_update_unit(unit: &str) -> Result<CommandExecResult, String> {
 
 fn restart_unit(unit: &str) -> Result<CommandExecResult, String> {
     let systemctl_args = vec!["restart".to_string(), unit.to_string()];
+    host_backend()
+        .systemctl_user(&systemctl_args)
+        .map_err(host_backend_error_to_string)
+}
+
+fn stop_unit(unit: &str) -> Result<CommandExecResult, String> {
+    let systemctl_args = vec!["stop".to_string(), unit.to_string()];
     host_backend()
         .systemctl_user(&systemctl_args)
         .map_err(host_backend_error_to_string)
@@ -13168,6 +13719,1038 @@ fn run_manual_service_task(task_id: &str, unit: &str, image: Option<&str>) -> Re
     Ok(())
 }
 
+fn run_manual_service_upgrade_task(
+    task_id: &str,
+    unit: &str,
+    requested_image: Option<&str>,
+) -> Result<(), String> {
+    let unit_owned = unit.to_string();
+    let requested_trimmed = requested_image.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    let base_image = match resolve_upgrade_base_image(&unit_owned) {
+        Ok(img) => img,
+        Err(err) => {
+            update_task_state_with_unit_error(
+                task_id,
+                "failed",
+                &unit_owned,
+                "failed",
+                "Manual service upgrade task failed (image missing)",
+                Some(&truncate_unit_error_summary(&err)),
+                "manual-service-upgrade-run",
+                "error",
+                json!({
+                    "unit": unit_owned,
+                    "requested_image": requested_trimmed,
+                    "error": err,
+                }),
+            );
+            return Ok(());
+        }
+    };
+
+    let target_image = match resolve_upgrade_target_image(&base_image, requested_trimmed) {
+        Ok(img) => img,
+        Err(err) => {
+            update_task_state_with_unit_error(
+                task_id,
+                "failed",
+                &unit_owned,
+                "failed",
+                "Manual service upgrade task failed (invalid image)",
+                Some(&truncate_unit_error_summary(&err)),
+                "manual-service-upgrade-run",
+                "error",
+                json!({
+                    "unit": unit_owned,
+                    "base_image": base_image,
+                    "requested_image": requested_trimmed,
+                    "error": err,
+                }),
+            );
+            return Ok(());
+        }
+    };
+
+    let before_digest = resolve_running_digest_for_unit_fresh(&unit_owned)
+        .ok()
+        .flatten();
+    let container_name = unit_execstart_podman_start_container_name(&unit_owned);
+
+    // 1) Pull target image (always).
+    update_task_unit_phase(task_id, &unit_owned, "pulling-image");
+    let pull_command = format!("podman pull {target_image}");
+    let pull_argv = ["podman", "pull", target_image.as_str()];
+    let pull_result = match pull_container_image(&target_image) {
+        Ok(res) => res,
+        Err(err) => {
+            append_task_log(
+                task_id,
+                "error",
+                "image-pull",
+                "failed",
+                "Image pull failed",
+                Some(&unit_owned),
+                merge_task_meta(
+                    json!({
+                        "type": "command",
+                        "command": pull_command,
+                        "argv": pull_argv,
+                        "error": err,
+                    }),
+                    json!({
+                        "unit": unit_owned,
+                        "base_image": base_image,
+                        "target_image": target_image,
+                    }),
+                ),
+            );
+
+            update_task_state_with_unit_error(
+                task_id,
+                "failed",
+                &unit_owned,
+                "failed",
+                "Manual service upgrade task failed (image pull error)",
+                Some("image-pull-error"),
+                "manual-service-upgrade-run",
+                "error",
+                json!({
+                    "unit": unit_owned,
+                    "base_image": base_image,
+                    "target_image": target_image,
+                }),
+            );
+            return Ok(());
+        }
+    };
+
+    let pull_meta = build_command_meta(
+        &pull_command,
+        &pull_argv,
+        &pull_result,
+        Some(json!({
+            "unit": unit_owned.as_str(),
+            "base_image": base_image.as_str(),
+            "target_image": target_image.as_str(),
+        })),
+    );
+    if pull_result.success() {
+        append_task_log(
+            task_id,
+            "info",
+            "image-pull",
+            "succeeded",
+            "Image pull succeeded",
+            Some(&unit_owned),
+            pull_meta,
+        );
+    } else {
+        append_task_log(
+            task_id,
+            "error",
+            "image-pull",
+            "failed",
+            "Image pull failed",
+            Some(&unit_owned),
+            pull_meta,
+        );
+        update_task_state_with_unit_error(
+            task_id,
+            "failed",
+            &unit_owned,
+            "failed",
+            "Manual service upgrade task failed (image pull failed)",
+            Some("image-pull-failed"),
+            "manual-service-upgrade-run",
+            "error",
+            json!({
+                "unit": unit_owned,
+                "base_image": base_image,
+                "target_image": target_image,
+            }),
+        );
+        return Ok(());
+    }
+
+    // 2) If the unit recreates containers from an image ref, support tag-only
+    // upgrades by retagging the pulled image to the configured base tag.
+    if container_name.is_none() && !images_match(&target_image, &base_image) {
+        update_task_unit_phase(task_id, &unit_owned, "tagging-image");
+        let command = format!("podman tag {target_image} {base_image}");
+        let argv = ["podman", "tag", target_image.as_str(), base_image.as_str()];
+        let args = vec![
+            "tag".to_string(),
+            target_image.to_string(),
+            base_image.to_string(),
+        ];
+
+        match host_backend()
+            .podman(&args)
+            .map_err(host_backend_error_to_string)
+        {
+            Ok(result) => {
+                let meta = build_command_meta(
+                    &command,
+                    &argv,
+                    &result,
+                    Some(json!({
+                        "unit": unit_owned.as_str(),
+                        "base_image": base_image.as_str(),
+                        "target_image": target_image.as_str(),
+                    })),
+                );
+                if result.success() {
+                    append_task_log(
+                        task_id,
+                        "info",
+                        "image-tag",
+                        "succeeded",
+                        "Image tag updated",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                } else {
+                    append_task_log(
+                        task_id,
+                        "error",
+                        "image-tag",
+                        "failed",
+                        "Image tag failed",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                    update_task_state_with_unit_error(
+                        task_id,
+                        "failed",
+                        &unit_owned,
+                        "failed",
+                        "Manual service upgrade task failed (image tag failed)",
+                        Some("image-tag-failed"),
+                        "manual-service-upgrade-run",
+                        "error",
+                        json!({
+                            "unit": unit_owned.as_str(),
+                            "base_image": base_image.as_str(),
+                            "target_image": target_image.as_str(),
+                        }),
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                append_task_log(
+                    task_id,
+                    "error",
+                    "image-tag",
+                    "failed",
+                    "Image tag failed",
+                    Some(&unit_owned),
+                    json!({
+                        "type": "command",
+                        "command": command,
+                        "argv": argv,
+                        "error": err,
+                        "unit": unit_owned.as_str(),
+                        "base_image": base_image.as_str(),
+                        "target_image": target_image.as_str(),
+                    }),
+                );
+                update_task_state_with_unit_error(
+                    task_id,
+                    "failed",
+                    &unit_owned,
+                    "failed",
+                    "Manual service upgrade task failed (image tag error)",
+                    Some("image-tag-error"),
+                    "manual-service-upgrade-run",
+                    "error",
+                    json!({
+                        "unit": unit_owned.as_str(),
+                        "base_image": base_image.as_str(),
+                        "target_image": target_image.as_str(),
+                        "error": err,
+                    }),
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // 3) Restart/start via systemd, using container replacement when the unit is
+    // a `podman start <container>` wrapper.
+    if let Some(container) = container_name.as_deref() {
+        update_task_unit_phase(task_id, &unit_owned, "restarting");
+
+        let tmp_suffix = sanitize_image_key(task_id);
+        let mut tmp_container = format!("{container}-podup-{tmp_suffix}");
+        if tmp_container.len() > 120 {
+            tmp_container.truncate(120);
+        }
+
+        // Clone existing container config onto the new image.
+        let clone_cmd =
+            format!("podman container clone {container} {tmp_container} {target_image}");
+        let clone_argv = [
+            "podman",
+            "container",
+            "clone",
+            container,
+            tmp_container.as_str(),
+            target_image.as_str(),
+        ];
+        let clone_args = vec![
+            "container".to_string(),
+            "clone".to_string(),
+            container.to_string(),
+            tmp_container.clone(),
+            target_image.to_string(),
+        ];
+        match host_backend()
+            .podman(&clone_args)
+            .map_err(host_backend_error_to_string)
+        {
+            Ok(result) => {
+                let meta = build_command_meta(
+                    &clone_cmd,
+                    &clone_argv,
+                    &result,
+                    Some(json!({
+                        "unit": unit_owned.as_str(),
+                        "container": container,
+                        "tmp_container": tmp_container.as_str(),
+                        "target_image": target_image.as_str(),
+                    })),
+                );
+                if result.success() {
+                    append_task_log(
+                        task_id,
+                        "info",
+                        "container-clone",
+                        "succeeded",
+                        "Container clone succeeded",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                } else {
+                    append_task_log(
+                        task_id,
+                        "error",
+                        "container-clone",
+                        "failed",
+                        "Container clone failed",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                    update_task_state_with_unit_error(
+                        task_id,
+                        "failed",
+                        &unit_owned,
+                        "failed",
+                        "Manual service upgrade task failed (container clone failed)",
+                        Some("container-clone-failed"),
+                        "manual-service-upgrade-run",
+                        "error",
+                        json!({
+                            "unit": unit_owned.as_str(),
+                            "container": container,
+                            "tmp_container": tmp_container.as_str(),
+                            "target_image": target_image.as_str(),
+                        }),
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                append_task_log(
+                    task_id,
+                    "error",
+                    "container-clone",
+                    "failed",
+                    "Container clone failed",
+                    Some(&unit_owned),
+                    json!({
+                        "type": "command",
+                        "command": clone_cmd,
+                        "argv": clone_argv,
+                        "error": err,
+                        "unit": unit_owned.as_str(),
+                        "container": container,
+                        "tmp_container": tmp_container.as_str(),
+                        "target_image": target_image.as_str(),
+                    }),
+                );
+                update_task_state_with_unit_error(
+                    task_id,
+                    "failed",
+                    &unit_owned,
+                    "failed",
+                    "Manual service upgrade task failed (container clone error)",
+                    Some("container-clone-error"),
+                    "manual-service-upgrade-run",
+                    "error",
+                    json!({
+                        "unit": unit_owned.as_str(),
+                        "container": container,
+                        "tmp_container": tmp_container.as_str(),
+                        "target_image": target_image.as_str(),
+                        "error": err,
+                    }),
+                );
+                return Ok(());
+            }
+        }
+
+        // Stop the unit first to avoid touching a running container.
+        let stop_cmd = format!("systemctl --user stop {unit_owned}");
+        let stop_argv = ["systemctl", "--user", "stop", unit_owned.as_str()];
+        match stop_unit(&unit_owned) {
+            Ok(result) => {
+                let meta = build_command_meta(
+                    &stop_cmd,
+                    &stop_argv,
+                    &result,
+                    Some(json!({ "unit": unit_owned.as_str() })),
+                );
+                if result.success() {
+                    append_task_log(
+                        task_id,
+                        "info",
+                        "stop-unit",
+                        "succeeded",
+                        "Unit stopped",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                } else {
+                    append_task_log(
+                        task_id,
+                        "error",
+                        "stop-unit",
+                        "failed",
+                        "Unit stop failed",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                    update_task_state_with_unit_error(
+                        task_id,
+                        "failed",
+                        &unit_owned,
+                        "failed",
+                        "Manual service upgrade task failed (unit stop failed)",
+                        Some("unit-stop-failed"),
+                        "manual-service-upgrade-run",
+                        "error",
+                        json!({ "unit": unit_owned }),
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                append_task_log(
+                    task_id,
+                    "error",
+                    "stop-unit",
+                    "failed",
+                    "Unit stop failed",
+                    Some(&unit_owned),
+                    json!({
+                        "type": "command",
+                        "command": stop_cmd,
+                        "argv": stop_argv,
+                        "error": err,
+                        "unit": unit_owned,
+                    }),
+                );
+                update_task_state_with_unit_error(
+                    task_id,
+                    "failed",
+                    &unit_owned,
+                    "failed",
+                    "Manual service upgrade task failed (unit stop error)",
+                    Some("unit-stop-error"),
+                    "manual-service-upgrade-run",
+                    "error",
+                    json!({ "unit": unit_owned, "error": err }),
+                );
+                return Ok(());
+            }
+        }
+
+        // Remove original container and swap in the cloned one.
+        let rm_cmd = format!("podman rm {container}");
+        let rm_argv = ["podman", "rm", container];
+        let rm_args = vec!["rm".to_string(), container.to_string()];
+        match host_backend()
+            .podman(&rm_args)
+            .map_err(host_backend_error_to_string)
+        {
+            Ok(result) => {
+                let meta = build_command_meta(
+                    &rm_cmd,
+                    &rm_argv,
+                    &result,
+                    Some(json!({ "unit": unit_owned.as_str(), "container": container })),
+                );
+                if result.success() {
+                    append_task_log(
+                        task_id,
+                        "info",
+                        "rm-container",
+                        "succeeded",
+                        "Container removed",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                } else {
+                    append_task_log(
+                        task_id,
+                        "error",
+                        "rm-container",
+                        "failed",
+                        "Container remove failed",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                    update_task_state_with_unit_error(
+                        task_id,
+                        "failed",
+                        &unit_owned,
+                        "failed",
+                        "Manual service upgrade task failed (container remove failed)",
+                        Some("container-remove-failed"),
+                        "manual-service-upgrade-run",
+                        "error",
+                        json!({ "unit": unit_owned, "container": container }),
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                append_task_log(
+                    task_id,
+                    "error",
+                    "rm-container",
+                    "failed",
+                    "Container remove failed",
+                    Some(&unit_owned),
+                    json!({
+                        "type": "command",
+                        "command": rm_cmd,
+                        "argv": rm_argv,
+                        "error": err,
+                        "unit": unit_owned,
+                        "container": container,
+                    }),
+                );
+                update_task_state_with_unit_error(
+                    task_id,
+                    "failed",
+                    &unit_owned,
+                    "failed",
+                    "Manual service upgrade task failed (container remove error)",
+                    Some("container-remove-error"),
+                    "manual-service-upgrade-run",
+                    "error",
+                    json!({ "unit": unit_owned, "container": container, "error": err }),
+                );
+                return Ok(());
+            }
+        }
+
+        let rename_cmd = format!("podman rename {tmp_container} {container}");
+        let rename_argv = ["podman", "rename", tmp_container.as_str(), container];
+        let rename_args = vec![
+            "rename".to_string(),
+            tmp_container.clone(),
+            container.to_string(),
+        ];
+        match host_backend()
+            .podman(&rename_args)
+            .map_err(host_backend_error_to_string)
+        {
+            Ok(result) => {
+                let meta = build_command_meta(
+                    &rename_cmd,
+                    &rename_argv,
+                    &result,
+                    Some(json!({
+                        "unit": unit_owned.as_str(),
+                        "tmp_container": tmp_container.as_str(),
+                        "container": container,
+                    })),
+                );
+                if result.success() {
+                    append_task_log(
+                        task_id,
+                        "info",
+                        "rename-container",
+                        "succeeded",
+                        "Container renamed",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                } else {
+                    append_task_log(
+                        task_id,
+                        "error",
+                        "rename-container",
+                        "failed",
+                        "Container rename failed",
+                        Some(&unit_owned),
+                        meta,
+                    );
+                    update_task_state_with_unit_error(
+                        task_id,
+                        "failed",
+                        &unit_owned,
+                        "failed",
+                        "Manual service upgrade task failed (container rename failed)",
+                        Some("container-rename-failed"),
+                        "manual-service-upgrade-run",
+                        "error",
+                        json!({ "unit": unit_owned, "container": container }),
+                    );
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                append_task_log(
+                    task_id,
+                    "error",
+                    "rename-container",
+                    "failed",
+                    "Container rename failed",
+                    Some(&unit_owned),
+                    json!({
+                        "type": "command",
+                        "command": rename_cmd,
+                        "argv": rename_argv,
+                        "error": err,
+                        "unit": unit_owned,
+                        "container": container,
+                        "tmp_container": tmp_container,
+                    }),
+                );
+                update_task_state_with_unit_error(
+                    task_id,
+                    "failed",
+                    &unit_owned,
+                    "failed",
+                    "Manual service upgrade task failed (container rename error)",
+                    Some("container-rename-error"),
+                    "manual-service-upgrade-run",
+                    "error",
+                    json!({ "unit": unit_owned, "container": container, "error": err }),
+                );
+                return Ok(());
+            }
+        }
+
+        let run = run_unit_operation(&unit_owned, UnitOperationPurpose::Start);
+        let result = unit_action_result_from_operation(&unit_owned, &run.result);
+        let unit_status = match result.status.as_str() {
+            "triggered" => "succeeded",
+            "failed" | "error" => "failed",
+            other => other,
+        };
+        let op_meta = build_unit_operation_command_meta(
+            &unit_owned,
+            Some(&target_image),
+            run.runner,
+            run.purpose,
+            &run.command,
+            &run.argv,
+            &run.result,
+            &result.status,
+            &result.message,
+        );
+        append_task_log(
+            task_id,
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
+            "start-unit",
+            unit_status,
+            if unit_status == "failed" {
+                "Unit start failed"
+            } else {
+                "Unit started"
+            },
+            Some(&unit_owned),
+            op_meta,
+        );
+        if unit_status == "failed" {
+            update_task_state_with_unit_error(
+                task_id,
+                "failed",
+                &unit_owned,
+                "failed",
+                "Manual service upgrade task failed (unit start failed)",
+                Some("unit-start-failed"),
+                "manual-service-upgrade-run",
+                "error",
+                json!({
+                    "unit": unit_owned,
+                    "base_image": base_image,
+                    "target_image": target_image,
+                }),
+            );
+
+            for entry in capture_unit_failure_diagnostics(
+                &unit_owned,
+                task_diagnostics_journal_lines_from_env(),
+            ) {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
+            return Ok(());
+        }
+    } else {
+        update_task_unit_phase(task_id, &unit_owned, "restarting");
+        let run = run_unit_operation(&unit_owned, UnitOperationPurpose::Restart);
+        let result = unit_action_result_from_operation(&unit_owned, &run.result);
+        let unit_status = match result.status.as_str() {
+            "triggered" => "succeeded",
+            "failed" | "error" => "failed",
+            other => other,
+        };
+        let op_meta = build_unit_operation_command_meta(
+            &unit_owned,
+            Some(&base_image),
+            run.runner,
+            run.purpose,
+            &run.command,
+            &run.argv,
+            &run.result,
+            &result.status,
+            &result.message,
+        );
+        append_task_log(
+            task_id,
+            if unit_status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
+            "restart-unit",
+            unit_status,
+            if unit_status == "failed" {
+                "Unit restart failed"
+            } else {
+                "Unit restarted"
+            },
+            Some(&unit_owned),
+            op_meta,
+        );
+        if unit_status == "failed" {
+            update_task_state_with_unit_error(
+                task_id,
+                "failed",
+                &unit_owned,
+                "failed",
+                "Manual service upgrade task failed (unit restart failed)",
+                Some("unit-restart-failed"),
+                "manual-service-upgrade-run",
+                "error",
+                json!({
+                    "unit": unit_owned,
+                    "base_image": base_image,
+                    "target_image": target_image,
+                }),
+            );
+
+            for entry in capture_unit_failure_diagnostics(
+                &unit_owned,
+                task_diagnostics_journal_lines_from_env(),
+            ) {
+                append_task_log(
+                    task_id,
+                    entry.level,
+                    entry.action,
+                    entry.status,
+                    &entry.summary,
+                    Some(&entry.unit),
+                    entry.meta,
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    update_task_unit_phase(task_id, &unit_owned, "verifying");
+    let (verdict, health_summary) = append_unit_health_check_log(task_id, &unit_owned);
+    if verdict != UnitHealthVerdict::Healthy {
+        update_task_state_with_unit_error(
+            task_id,
+            "failed",
+            &unit_owned,
+            "failed",
+            "Manual service upgrade task failed",
+            Some(&health_summary),
+            "manual-service-upgrade-run",
+            "error",
+            json!({
+                "unit": unit_owned,
+                "base_image": base_image,
+                "target_image": target_image,
+                "before_digest": before_digest,
+                "health": health_summary,
+            }),
+        );
+
+        for entry in
+            capture_unit_failure_diagnostics(&unit_owned, task_diagnostics_journal_lines_from_env())
+        {
+            append_task_log(
+                task_id,
+                entry.level,
+                entry.action,
+                entry.status,
+                &entry.summary,
+                Some(&entry.unit),
+                entry.meta,
+            );
+        }
+        return Ok(());
+    }
+
+    update_task_unit_phase(task_id, &unit_owned, "image-verify");
+
+    // Remote digest (platform-aware) + local running digest after restart.
+    let platform = current_oci_platform();
+    let image_owned = target_image.clone();
+    let platform_os = platform.os.clone();
+    let platform_arch = platform.arch.clone();
+    let platform_variant = platform.variant.clone();
+    let ttl_secs = registry_digest::registry_digest_cache_ttl_secs();
+
+    let remote_record_result: Result<registry_digest::RegistryPlatformDigestRecord, String> =
+        with_db(|pool| async move {
+            Ok::<registry_digest::RegistryPlatformDigestRecord, sqlx::Error>(
+                registry_digest::resolve_remote_index_and_platform_digest(
+                    &pool,
+                    &image_owned,
+                    &platform_os,
+                    &platform_arch,
+                    platform_variant.as_deref(),
+                    ttl_secs,
+                    true,
+                )
+                .await,
+            )
+        });
+
+    let mut remote_index_digest: Option<String> = None;
+    let mut remote_platform_digest: Option<String> = None;
+    let mut remote_error: Option<String> = None;
+    let mut remote_checked_at: Option<i64> = None;
+    let mut remote_stale: Option<bool> = None;
+    let mut remote_from_cache: Option<bool> = None;
+
+    match remote_record_result {
+        Ok(record) => {
+            remote_index_digest = record.remote_index_digest.clone();
+            remote_platform_digest = record.remote_platform_digest.clone();
+            remote_checked_at = Some(record.checked_at);
+            remote_stale = Some(record.stale);
+            remote_from_cache = Some(record.from_cache);
+            if record.status != registry_digest::RegistryDigestStatus::Ok
+                || record.remote_platform_digest.is_none()
+            {
+                remote_error = Some(record.error.unwrap_or_else(|| "remote-error".to_string()));
+            }
+        }
+        Err(err) => {
+            remote_error = Some(format!("db-error: {err}"));
+        }
+    }
+
+    let mut pulled_digest: Option<String> = None;
+    let mut running_after_digest: Option<String> = None;
+    let mut local_error: Option<String> = None;
+
+    let running_image_id = match resolve_running_image_id_for_unit_fresh(&unit_owned) {
+        Ok(id) => id,
+        Err(err) => {
+            local_error = Some(err);
+            String::new()
+        }
+    };
+
+    if local_error.is_none() {
+        let inspect_args = vec![target_image.clone(), running_image_id.clone()];
+        match podman_image_inspect_json(&inspect_args) {
+            Ok(inspect) => {
+                if let Some(images) = inspect.as_array() {
+                    for entry in images {
+                        let digest = podman_inspect_digest(entry);
+                        let id = image_inspect_id(entry);
+
+                        if pulled_digest.is_none() {
+                            let tags = entry
+                                .get("RepoTags")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| {
+                                    Some(
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .any(|t| t.trim() == target_image),
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if tags {
+                                pulled_digest = digest.clone();
+                            }
+                        }
+
+                        if running_after_digest.is_none()
+                            && id.as_deref() == Some(running_image_id.as_str())
+                        {
+                            running_after_digest = digest;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                local_error = Some(format!("podman-image-inspect-failed: {err}"));
+            }
+        }
+
+        if running_after_digest.is_none() {
+            local_error.get_or_insert("running-digest-missing".to_string());
+        }
+    }
+
+    let expected_remote = remote_platform_digest.clone();
+    let after = running_after_digest.clone();
+    let digest_changed = match (before_digest.as_deref(), after.as_deref()) {
+        (Some(before), Some(after)) => before != after,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    let digest_matches_remote_platform = match (expected_remote.as_deref(), after.as_deref()) {
+        (Some(expected), Some(after)) => expected == after,
+        _ => false,
+    };
+
+    let is_manifest_list = match (
+        remote_index_digest.as_deref(),
+        remote_platform_digest.as_deref(),
+    ) {
+        (Some(index), Some(platform)) => index != platform,
+        _ => false,
+    };
+
+    let (final_status, final_level, final_summary, final_error) = if remote_error.is_some() {
+        (
+            "unknown",
+            "warning",
+            "Manual service upgrade completed with unknown status".to_string(),
+            Some("remote-digest-unavailable".to_string()),
+        )
+    } else if local_error.is_some() {
+        (
+            "anomaly",
+            "warning",
+            "Manual service upgrade completed with anomaly".to_string(),
+            local_error.clone(),
+        )
+    } else if digest_matches_remote_platform && digest_changed {
+        (
+            "succeeded",
+            "info",
+            "Manual service upgrade succeeded".to_string(),
+            None,
+        )
+    } else {
+        let reason = if !digest_changed {
+            "digest-unchanged"
+        } else {
+            "digest-mismatch"
+        };
+        (
+            "anomaly",
+            "warning",
+            "Manual service upgrade completed with anomaly".to_string(),
+            Some(reason.to_string()),
+        )
+    };
+
+    let verify_summary = match final_status {
+        "succeeded" => "Image verify: OK".to_string(),
+        "unknown" => "Image verify: unavailable".to_string(),
+        _ => "Image verify: ANOMALY".to_string(),
+    };
+
+    let verify_message = format!(
+        "expected_remote_platform={} before={} after={}",
+        expected_remote.as_deref().unwrap_or("-"),
+        before_digest.as_deref().unwrap_or("-"),
+        after.as_deref().unwrap_or("-"),
+    );
+
+    append_task_log(
+        task_id,
+        final_level,
+        "image-verify",
+        final_status,
+        &verify_summary,
+        Some(&unit_owned),
+        json!({
+            "unit": unit_owned.as_str(),
+            "base_image": base_image.as_str(),
+            "target_image": target_image.as_str(),
+            "requested_image": requested_trimmed,
+            "platform": { "os": platform.os, "arch": platform.arch, "variant": platform.variant },
+            "remote_index_digest": remote_index_digest,
+            "remote_platform_digest": remote_platform_digest,
+            "pulled_digest": pulled_digest,
+            "running_digest_before": before_digest,
+            "running_digest_after": running_after_digest,
+            "remote_error": remote_error,
+            "local_error": local_error,
+            "checked_at": remote_checked_at,
+            "stale": remote_stale,
+            "from_cache": remote_from_cache,
+            "is_manifest_list": is_manifest_list,
+            "digest_changed": digest_changed,
+            "digest_matches_remote_platform": digest_matches_remote_platform,
+            "result_message": verify_message,
+        }),
+    );
+
+    update_task_state_with_unit_error(
+        task_id,
+        final_status,
+        &unit_owned,
+        final_status,
+        &final_summary,
+        final_error.as_deref(),
+        "manual-service-upgrade-run",
+        final_level,
+        json!({
+            "unit": unit_owned,
+            "base_image": base_image,
+            "target_image": target_image,
+            "before_digest": before_digest,
+            "after_digest": after,
+            "expected_remote_platform_digest": expected_remote,
+        }),
+    );
+
+    Ok(())
+}
+
 fn run_auto_update_run_task(task_id: &str, unit: &str, dry_run: bool) -> Result<(), String> {
     let unit_owned = unit.to_string();
     let command = format!("systemctl --user start {unit_owned}");
@@ -14197,6 +15780,50 @@ fn unit_definition_path(unit: &str) -> Option<host_backend::HostAbsPath> {
     source
         .or(fragment)
         .and_then(|p| host_backend::HostAbsPath::parse(&p).ok())
+}
+
+fn unit_execstart_podman_start_container_name(unit: &str) -> Option<String> {
+    let path = unit_definition_path(unit)?;
+    let contents = host_backend().read_file_to_string(&path).ok()?;
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        let Some(rest) = line.strip_prefix("ExecStart=") else {
+            continue;
+        };
+        let cmdline = rest.trim();
+        if cmdline.is_empty() {
+            continue;
+        }
+
+        let tokens: Vec<&str> = cmdline.split_whitespace().collect();
+        if tokens.len() < 3 {
+            continue;
+        }
+
+        for idx in 0..tokens.len().saturating_sub(2) {
+            let bin = tokens[idx];
+            let verb = tokens[idx + 1];
+            if !(bin.ends_with("/podman") || bin == "podman") {
+                continue;
+            }
+            if verb != "start" {
+                continue;
+            }
+
+            for arg in tokens.iter().skip(idx + 2) {
+                if arg.starts_with('-') {
+                    continue;
+                }
+                let name = arg.trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_container_image_contents(contents: &str) -> Option<String> {

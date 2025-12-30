@@ -419,6 +419,8 @@ export default function TasksPage() {
 				return "badge-info";
 			case "succeeded":
 				return "badge-success";
+			case "anomaly":
+				return "badge-warning";
 			case "failed":
 				return "badge-error";
 			case "cancelled":
@@ -436,6 +438,7 @@ export default function TasksPage() {
 
 	const renderTaskStatusLabel = (status: TaskStatus) => {
 		if (status === "unknown") return "Unknown";
+		if (status === "anomaly") return "Anomaly";
 		return status;
 	};
 
@@ -662,6 +665,7 @@ export default function TasksPage() {
 								<option value="running">running</option>
 								<option value="pending">pending</option>
 								<option value="succeeded">succeeded</option>
+								<option value="anomaly">anomaly</option>
 								<option value="failed">failed</option>
 								<option value="cancelled">cancelled</option>
 								<option value="skipped">skipped</option>

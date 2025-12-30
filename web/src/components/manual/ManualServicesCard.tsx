@@ -39,7 +39,7 @@ export function ManualServicesCard({
 			<div className="card-body gap-4">
 				<div className="flex items-center justify-between">
 					<h2 className="text-lg font-semibold uppercase tracking-wide text-base-content/70">
-						按服务部署
+						按服务升级
 					</h2>
 					<div className="flex items-center gap-3">
 						<button
@@ -90,7 +90,7 @@ export function ManualServicesCard({
 					) : null}
 
 					{!busy && !error && services.length === 0 && (
-						<p className="text-xs text-base-content/60">暂无可部署的服务。</p>
+						<p className="text-xs text-base-content/60">暂无可升级的服务。</p>
 					)}
 					{services.map((service) => (
 						<ManualServiceRow
