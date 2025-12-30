@@ -13,7 +13,7 @@ afterEach(() => cleanup());
 describe("ManualServicesCard stories", () => {
 	it("renders empty message when no services", async () => {
 		render(<Empty />);
-		expect(await screen.findByText("暂无可部署的服务。")).toBeInTheDocument();
+		expect(await screen.findByText("暂无可升级的服务。")).toBeInTheDocument();
 	});
 
 	it("renders mixed update badge states", async () => {
@@ -34,6 +34,6 @@ describe("ManualServicesCard stories", () => {
 	it("renders loading state when services are loading", async () => {
 		render(<Loading />);
 		expect(await screen.findByText("正在加载服务列表…")).toBeInTheDocument();
-		expect(screen.queryByText("暂无可部署的服务。")).toBeNull();
+		expect(screen.queryByText("暂无可升级的服务。")).toBeNull();
 	});
 });

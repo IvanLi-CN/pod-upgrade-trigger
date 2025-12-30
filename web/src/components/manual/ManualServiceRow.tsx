@@ -106,7 +106,7 @@ export function ManualServiceRow({
 						className="input input-xs input-bordered"
 						placeholder={
 							defaultImage
-								? "override image (blank uses default)"
+								? "override image/tag (blank uses default)"
 								: "image (required)"
 						}
 						value={image}
@@ -148,7 +148,7 @@ export function ManualServiceRow({
 					disabled={pending || !canDeploy}
 				>
 					<Icon icon="mdi:play" className="text-lg" />
-					部署
+					升级
 				</button>
 			</div>
 		</form>

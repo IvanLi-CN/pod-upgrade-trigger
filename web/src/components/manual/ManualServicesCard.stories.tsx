@@ -22,7 +22,7 @@ export const Empty: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		expect(await canvas.findByText("暂无可部署的服务。")).toBeInTheDocument();
+		expect(await canvas.findByText("暂无可升级的服务。")).toBeInTheDocument();
 	},
 };
 

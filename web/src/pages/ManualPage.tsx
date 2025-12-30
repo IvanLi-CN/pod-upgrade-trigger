@@ -285,14 +285,14 @@ export default function ManualPage() {
 			if (service.is_auto_update === true) {
 				pushToast({
 					variant: "warning",
-					title: "auto-update 不是服务部署目标",
+					title: "auto-update 不是服务升级目标",
 					message: "请使用下方的 auto-update 卡片执行。",
 				});
 				return;
 			}
 
 			const response = await postJson<ServiceTriggerResponse>(
-				`/api/manual/services/${encodeURIComponent(service.slug)}`,
+				`/api/manual/services/${encodeURIComponent(service.slug)}/upgrade`,
 				{
 					dry_run: params.dryRun,
 					image: params.image || undefined,
@@ -306,10 +306,10 @@ export default function ManualPage() {
 				response?.status === "pending";
 			pushToast({
 				variant: ok ? "success" : "warning",
-				title: ok ? "服务部署成功" : "服务部署失败",
+				title: ok ? "服务升级已提交" : "服务升级失败",
 				message: `${service.unit} · status=${response?.status ?? "unknown"}`,
 			});
-			pushHistory(response, `deploy-service ${service.unit}`);
+			pushHistory(response, `upgrade-service ${service.unit}`);
 
 			if (!params.dryRun && response.task_id) {
 				pushToast({
@@ -329,7 +329,7 @@ export default function ManualPage() {
 					: "Unknown error";
 			pushToast({
 				variant: "error",
-				title: "服务部署失败",
+				title: "服务升级失败",
 				message,
 			});
 		}
@@ -541,7 +541,7 @@ export default function ManualPage() {
 								运行 auto-update
 							</button>
 							<span className="text-[11px] text-base-content/60">
-								仅运行 podman auto-update，不是服务部署。
+								仅运行 podman auto-update，不是服务升级。
 							</span>
 						</div>
 					</form>
@@ -569,7 +569,7 @@ export default function ManualPage() {
 					</div>
 					<div className="space-y-2">
 						{history.length === 0 && (
-							<p className="text-xs text-base-content/60">暂无手动部署记录。</p>
+							<p className="text-xs text-base-content/60">暂无手动操作记录。</p>
 						)}
 						{history.map((entry) => (
 							<button
@@ -879,6 +879,8 @@ function ManualTasksDrawer({
 				return "badge-info";
 			case "succeeded":
 				return "badge-success";
+			case "anomaly":
+				return "badge-warning";
 			case "failed":
 				return "badge-error";
 			case "cancelled":
@@ -896,6 +898,7 @@ function ManualTasksDrawer({
 
 	const renderTaskStatusLabel = (status: TaskStatus) => {
 		if (status === "unknown") return "Unknown";
+		if (status === "anomaly") return "Anomaly";
 		return status;
 	};
 
